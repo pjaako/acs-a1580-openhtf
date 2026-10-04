@@ -1,0 +1,354 @@
+"""Tests for tools/hw_probe.py, the owner's instrument for the first hardware session.
+
+The tool runs in-process against `FakeA1580Resource` (no hardware, no sockets).
+"""
+
+from __future__ import annotations
+
+import json
+import socket
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from a1580_openhtf.fake_resource import FakeA1580Resource
+from a1580_openhtf.plug import STATE_HEADERS, normalize_header
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'tools'))
+
+import hw_probe  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _quick(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hw_probe, 'OBSERVE_S', 0.05)
+    monkeypatch.delenv('A1580_HOST', raising=False)
+
+
+def _no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError('a socket was opened')
+
+    monkeypatch.setattr(socket, 'create_connection', refuse)
+
+
+def _json_files(out: Path) -> tuple[Path, Path]:
+    snapshots = [p for p in out.glob('*.json') if not p.name.startswith('probe-')]
+    probes = list(out.glob('probe-*.json'))
+    assert len(snapshots) == 1, snapshots
+    assert len(probes) == 1, probes
+    return snapshots[0], probes[0]
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def test_dry_run_lists_every_command_without_connecting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_sockets(monkeypatch)
+    assert hw_probe.main(['--dry-run', '--phase', 'AB']) == 0
+    out = capsys.readouterr().out
+    lines = {line.strip() for line in out.splitlines()}
+    for cmd in (
+        '*IDN?',
+        'SYST:VERS?',
+        'SYST:ERR:COUN?',
+        'DATA:PORT?',
+        'SYSTem:ERRor?',
+        'ZZZ:NOPE 1',
+        'ZZZ:NOPE25',
+        'TRAN:ENAB OFF',
+        'TRAN:ENAB?',
+        'DATA:LENG 1024',
+        'FREQ 100 MHZ',
+        'TRIG:MODE INT',
+        'TRIG:INT 10 MS',
+        'AVER:COUN 4',
+        'STAR AUTO',
+        'STOP',
+        'GAIN?',
+        *(f'{header}?' for header in STATE_HEADERS),
+    ):
+        assert cmd in lines, cmd
+    for number in range(1, 10):
+        assert f'STEP {number}:' in out
+    assert 'FINAL DIFF' in out
+    # the only TRAN:PULS the tool can send is a query
+    assert not [line for line in lines if line.startswith('TRAN:PULS ') and '?' not in line]
+    assert '*RST' not in lines
+
+
+def test_dry_run_phase_a_has_no_phase_b_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    assert hw_probe.main(['--dry-run']) == 0
+    out = capsys.readouterr().out
+    assert 'STEP 5:' in out
+    assert 'STEP 6:' not in out
+    assert 'STAR AUTO' not in out
+
+
+def test_no_host_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+    assert hw_probe.main(['--phase', 'A']) == 2
+    assert 'A1580_HOST' in capsys.readouterr().err
+
+
+def test_host_from_environment_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('A1580_HOST', 'device.invalid')
+    args = hw_probe.build_parser().parse_args([])
+    assert args.host == 'device.invalid'
+    assert args.phase == 'A'
+    assert args.max_pulse_v == 20
+    assert args.packets == 10
+    assert args.out == 'setups/'
+
+
+def test_commands_sent_by_a_full_run_are_all_in_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run must not lie: every header the run sends appears in the plan."""
+    _no_sockets(monkeypatch)
+    fake = FakeA1580Resource()
+    assert hw_probe.main(['--fake', '--phase', 'AB', '--out', str(tmp_path)], fake=fake) == 0
+    planned = {
+        normalize_header(cmd.split(' ', 1)[0])
+        for _heading, commands in hw_probe.plan('AB')
+        for cmd in commands
+        if not cmd.startswith('raw socket')
+    }
+    sent = {normalize_header(cmd.strip().split(' ', 1)[0]) for cmd in fake.log}
+    assert sent <= planned, sent - planned
+
+
+# ── fake runs ────────────────────────────────────────────────────────────────
+
+
+def test_fake_phase_ab_runs_all_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_sockets(monkeypatch)
+    fake = FakeA1580Resource()
+    code = hw_probe.main(['--fake', '--phase', 'AB', '--out', str(tmp_path)], fake=fake)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    for number in range(1, 10):
+        assert f'STEP {number}:' in out
+    assert 'FAILED' not in out
+    assert 'FINAL DIFF' in out
+    assert 'no differences' in out
+    assert 'SKIPPED (fake)' in out
+
+    snapshot_path, probe_path = _json_files(tmp_path)
+    snapshot = json.loads(snapshot_path.read_text(encoding='utf-8'))
+    assert snapshot['idn'] == 'ACS-Solutions GmbH,A1580-HF,100500,1.6.b41'
+    assert set(snapshot['state']) == set(STATE_HEADERS)
+    assert set(snapshot['timing_s']) == set(STATE_HEADERS)
+    assert snapshot_path.name.startswith('100500-')
+    assert probe_path.name.startswith('probe-100500-')
+
+    report = json.loads(probe_path.read_text(encoding='utf-8'))
+    assert report['exit_code'] == 0
+    assert report['final_diff']['changed'] == {}
+    assert [f'STEP {n}' in report['steps'] for n in range(1, 10)] == [True] * 9
+    step6 = report['steps']['STEP 6']['data']
+    assert step6['n'] == 10
+    assert len(step6['packets']) == 10
+    assert step6['packet_number_steps'] == [1]
+    assert {'min', 'max', 'std', 'ascan_count', 'buffer_fill', 'is_full'} <= set(
+        step6['packets'][0]
+    )
+    assert report['steps']['STEP 7']['data']['ascan_counts'] == [4]
+    assert report['steps']['STEP 5']['data']['depth'] == 25
+    assert report['steps']['STEP 9']['data']['verdict'].startswith('accepted')
+    assert '8a' in report['steps']['STEP 8']['data']
+    assert 'idle' in report['steps']['STEP 8']['data']['8a']['verdict']
+    assert 'data arrived' in report['steps']['STEP 8']['data']['8b']['verdict']
+
+
+def test_replies_are_printed_verbatim_between_backticks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeA1580Resource()
+    assert hw_probe.main(['--fake', '--out', str(tmp_path)], fake=fake) == 0
+    out = capsys.readouterr().out
+    assert '`ACS-Solutions GmbH,A1580-HF,100500,1.6.b41`' in out
+    assert 'TRIG:INT?' in out
+    assert '`10.0E-3`' in out
+    assert '`2758`' in out
+
+
+def test_the_tool_never_sends_the_forbidden_commands(tmp_path: Path) -> None:
+    fake = FakeA1580Resource()
+    assert hw_probe.main(['--fake', '--phase', 'AB', '--out', str(tmp_path)], fake=fake) == 0
+    for cmd in fake.log:
+        assert not cmd.upper().startswith('*RST'), cmd
+        assert '/config' not in cmd.lower(), cmd
+        assert not (normalize_header(cmd.split(' ', 1)[0]) == 'TRAN:PULS' and ' ' in cmd), cmd
+
+
+def test_phase_a_is_read_only_except_bad_headers(tmp_path: Path) -> None:
+    fake = FakeA1580Resource()
+    assert hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)], fake=fake) == 0
+    writes = [c for c in fake.log if not c.rstrip().endswith('?')]
+    first_restore = max(i for i, c in enumerate(fake.log) if c == 'STOP')
+    before_teardown = [c for c in fake.log[:first_restore] if c in writes]
+    assert before_teardown, 'the bad headers of step 5 are expected'
+    assert all(c.startswith('ZZZ:NOPE') for c in before_teardown), before_teardown
+
+
+def test_pulser_is_switched_off_and_checked_before_any_other_phase_b_write(
+    tmp_path: Path,
+) -> None:
+    fake = FakeA1580Resource()
+    fake.write('TRAN:ENAB ON')
+    fake.log.clear()
+    assert hw_probe.main(['--fake', '--phase', 'B', '--out', str(tmp_path)], fake=fake) == 0
+    writes = [c for c in fake.log if not c.rstrip().endswith('?')]
+    assert writes[0] == 'TRAN:ENAB OFF'
+    off = fake.log.index('TRAN:ENAB OFF')
+    assert fake.log[off + 1 :].index('TRAN:ENAB?') < fake.log[off + 1 :].index('DATA:LENG 1024')
+
+
+def test_pulser_that_stays_on_aborts_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class StuckOn(FakeA1580Resource):
+        def write(self, cmd: str) -> None:
+            if cmd == 'TRAN:ENAB OFF' and not self.stop_count:
+                self.log.append(cmd)  # swallowed: the pulser stays on
+                return
+            super().write(cmd)
+
+    fake = StuckOn()
+    fake._values['TRAN:ENAB'] = 'ON'
+    code = hw_probe.main(['--fake', '--phase', 'B', '--out', str(tmp_path)], fake=fake)
+    out = capsys.readouterr().out
+    assert code == hw_probe.EXIT_PULSER
+    assert 'PULSER-OFF CHECK ABORTED' in out
+    assert 'STEP 6:' not in out
+    assert 'STOP' in fake.log  # tearDown still ran
+    before_teardown = fake.log[: fake.log.index('STOP')]
+    assert 'DATA:LENG 1024' not in before_teardown
+    assert 'STAR AUTO' not in fake.log
+    assert 'FINAL DIFF' in out
+
+
+def test_pulser_above_ceiling_exits_before_anything_is_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeA1580Resource()
+    fake.write('TRAN:PULS 30 V')
+    fake.log.clear()
+    code = hw_probe.main(['--fake', '--phase', 'AB', '--out', str(tmp_path)], fake=fake)
+    captured = capsys.readouterr()
+    assert code == hw_probe.EXIT_CEILING
+    assert 'above --max-pulse-v' in captured.err
+    assert 'STEP 6:' not in captured.out
+    writes = [c for c in fake.log if not c.rstrip().endswith('?')]
+    assert writes == ['STOP']  # only the harmless STOP of tearDown, no restore, no TRAN:ENAB
+    assert fake._values['TRAN:PULS'] == '30'
+    assert _json_files(tmp_path)
+
+
+def test_ceiling_can_be_raised(tmp_path: Path) -> None:
+    fake = FakeA1580Resource()
+    fake.write('TRAN:PULS 30 V')
+    fake.log.clear()
+    args = ['--fake', '--phase', 'A', '--max-pulse-v', '30', '--out', str(tmp_path)]
+    assert hw_probe.main(args, fake=fake) == 0
+    assert fake._values['TRAN:PULS'] == '30'
+    assert not [c for c in fake.log if c.startswith('TRAN:PULS ')]  # never written back
+
+
+def test_rejected_header_in_step_6_is_reported_and_tear_down_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(hw_probe, 'STEP6_SETTINGS', {**hw_probe.STEP6_SETTINGS, 'BOGUS:HDR': 1})
+    fake = FakeA1580Resource()
+    code = hw_probe.main(['--fake', '--phase', 'AB', '--out', str(tmp_path)], fake=fake)
+    out = capsys.readouterr().out
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert 'STEP 6 FAILED' in out
+    assert 'BOGUS:HDR' in out
+    assert 'STEP 7:' in out
+    assert 'STEP 9:' in out  # the run went on
+    last_stop = max(i for i, c in enumerate(fake.log) if c == 'STOP')
+    restore = fake.log[last_stop:]
+    assert 'TRAN:ENAB OFF' in restore
+    assert any(c.startswith('DATA:LENG ') for c in restore)
+    assert any(c.startswith('AVER:COUN ') for c in restore)
+    assert 'FINAL DIFF' in out
+    assert 'no differences' in out  # the restore put the fake back as found
+    _snapshot, probe_path = _json_files(tmp_path)
+    report = json.loads(probe_path.read_text(encoding='utf-8'))
+    assert report['steps']['STEP 6']['status'] == 'failed'
+    assert report['steps']['STEP 7']['status'] == 'ok'
+
+
+def test_device_that_rejects_a_setting_fails_the_step_not_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeA1580Resource(reject={'TRIG:INT': '-102,"Syntax error"'})
+    code = hw_probe.main(['--fake', '--phase', 'B', '--out', str(tmp_path)], fake=fake)
+    out = capsys.readouterr().out
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert 'STEP 6 FAILED' in out
+    assert 'STEP 8:' in out
+    assert fake.log.count('STOP') >= 1
+
+
+def test_unanswered_header_is_recorded_and_not_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Mute(FakeA1580Resource):
+        def query(self, cmd: str) -> str:
+            if cmd.startswith('FILT:HPAS:IND'):
+                self.log.append(cmd)
+                raise TimeoutError('no reply')
+            return super().query(cmd)
+
+    fake = Mute()
+    assert hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)], fake=fake) == 0
+    snapshot_path, _probe = _json_files(tmp_path)
+    snapshot = json.loads(snapshot_path.read_text(encoding='utf-8'))
+    assert snapshot['state']['FILT:HPAS:IND'].startswith('<ERROR TimeoutError')
+    assert not [c for c in fake.log if c.startswith('FILT:HPAS:IND ')]
+
+
+def test_guarded_resource_refuses_forbidden_commands() -> None:
+    fake = FakeA1580Resource()
+    guarded = hw_probe.GuardedResource(fake)
+    for cmd in ('TRAN:PULS 50 V', 'TRANsmitter:PULSe:LEVel 5 V', '*RST'):
+        with pytest.raises(hw_probe.ForbiddenCommand):
+            guarded.write(cmd)
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.query('/config/dev.eth?')
+    assert guarded.query('TRAN:PULS?') == '20'
+    assert fake.log == ['TRAN:PULS?']
+    guarded.close()
+    assert not fake.closed  # close is deferred to shutdown()
+    guarded.shutdown()
+    assert fake.closed
+
+
+def test_packet_times_follow_the_completing_chunk() -> None:
+    class Dummy:
+        pass
+
+    sock = hw_probe.RecordingSocket(Dummy())
+    sock.chunks = [(1.0, 60), (2.0, 60), (3.0, 100)]
+    assert hw_probe.packet_times(sock, 100, 1) == [2.0]
+    assert hw_probe.packet_times(sock, 100, 5) == [2.0, 3.0]  # 220 bytes: two whole packets
+
+
+def test_previous_port_is_compared_across_sessions(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    earlier = {'steps': {'STEP 3': {'data': {'data_port': '9999'}}}}
+    (tmp_path / 'probe-100500-20200101-000000.json').write_text(json.dumps(earlier))
+    fake = FakeA1580Resource()
+    assert hw_probe.main(['--fake', '--out', str(tmp_path)], fake=fake) == 0
+    out = capsys.readouterr().out
+    assert 'earlier probe saw `9999`, now `2758`: CHANGED' in out
