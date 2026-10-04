@@ -14,7 +14,7 @@ when the test passes and 1 otherwise.
 
 Safety: the settings are the vendor example's, except the pulser, which is set to 20 V (the vendor uses 100 V)
 and switched on. When the test ends, `tearDown()` restores the settings the plug found at the start, writing
-`TRAN:ENAB OFF` first, so the pulser ends in the state it was in before the test (off, if it was off).
+`TRAN:ENAB OFF` first, so the device ends with the snapshot restored and the pulser off.
 Nothing has been run against a real A1580 yet.
 
 Results: OpenHTF prints the outcome table to the console and the phase prints

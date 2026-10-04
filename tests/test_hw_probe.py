@@ -105,6 +105,15 @@ def test_host_from_environment_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.out == 'setups/'
 
 
+def _header_key(cmd: str) -> str:
+    """The normal form of a command's header; one that does not normalise is kept verbatim."""
+    head = cmd.strip().split(' ', 1)[0]
+    try:
+        return normalize_header(head)
+    except ValueError:
+        return head
+
+
 def test_commands_sent_by_a_full_run_are_all_in_the_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -113,12 +122,12 @@ def test_commands_sent_by_a_full_run_are_all_in_the_plan(
     fake = FakeA1580Resource()
     assert hw_probe.main(['--fake', '--phase', 'AB', '--out', str(tmp_path)], fake=fake) == 0
     planned = {
-        normalize_header(cmd.split(' ', 1)[0])
+        _header_key(cmd)
         for _heading, commands in hw_probe.plan('AB')
         for cmd in commands
         if not cmd.startswith('raw socket')
     }
-    sent = {normalize_header(cmd.strip().split(' ', 1)[0]) for cmd in fake.log}
+    sent = {_header_key(cmd) for cmd in fake.log}
     assert sent <= planned, sent - planned
 
 
@@ -185,7 +194,7 @@ def test_the_tool_never_sends_the_forbidden_commands(tmp_path: Path) -> None:
     for cmd in fake.log:
         assert not cmd.upper().startswith('*RST'), cmd
         assert '/config' not in cmd.lower(), cmd
-        assert not (normalize_header(cmd.split(' ', 1)[0]) == 'TRAN:PULS' and ' ' in cmd), cmd
+        assert not (_header_key(cmd) == 'TRAN:PULS' and ' ' in cmd), cmd
 
 
 def test_phase_a_is_read_only_except_bad_headers(tmp_path: Path) -> None:
@@ -193,7 +202,9 @@ def test_phase_a_is_read_only_except_bad_headers(tmp_path: Path) -> None:
     assert hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)], fake=fake) == 0
     writes = [c for c in fake.log if not c.rstrip().endswith('?')]
     first_restore = max(i for i, c in enumerate(fake.log) if c == 'STOP')
-    before_teardown = [c for c in fake.log[:first_restore] if c in writes]
+    # tearDown opens with an unchecked `TRAN:ENAB OFF` before its STOP: that is the restore
+    teardown_start = max(i for i, c in enumerate(fake.log[:first_restore]) if c == 'TRAN:ENAB OFF')
+    before_teardown = [c for c in fake.log[:teardown_start] if c in writes]
     assert before_teardown, 'the bad headers of step 5 are expected'
     assert all(c.startswith('ZZZ:NOPE') for c in before_teardown), before_teardown
 
@@ -247,7 +258,8 @@ def test_pulser_above_ceiling_exits_before_anything_is_written(
     assert 'above --max-pulse-v' in captured.err
     assert 'STEP 6:' not in captured.out
     writes = [c for c in fake.log if not c.rstrip().endswith('?')]
-    assert writes == ['STOP']  # only the harmless STOP of tearDown, no restore, no TRAN:ENAB
+    # only tearDown's unchecked TRAN:ENAB OFF (its first action) and the STOP; no restore
+    assert writes == ['TRAN:ENAB OFF', 'STOP']
     assert fake._values['TRAN:PULS'] == '30'
     assert _json_files(tmp_path)
 

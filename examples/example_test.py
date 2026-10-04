@@ -24,7 +24,6 @@ EXAMPLE_SETUP = {
     'DATA:LENG': 8192,
     'TRAN:FREQ': '2500 KHz',
     'TRAN:PULS': '20 V',  # the vendor example uses 100 V
-    'TRAN:ENAB': 'ON',
     'TRAN:DUR': 1,
     'TRAN:REVerse': 'OFF',
     'TRAN:DAMP:ENAB': 'ON',
@@ -41,6 +40,7 @@ EXAMPLE_SETUP = {
     'AVERage:DELay:RANDom': '2000 NS',
     'TRAN:GAP': '5 NS',
     'TRAN:DAMP:GAP': '30 NS',
+    'TRAN:ENAB': 'ON',  # last: the pulser comes on only after everything else is set
 }
 
 

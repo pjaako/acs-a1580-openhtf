@@ -401,16 +401,16 @@ def test_set_state_writes_in_order_with_units_and_checks_each() -> None:
     fake.log.clear()
     plug.set_state(state)
     writes = [e for e in fake.log if e != ERR]
-    # the first drain is the one that discards stale errors, then one drain per write
-    assert fake.log[0] == ERR
-    assert fake.log[1::2] == writes
-    assert fake.log[2::2] == [ERR] * len(writes)
+    # TRAN:ENAB OFF unchecked first, one drain (stale entries), then one drain per write
+    assert fake.log[:2] == ['TRAN:ENAB OFF', ERR]
+    assert fake.log[2::2] == writes[1:]
+    assert fake.log[3::2] == [ERR] * len(writes[1:])
     heads = [w.split(' ', 1)[0] for w in writes]
-    # TRAN:ENAB OFF first, the rest in STATE_HEADERS order, the snapshot's TRAN:ENAB last
+    # TRAN:ENAB OFF first, the rest in STATE_HEADERS order, TRAN:ENAB OFF again at the end
     expected = ['TRAN:ENAB'] + [h for h in STATE_HEADERS if h not in ('TRAN:ENAB', 'AVER:DEL:CONS')]
     expected.append('TRAN:ENAB')
     assert heads == expected
-    assert writes[0] == 'TRAN:ENAB OFF'
+    assert writes[0] == writes[-1] == 'TRAN:ENAB OFF'
     assert 'FREQ 100 MHZ' in writes
     assert 'TRAN:FREQ 5000 KHZ' in writes
     assert 'TRIG:INT 10000 US' in writes
@@ -418,22 +418,58 @@ def test_set_state_writes_in_order_with_units_and_checks_each() -> None:
     assert 'TRAN:PULS 20 V' in writes
     assert 'GAIN 0' in writes
     assert 'AVER:DEL:RAND 2000 NS' in writes
+    # the TGC curves are in place before the TGC mode is written
+    assert writes.index('GAIN:TGC:LIN 20.0, 0.1') < writes.index('GAIN:TGC:MODE OFF')
+    assert STATE_HEADERS.index('GAIN:TGC:ARB') < STATE_HEADERS.index('GAIN:TGC:MODE')
 
 
-def test_set_state_switches_the_pulser_off_before_any_other_restore_write() -> None:
+def test_set_state_never_writes_pulser_on_from_a_snapshot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     plug = _plug()
     fake = _fake(plug)
     plug.apply_setup({'TRAN:ENAB': 'ON'})
     state = plug.get_state()
     assert state['TRAN:ENAB'] == 'ON'
     fake.log.clear()
-    plug.set_state(state)
+    with caplog.at_level(logging.WARNING):
+        plug.set_state(state)
     writes = [e for e in fake.log if e != ERR]
-    assert writes[0] == 'TRAN:ENAB OFF'
-    assert writes[-1] == 'TRAN:ENAB ON'
-    assert writes.count('TRAN:ENAB OFF') == 1
-    assert fake.log[:3] == [ERR, 'TRAN:ENAB OFF', ERR]  # checked, right after the stale drain
-    assert plug.query('TRAN:ENAB?') == 'ON'
+    assert writes[0] == writes[-1] == 'TRAN:ENAB OFF'
+    assert writes.count('TRAN:ENAB OFF') == 2
+    assert not any(w.startswith('TRAN:ENAB ON') for w in writes)
+    assert fake.log[:2] == ['TRAN:ENAB OFF', ERR]  # unchecked, before the drain
+    assert plug.query('TRAN:ENAB?') == 'OFF'
+    assert 'snapshot had the pulser ON' in caplog.text
+
+
+@pytest.mark.parametrize('value', ['ON', '1'])
+def test_construction_warns_when_the_pulser_is_already_on(
+    value: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = FakeA1580Resource()
+    fake._values['TRAN:ENAB'] = value
+    with caplog.at_level(logging.WARNING):
+        A1580Plug(resource=fake, restore_state=True)
+    assert 'pulser was already enabled when the plug was created' in caplog.text
+    assert 'switched off in tearDown' in caplog.text
+
+
+def test_construction_does_not_warn_when_the_pulser_is_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        A1580Plug(resource=FakeA1580Resource(), restore_state=True)
+    assert 'already enabled' not in caplog.text
+
+
+def test_teardown_leaves_the_pulser_off_when_it_was_on_at_construction() -> None:
+    fake = FakeA1580Resource()
+    fake._values['TRAN:ENAB'] = 'ON'
+    plug = A1580Plug(resource=fake, restore_state=True)
+    plug.tearDown()
+    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake.closed
 
 
 def test_set_state_skips_constant_delay_while_auto_is_on() -> None:
@@ -489,9 +525,9 @@ def test_restore_state_true_snapshots_and_restores() -> None:
     plug.tearDown()
     assert fake.closed
     assert fake._values == initial
-    assert fake.log[0] == 'STOP'
+    assert fake.log[:3] == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF']  # pulser off first
+    assert fake.log[3] == ERR  # set_state: unchecked OFF, then the drain
     assert fake.stop_count == 1
-    assert fake.log[1:4] == [ERR, 'TRAN:ENAB OFF', ERR]  # pulser off before the other writes
     assert any(e.startswith('FREQ ') for e in fake.log)
 
 
@@ -510,8 +546,8 @@ def test_restore_state_false_stops_and_closes_only() -> None:
     changed = dict(fake._values)
     fake.log.clear()
     plug.tearDown()
-    # STOP, then the pulser off (checked, so one error-queue drain), nothing else restored
-    assert fake.log == ['STOP', 'TRAN:ENAB OFF', ERR]
+    # unchecked OFF, STOP, then the pulser off again (checked: one drain), nothing restored
+    assert fake.log == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF', ERR]
     assert fake._values == {**changed, 'TRAN:ENAB': 'OFF'}
     assert fake.closed
 
@@ -523,7 +559,7 @@ def test_teardown_without_restore_switches_the_pulser_off_after_stop() -> None:
     assert fake.query('TRAN:ENAB?') == 'ON'
     fake.log.clear()
     plug.tearDown()
-    assert fake.log[:2] == ['STOP', 'TRAN:ENAB OFF']
+    assert fake.log[:3] == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF']
     assert fake._values['TRAN:ENAB'] == 'OFF'
     assert fake.closed
 
@@ -584,6 +620,7 @@ def test_acquire_three() -> None:
     fake.log.clear()
     scans = plug.acquire(3)
     assert fake.log == [
+        'TRIG:INT?',  # the default timeout is derived from the trigger interval
         'DATA:LENG?',
         'FREQ?',
         'TRIG:DEL?',
@@ -653,7 +690,9 @@ def test_acquire_rejects_bad_arguments() -> None:
     assert fake.log == []
 
 
-def test_acquire_reports_instrument_errors() -> None:
+def test_acquire_logs_instrument_errors_but_returns_the_packets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     plug = _plug()
     fake = _fake(plug)
     fake._reject['STAR'] = '-200,"Execution error"'
@@ -668,8 +707,10 @@ def test_acquire_reports_instrument_errors() -> None:
             fake._errors.append('-200,"Execution error"')
 
     fake.write = noisy  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError, match='-200'):
-        plug.acquire(1)
+    with caplog.at_level(logging.WARNING):
+        scans = plug.acquire(1)  # the data arrived: the late device error is a warning
+    assert len(scans) == 1
+    assert '-200' in caplog.text
     assert plug._data_sock is None
     assert not fake.started
 
@@ -734,7 +775,7 @@ def test_stream_delivers_and_stops() -> None:
     fake = _fake(plug)
     got: list[AScan] = []
     plug.start_stream(got.append)
-    thread = plug._stream_thread
+    thread = plug._stream.thread if plug._stream else None
     assert thread is not None and thread.daemon
     assert _wait_for(lambda: len(got) >= 5, 1.0)
     count = plug.stop_stream()
@@ -742,7 +783,7 @@ def test_stream_delivers_and_stops() -> None:
     assert not thread.is_alive()
     assert not fake.started
     assert fake.sockets[0].closed
-    assert plug._data_sock is None and plug._stream_thread is None
+    assert plug._data_sock is None and plug._stream is None
     assert fake.log[-2:] == ['STOP', ERR]
     assert [s.header.packet_number for s in got[:3]] == [0, 1, 2]
     assert plug.stop_stream() == 0  # nothing running any more
@@ -776,7 +817,7 @@ def test_stream_callback_exception_surfaces_from_stop_stream(
 
     with caplog.at_level(logging.ERROR):
         plug.start_stream(boom)
-        thread = plug._stream_thread
+        thread = plug._stream.thread if plug._stream else None
         assert thread is not None
         thread.join(2.0)
         assert not thread.is_alive()  # the failure stopped the stream by itself
@@ -785,7 +826,7 @@ def test_stream_callback_exception_surfaces_from_stop_stream(
         plug.stop_stream()
     assert calls == [1]
     assert not fake.started  # cleanup still ran
-    assert plug._data_sock is None and plug._stream_thread is None
+    assert plug._data_sock is None and plug._stream is None
     assert plug.stop_stream() == 0  # the failure is reported once
     assert len(plug.acquire(1)) == 1
 
@@ -793,7 +834,7 @@ def test_stream_callback_exception_surfaces_from_stop_stream(
 def test_stream_stall_surfaces_as_timeout() -> None:
     plug = _plug(signal='none')
     plug.start_stream(lambda s: None, timeout_s=0.1)
-    thread = plug._stream_thread
+    thread = plug._stream.thread if plug._stream else None
     assert thread is not None
     thread.join(2.0)
     assert not thread.is_alive()
@@ -805,9 +846,9 @@ def test_stream_connection_loss_surfaces() -> None:
     plug = _plug()
     plug.start_stream(lambda s: time.sleep(0.001))
     fake = _fake(plug)
-    assert _wait_for(lambda: plug._stream_count >= 1)
+    assert _wait_for(lambda: plug._stream is not None and plug._stream.count >= 1)
     fake.sockets[0].shut = True  # the peer closes: recv returns b''
-    thread = plug._stream_thread
+    thread = plug._stream.thread if plug._stream else None
     assert thread is not None
     thread.join(2.0)
     with pytest.raises(ConnectionError):
@@ -818,7 +859,7 @@ def test_teardown_stops_a_running_stream() -> None:
     fake = FakeA1580Resource()
     plug = A1580Plug(resource=fake, restore_state=True)
     plug.start_stream(lambda s: None)
-    thread = plug._stream_thread
+    thread = plug._stream.thread if plug._stream else None
     assert thread is not None
     plug.tearDown()
     assert not thread.is_alive()
@@ -891,9 +932,9 @@ def test_host_defaults_to_config() -> None:
 
 def test_data_port_comes_from_the_reply_not_a_constant() -> None:
     fake = FakeA1580Resource()
-    fake._values['DATA:PORT'] = '5025'
+    fake._values['DATA:PORT'] = '2800'
     A1580Plug(resource=fake, restore_state=False).acquire(1)
-    assert fake.connections[0][1] == 5025
+    assert fake.connections[0][1] == 2800
 
 
 class _StubRM:
@@ -1052,3 +1093,1075 @@ def test_example_host_option_only_sets_the_config_in_fake_mode() -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'num_points=' in result.stdout
+
+
+# ══ review fixes ═════════════════════════════════════════════════════════════
+# Numbered as in the review: 1 teardown, 2-3 set_state, 4 keywords, 5 example, 6 get_state,
+# 7 apply_setup, 8 set_state failures, 9-10 acquire, 11 framing, 12-13 matching,
+# 14 streams, 15 lock, 16 visa errors.
+
+
+def _flaky(
+    fake: FakeA1580Resource, method: str, bad: Callable[[str], bool], exc: Exception
+) -> None:
+    """Make `fake.<method>(cmd)` raise `exc` whenever `bad(cmd)`."""
+    original = getattr(fake, method)
+
+    def wrapper(cmd: str) -> Any:
+        if bad(cmd):
+            fake.log.append(cmd)
+            raise exc
+        return original(cmd)
+
+    setattr(fake, method, wrapper)
+
+
+# ── 1. tearDown: the first action is an unchecked TRAN:ENAB OFF ──────────────
+
+
+@pytest.mark.parametrize('restore', [True, False])
+def test_teardown_first_action_is_an_unchecked_pulser_off(restore: bool) -> None:
+    fake = FakeA1580Resource()
+    plug = A1580Plug(resource=fake, restore_state=restore)
+    plug.apply_setup({'TRAN:ENAB': 'ON'})
+    fake.log.clear()
+    plug.tearDown()
+    assert fake.log[0] == 'TRAN:ENAB OFF'  # before STOP, before any error-queue read
+    assert fake.log[1] == 'STOP'
+    assert fake._values['TRAN:ENAB'] == 'OFF'
+
+
+def test_teardown_pulser_off_comes_before_stopping_a_running_stream() -> None:
+    fake = FakeA1580Resource()
+    plug = A1580Plug(resource=fake, restore_state=False)
+    plug.start_stream(lambda s: None)
+    mark = len(fake.log)
+    plug.tearDown()
+    assert fake.log[mark] == 'TRAN:ENAB OFF'
+    assert fake.log.index('STOP', mark) > mark
+
+
+def test_teardown_goes_on_when_the_first_pulser_off_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeA1580Resource()
+    plug = A1580Plug(resource=fake, restore_state=False)
+    calls: list[str] = []
+    original = fake.write
+
+    def write(cmd: str) -> None:
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise OSError('link hiccup')
+        original(cmd)
+
+    fake.write = write  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        plug.tearDown()
+    assert calls == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF']  # the checked one still follows
+    assert 'pulser off first' in caplog.text
+    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake.closed
+
+
+# ── 2. set_state: OFF before the drain ───────────────────────────────────────
+
+
+def test_set_state_goes_on_when_the_first_drain_raises(caplog: pytest.LogCaptureFixture) -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    state = plug.get_state()
+    plug.apply_setup({'FREQ': '50 MHZ'})
+    seen: list[int] = []
+    original = fake.query
+
+    def query(cmd: str) -> str:
+        if cmd == ERR and not seen:
+            seen.append(1)
+            raise OSError('drain failed')
+        return original(cmd)
+
+    fake.query = query  # type: ignore[method-assign]
+    fake.log.clear()
+    with caplog.at_level(logging.WARNING):
+        plug.set_state(state)
+    assert fake.log[0] == 'TRAN:ENAB OFF'  # the unchecked write came before the failing drain
+    assert 'draining the error queue failed' in caplog.text
+    assert fake._values['FREQ'] == '100000000'  # the restore happened
+    assert fake._values['TRAN:ENAB'] == 'OFF'
+
+
+def test_set_state_sends_nothing_else_when_the_first_off_cannot_be_written() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    state = plug.get_state()
+    _flaky(fake, 'write', lambda c: c == 'TRAN:ENAB OFF', OSError('down'))
+    fake.log.clear()
+    with pytest.raises(RuntimeError, match='nothing restored'):
+        plug.set_state(state)
+    assert fake.log == ['TRAN:ENAB OFF']
+
+
+# ── 3. never TRAN:ENAB ON from a snapshot ────────────────────────────────────
+
+
+def test_set_state_without_a_pulser_entry_still_ends_off() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    state = plug.get_state()
+    del state['TRAN:ENAB']
+    plug.apply_setup({'TRAN:ENAB': 'ON'})
+    fake.log.clear()
+    plug.set_state(state)
+    assert fake.log[-2:] == ['TRAN:ENAB OFF', ERR]
+    assert fake._values['TRAN:ENAB'] == 'OFF'
+
+
+def test_docstrings_describe_the_pulser_rule() -> None:
+    assert 'pulser off' in (A1580Plug.__doc__ or '')
+    assert 'never writes' in (A1580Plug.set_state.__doc__ or '') or 'never' in (
+        A1580Plug.set_state.__doc__ or ''
+    )
+
+
+# ── 4. keywords on TRAN:PULS ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize('keyword', ['MIN', 'MAX', 'DEF', 'UP', 'DOWN', 'maximum', 'Default'])
+@pytest.mark.parametrize('header', ['TRAN:PULS', 'TRANsmitter:PULSe:LEVel', 'SOUR:TRAN:PULS'])
+def test_pulser_voltage_by_keyword_is_refused_before_anything_is_written(
+    header: str, keyword: str
+) -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    fake.log.clear()
+    with pytest.raises(ValueError, match='refuse to set the pulser voltage by keyword'):
+        plug.apply_setup({'GAIN': 5, header: keyword, 'FREQ': '50 MHZ'})
+    assert fake.log == []  # not even the GAIN before it
+    assert plug.query('GAIN?') == '0'
+
+
+def test_other_headers_keep_the_warn_and_pass_behaviour_for_keywords(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plug = _plug()
+    with caplog.at_level(logging.WARNING):
+        plug.apply_setup({'GAIN': 'MAX', 'TRAN:FREQ': 'DEF'})
+    assert caplog.text.count('cannot be verified') == 2
+
+
+# ── 5. the example sets the pulser last ──────────────────────────────────────
+
+
+def test_example_setup_enables_the_pulser_last() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        'example_under_test', ROOT / 'examples' / 'example_test.py'
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    keys = list(module.EXAMPLE_SETUP)
+    assert keys[-1] == 'TRAN:ENAB'
+    assert keys.count('TRAN:ENAB') == 1
+    assert module.EXAMPLE_SETUP['TRAN:ENAB'] == 'ON'
+
+
+# ── 6. get_state survives a header that raises ───────────────────────────────
+
+
+class _NoAnswerFake(FakeA1580Resource):
+    """No reply (timeout) to one header, like a firmware that lacks it."""
+
+    def __init__(self, header: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.header = header
+
+    def query(self, cmd: str) -> str:
+        if cmd == f'{self.header}?':
+            self.log.append(cmd)
+            self._errors.append('-113,"Undefined header"')
+            raise TimeoutError('no reply')
+        return super().query(cmd)
+
+
+def test_get_state_omits_a_header_that_raises_and_drains_the_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _NoAnswerFake('FILT:HPAS:IND')
+    with caplog.at_level(logging.WARNING):
+        plug = A1580Plug(resource=fake, restore_state=True)  # the constructor survives
+    assert plug._initial_state is not None
+    assert 'FILT:HPAS:IND' not in plug._initial_state
+    assert len(plug._initial_state) == len(STATE_HEADERS) - 1
+    assert 'FILT:HPAS:IND' in caplog.text
+    assert 'flush' in fake.log  # the late reply was discarded
+    assert fake._errors == []  # the -113 was drained
+    # and the restore skips it
+    fake.log.clear()
+    plug.tearDown()
+    assert not any(e.startswith('FILT:HPAS:IND ') for e in fake.log)
+
+
+def test_get_state_gives_up_after_three_consecutive_transport_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeA1580Resource()
+    plug = A1580Plug(resource=fake, restore_state=False)
+    original = fake.query
+    asked: list[str] = []
+
+    def query(cmd: str) -> str:
+        if cmd != ERR:
+            asked.append(cmd)
+        if len(asked) > 2:  # everything after the second header times out, the drain too
+            raise TimeoutError('no reply')
+        return original(cmd)
+
+    fake.query = query  # type: ignore[method-assign]
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        state = plug.get_state()
+    assert time.monotonic() - started < 0.5
+    assert list(state) == list(STATE_HEADERS[:2])
+    assert asked == [f'{h}?' for h in STATE_HEADERS[:5]]  # two good ones, then three failures
+    remaining = len(STATE_HEADERS) - 5
+    assert (
+        f'link appears dead after 3 consecutive transport errors; '
+        f'skipping the remaining {remaining} headers'
+    ) in caplog.text
+
+
+def test_get_state_survives_a_failing_drain(caplog: pytest.LogCaptureFixture) -> None:
+    fake = FakeA1580Resource()
+    plug = A1580Plug(resource=fake, restore_state=False)
+    failed = {'on': False}
+    original = fake.query
+
+    def query(cmd: str) -> str:
+        if cmd == 'FILT:HPAS:IND?':
+            failed['on'] = True
+            raise TimeoutError('no reply')
+        if cmd == ERR and failed['on']:
+            failed['on'] = False
+            raise OSError('drain broke')
+        return original(cmd)
+
+    fake.query = query  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        state = plug.get_state()
+    assert 'FILT:HPAS:IND' not in state
+    assert len(state) == len(STATE_HEADERS) - 1
+    assert 'draining the error queue after FILT:HPAS:IND? failed' in caplog.text
+
+
+# ── 7. apply_setup: any exception becomes a failure ──────────────────────────
+
+
+def test_apply_setup_collects_an_exception_and_goes_on() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    _flaky(fake, 'write', lambda c: c.startswith('GAIN '), OSError('link hiccup'))
+    with pytest.raises(RuntimeError, match=r'GAIN.*OSError.*link hiccup') as exc:
+        plug.apply_setup({'FREQ': '50 MHZ', 'GAIN': 5, 'TRAN:DUR': 2})
+    assert 'FREQ' not in str(exc.value).replace('apply_setup', '')
+    assert plug.query('FREQ?') == '50000000'  # before it
+    assert plug.query('TRAN:DUR?') == '2'  # after it
+    assert 'flush' in fake.log  # a late reply is discarded after the exception
+
+
+def test_apply_setup_collects_an_exception_from_the_drain() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    original = fake.query
+    count = {'n': 0}
+
+    def query(cmd: str) -> str:
+        if cmd == ERR:
+            count['n'] += 1
+            if count['n'] == 1:
+                raise ValueError('garbled')
+        return original(cmd)
+
+    fake.query = query  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match='ValueError: garbled'):
+        plug.apply_setup({'GAIN': 5, 'TRAN:DUR': 2})
+    assert plug.query('TRAN:DUR?') == '2'
+
+
+def test_apply_setup_without_flush_support_is_fine() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    fake.flush = None  # type: ignore[assignment,method-assign]
+    fake.clear = None  # type: ignore[assignment,method-assign]
+    _flaky(fake, 'write', lambda c: c.startswith('GAIN '), OSError('x'))
+    with pytest.raises(RuntimeError, match='GAIN'):
+        plug.apply_setup({'GAIN': 5, 'TRAN:DUR': 2})
+    assert plug.query('TRAN:DUR?') == '2'
+
+
+def test_apply_setup_falls_back_to_clear_when_flush_fails() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+
+    def broken_flush(mask: object = None) -> None:
+        raise OSError('not supported')
+
+    fake.flush = broken_flush  # type: ignore[method-assign]
+    _flaky(fake, 'write', lambda c: c.startswith('GAIN '), OSError('x'))
+    with pytest.raises(RuntimeError):
+        plug.apply_setup({'GAIN': 5})
+    assert 'clear' in fake.log
+
+
+# ── 8. set_state collects failures ───────────────────────────────────────────
+
+
+def test_set_state_continues_after_a_failed_header_and_raises_at_the_end() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    state = plug.get_state()
+    _change_things(plug)
+    fake._reject['TRAN:PULS'] = '-222,"Data out of range"'
+    fake._reject['FREQ'] = '-222,"Data out of range"'
+    fake.log.clear()
+    with pytest.raises(RuntimeError, match='set_state failed') as exc:
+        plug.set_state(state)
+    message = str(exc.value)
+    assert 'TRAN:PULS' in message and 'FREQ' in message
+    assert message.count('set_state failed') == 1
+    writes = [e for e in fake.log if e != ERR]
+    assert 'GAIN 0' in writes and 'AVER:DEL:RAND 2000 NS' in writes  # the later headers
+    assert writes[-1] == 'TRAN:ENAB OFF'  # the final OFF came before the raise
+    assert fake._values['GAIN'] == '0'
+    assert fake._values['TRAN:ENAB'] == 'OFF'
+
+
+def test_set_state_collects_a_transport_error_and_discards_the_late_reply() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    state = plug.get_state()
+    _flaky(fake, 'write', lambda c: c.startswith('TRAN:DUR '), OSError('link hiccup'))
+    fake.log.clear()
+    with pytest.raises(RuntimeError, match=r'TRAN:DUR.*link hiccup'):
+        plug.set_state(state)
+    assert 'flush' in fake.log
+    assert 'GAIN 0' in fake.log  # went on
+    assert fake.log[-2:] == ['TRAN:ENAB OFF', ERR]
+
+
+def test_set_state_gives_up_after_three_consecutive_transport_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    state = plug.get_state()
+    todo = [h for h in STATE_HEADERS if h != 'TRAN:ENAB' and state.get(h, '').strip()]
+    todo = [h for h in todo if h != 'AVER:DEL:CONS']  # skipped while AVER:DEL:CONS:AUTO is ON
+    seen: list[str] = []
+    original = fake.write
+
+    def write(cmd: str) -> None:
+        seen.append(cmd)
+        if len(seen) > 3:  # the OFF, then the first two headers; everything later times out
+            fake.log.append(cmd)
+            raise TimeoutError('no reply')
+        original(cmd)
+
+    fake.write = write  # type: ignore[method-assign]
+    fake.log.clear()
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match='set_state failed'):
+        plug.set_state(state)
+    assert time.monotonic() - started < 0.5
+    assert len(seen) == 3 + 3 + 1  # OFF + two good + three failing headers + the final OFF
+    assert seen[-1] == 'TRAN:ENAB OFF'  # the final OFF was still attempted
+    remaining = len(todo) - 5
+    assert (
+        f'link appears dead after 3 consecutive transport errors; '
+        f'skipping the remaining {remaining} headers'
+    ) in caplog.text
+
+
+def test_set_state_skips_empty_snapshot_values() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    state = plug.get_state()
+    state['FILT:HPAS:IND'] = ''
+    state['TRAN:IMP'] = '  '
+    fake.log.clear()
+    plug.set_state(state)
+    assert not any(e.startswith(('FILT:HPAS:IND ', 'TRAN:IMP ')) for e in fake.log)
+    assert plug.check_errors() == []
+
+
+def test_state_headers_order() -> None:
+    assert STATE_HEADERS == (
+        'FREQ',
+        'DATA:LENG',
+        'MODE',
+        'TRAN:TYPE',
+        'TRAN:REV',
+        'TRAN:PULS',
+        'TRAN:FREQ',
+        'TRAN:DUR',
+        'TRAN:GAP',
+        'TRAN:DAMP',
+        'TRAN:DAMP:GAP',
+        'TRAN:IMP',
+        'TRAN:ENAB',
+        'TRIG:MODE',
+        'TRIG:INT',
+        'TRIG:DEL',
+        'GAIN',
+        'GAIN:PRE:COMB',
+        'GAIN:PRE:SPLIT',
+        'GAIN:TGC:LIN',
+        'GAIN:TGC:ARB',
+        'GAIN:TGC:MODE',
+        'AVER:COUN',
+        'AVER:DEL:CONS:AUTO',
+        'AVER:DEL:CONS',
+        'AVER:DEL:RAND',
+        'FILT:HPAS:IND',
+    )
+
+
+# ── 9. parsing the geometry replies ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize('reply', ['1024.5', 'abc', '', 'nan', 'inf'])
+@pytest.mark.parametrize('method', ['acquire', 'start_stream'])
+def test_data_length_must_be_an_integer(reply: str, method: str) -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    fake._values['DATA:LENG'] = reply
+    fake.log.clear()
+    call = plug.acquire if method == 'acquire' else (lambda: plug.start_stream(lambda s: None))
+    with pytest.raises(RuntimeError, match=r'DATA:LENG\? reply') as exc:
+        call()
+    assert repr(reply) in str(exc.value)
+    assert 'STAR AUTO' not in fake.log
+    assert fake.connections == []
+
+
+@pytest.mark.parametrize('reply', ['1024.0', '+1024', '1.024E3'])
+def test_data_length_accepts_an_integral_float_text(reply: str) -> None:
+    plug = _plug()
+    _fake(plug)._values['DATA:LENG'] = reply
+    (scan,) = plug.acquire(1)
+    assert len(scan.raw) == 1024
+
+
+@pytest.mark.parametrize(
+    ('reply', 'expected'), [('15000', 15000), ('15000.4', 15000), ('15000.6', 15001)]
+)
+def test_trigger_delay_is_rounded_and_a_fraction_is_flagged(
+    reply: str, expected: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    plug = _plug()
+    _fake(plug)._values['TRIG:DEL'] = reply
+    with caplog.at_level(logging.WARNING):
+        (scan,) = plug.acquire(1)
+    assert scan.trigger_delay_ns == expected
+    assert ('CONFLICT 4' in caplog.text) is (reply != '15000')
+
+
+def test_trigger_delay_that_is_not_a_number_raises() -> None:
+    plug = _plug()
+    _fake(plug)._values['TRIG:DEL'] = 'soon'
+    with pytest.raises(RuntimeError, match="TRIG:DEL\\? reply 'soon'"):
+        plug.acquire(1)
+
+
+@pytest.mark.parametrize('method', ['acquire', 'start_stream'])
+def test_data_port_equal_to_the_scpi_port_is_refused(method: str) -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    fake._values['DATA:PORT'] = '5025'
+    fake.log.clear()
+    call = plug.acquire if method == 'acquire' else (lambda: plug.start_stream(lambda s: None))
+    with pytest.raises(RuntimeError, match=r'DATA:PORT\? returned the SCPI port 5025.*CONFLICT 1'):
+        call()
+    assert fake.connections == []
+    assert 'STAR AUTO' not in fake.log
+    assert plug._stream is None and plug._data_sock is None
+
+
+def test_data_port_check_uses_the_configured_scpi_port() -> None:
+    plug = _plug()
+    plug._scpi_port = 2758  # the port the resource was opened with
+    with pytest.raises(RuntimeError, match='SCPI port 2758'):
+        plug.acquire(1)
+
+
+# ── 10. acquire: default timeout, error decoration, late device errors ───────
+
+
+def _record_read_timeouts(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    from a1580_openhtf.stream import FrameReader
+
+    seen: list[float] = []
+    original = FrameReader.read
+
+    def read(self: FrameReader, n: int, timeout_s: float) -> list[bytes]:
+        seen.append(timeout_s)
+        return original(self, n, timeout_s)
+
+    monkeypatch.setattr(FrameReader, 'read', read)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ('interval', 'n', 'expected'),
+    [('10 MS', 1, 5.0), ('2 S', 3, 14.0), ('100 US', 100, 5.0), ('1 S', 10, 22.0)],
+)
+def test_acquire_default_timeout_follows_the_trigger_interval(
+    monkeypatch: pytest.MonkeyPatch, interval: str, n: int, expected: float
+) -> None:
+    plug = _plug()
+    plug.apply_setup({'TRIG:INT': interval})
+    seen = _record_read_timeouts(monkeypatch)
+    plug.acquire(n)
+    assert seen == [pytest.approx(expected)]
+
+
+def test_acquire_explicit_timeout_does_not_query_the_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    seen = _record_read_timeouts(monkeypatch)
+    fake.log.clear()
+    plug.acquire(1, timeout_s=3.0)
+    assert seen == [3.0]
+    assert 'TRIG:INT?' not in fake.log
+
+
+def test_acquire_default_timeout_falls_back_when_the_interval_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    plug = _plug()
+    _fake(plug)._values['TRIG:INT'] = 'garbage'
+    seen = _record_read_timeouts(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        plug.acquire(1)
+    assert seen == [5.0]
+    assert 'TRIG:INT? failed' in caplog.text
+
+
+def test_acquire_connection_error_carries_the_same_suffix() -> None:
+    fake = FakeA1580Resource()
+
+    def factory(host: str, port: int) -> Any:
+        sock = fake.data_socket_factory(host, port)
+        sock.shut = True  # recv returns b'': the device closed the connection
+        return sock
+
+    plug = A1580Plug(resource=fake, data_socket_factory=factory, restore_state=False)
+    with pytest.raises(ConnectionError, match=r'\(DATA:LENG=1024, port=2758\)'):
+        plug.acquire(1, timeout_s=1.0)
+    assert plug._data_sock is None
+
+
+def test_acquire_failed_stop_still_raises() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    _flaky(fake, 'write', lambda c: c == 'STOP', OSError('link down'))
+    with pytest.raises(RuntimeError, match='STOP failed'):
+        plug.acquire(1)
+
+
+# ── 11. framing statistics in the log ────────────────────────────────────────
+
+
+def test_acquire_logs_frame_stats_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    plug = _plug()
+    with caplog.at_level(logging.INFO):
+        plug.acquire(2)
+    assert 'acquire: frame stats' in caplog.text
+    assert 'framing problems' not in caplog.text
+
+
+def test_acquire_warns_about_dropped_bytes(caplog: pytest.LogCaptureFixture) -> None:
+    plug = _plug(garbage_prefix=b'xx')
+    with caplog.at_level(logging.INFO):
+        plug.acquire(1)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        'framing problems' in r.getMessage() and 'dropped_bytes=2' in r.getMessage()
+        for r in warnings
+    )
+
+
+class _BytesSocket:
+    """Serves `data` once, then times out."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def settimeout(self, value: float | None) -> None:
+        pass
+
+    def recv(self, n: int) -> bytes:
+        if self.data:
+            out, self.data = self.data, b''
+            return out
+        time.sleep(0.001)
+        raise TimeoutError('nothing more')
+
+    def shutdown(self, how: int) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_acquire_warns_about_misaligned_packets(caplog: pytest.LogCaptureFixture) -> None:
+    fake = FakeA1580Resource()  # DATA:LENG 1024 ...
+    wide = build_packet([0] * 2048)  # ... but the stream carries 2048 samples per packet
+
+    plug = A1580Plug(
+        resource=fake, data_socket_factory=lambda h, p: _BytesSocket(wide), restore_state=False
+    )
+    with caplog.at_level(logging.INFO):
+        plug.acquire(1)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('framing problems' in m and 'misaligned=1' in m for m in warnings)
+
+
+def test_stop_stream_logs_frame_stats_and_warns(caplog: pytest.LogCaptureFixture) -> None:
+    plug = _plug(garbage_prefix=b'xx')
+    got: list[AScan] = []
+    plug.start_stream(got.append)
+    assert _wait_for(lambda: len(got) >= 1)
+    with caplog.at_level(logging.INFO):
+        plug.stop_stream()
+    assert 'stop_stream: frame stats' in caplog.text
+    assert any(
+        r.levelno == logging.WARNING and 'framing problems' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+# ── 12. values_match false positives ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ('header', 'sent', 'reply', 'expected'),
+    [
+        ('FILT:HPAS:IND', '1', 'ON', False),
+        ('FILT:HPAS:IND', '0', 'OFF', False),
+        ('TRAN:IMP', '200', '2000 OHM', False),
+        ('GAIN:TGC:MODE', 'LINear', 'LINEARX', False),
+        ('TRIG:DEL', '2147483647 NS', '2147483000', False),
+        ('FREQ', '', '', False),
+        ('MODE', '', 'MASTER', False),
+        ('GAIN', ' ', '10', False),
+        # the existing positives still hold
+        ('TRAN:ENAB', 'ON', '1', True),
+        ('TRAN:DAMP', 'OFF', '0', True),
+        ('GAIN:TGC:MODE', 'LINear', 'LINEAR', True),
+        ('GAIN:TGC:MODE', 'LINear', 'LIN', True),
+        ('TRIG:MODE', 'INTERNAL', 'INT', True),
+        ('TRIG:MODE', 'INT', 'INTERNAL', True),
+        ('TRIG:DEL', '2147483647 NS', '2147483647', True),
+        ('FREQ', '100 MHZ', '100000000', True),
+        # integer replies: half a unit, in the reply unit
+        ('TRIG:DEL', '15 US', '15000.4', True),
+        ('TRIG:DEL', '15 US', '15001', False),
+        ('FREQ', '100 MHZ', '100000001', False),
+        ('TRAN:FREQ', '2500 KHz', '2500000.3', True),
+        ('DATA:LENG', '8192', '8193', False),
+        ('AVER:COUN', '3', '3.4', True),
+        ('FILT:HPAS:IND', '2', '3', False),
+        ('TRAN:PULS', '20 V', '20.4', True),
+        ('TRAN:PULS', '20 V', '21', False),
+        # float replies keep the relative tolerance
+        ('GAIN', '10', '10.0000001', True),
+        ('TRIG:INT', '100000 US', '100.0000001E-3', True),
+        # booleans only for boolean headers
+        ('TRAN:IMP', '1', 'ON', False),
+        ('GAIN:PRE:SPLIT', 'ON', '1', True),
+        ('AVER:DEL:CONS:AUTO', 'OFF', '0', True),
+        ('TRAN:REV', 'ON', '0', False),
+        # an enumeration needs an alphabetic token of 3+ letters
+        ('TRAN:IMP', '200', '2000', False),
+        ('MODE', 'MA', 'MASTER', False),
+    ],
+)
+def test_values_match_false_positives_and_tolerances(
+    header: str, sent: str, reply: str, expected: bool
+) -> None:
+    assert values_match(header, sent, reply) is expected
+
+
+def test_boolean_and_integer_header_sets() -> None:
+    from a1580_openhtf.plug import BOOLEAN_HEADERS, INTEGER_REPLY_HEADERS
+
+    assert BOOLEAN_HEADERS == {
+        'TRAN:ENAB',
+        'TRAN:REV',
+        'TRAN:DAMP',
+        'GAIN:PRE:COMB',
+        'GAIN:PRE:SPLIT',
+        'AVER:DEL:CONS:AUTO',
+    }
+    assert INTEGER_REPLY_HEADERS == {
+        'FREQ',
+        'TRAN:FREQ',
+        'TRIG:DEL',
+        'TRAN:GAP',
+        'TRAN:DAMP:GAP',
+        'DATA:LENG',
+        'TRAN:PULS',
+        'AVER:COUN',
+        'FILT:HPAS:IND',
+    }
+
+
+# ── 13. normalize_header: only known nodes ───────────────────────────────────
+
+_ALL_FORMS = {
+    'TRAN': 'TRANSMITTER',
+    'PULS': 'PULSE',
+    'FREQ': 'FREQUENCY',
+    'ENAB': 'ENABLE',
+    'REV': 'REVERSE',
+    'IMP': 'IMPEDANCE',
+    'TRIG': 'TRIGGERING',
+    'INT': 'INTERVAL',
+    'DEL': 'DELAY',
+    'LEV': 'LEVEL',
+    'PRE': 'PREAMP',
+    'COMB': 'COMBINED',
+    'LIN': 'LINEAR',
+    'ARB': 'ARBITRARY',
+    'AVER': 'AVERAGE',
+    'COUN': 'COUNT',
+    'CONS': 'CONSTANT',
+    'VAL': 'VALUE',
+    'RAND': 'RANDOM',
+    'FILT': 'FILTER',
+    'HPAS': 'HPASS',
+    'IND': 'INDEX',
+    'LENG': 'LENGTH',
+    'MEM': 'MEMORY',
+    'CLE': 'CLEAR',
+    'SYST': 'SYSTEM',
+    'ERR': 'ERROR',
+    'VERS': 'VERSION',
+    'STAR': 'START',
+    'DUR': 'DURATION',
+}
+
+
+@pytest.mark.parametrize(('short', 'long'), sorted(_ALL_FORMS.items()))
+def test_every_node_has_a_short_and_a_long_form(short: str, long: str) -> None:
+    from a1580_openhtf.plug import _NODES
+
+    assert _NODES[short] == short
+    assert _NODES[long] == short
+
+
+@pytest.mark.parametrize(
+    'header',
+    [
+        'GAINX',
+        'FREQUE',
+        'TRAN:PULSX',
+        'TRANSMIT:PULS',
+        'TRAN:PULS:LEVELX',
+        'NOPE:HDR',
+        'ZZZ:NOPE',
+        '',
+        ':',
+        'FRE',
+    ],
+)
+def test_normalize_header_rejects_unknown_nodes(header: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_header(header)
+
+
+def test_normalize_header_error_names_the_node() -> None:
+    with pytest.raises(ValueError, match="'GAINX'"):
+        normalize_header('GAINX')
+
+
+@pytest.mark.parametrize(
+    ('header', 'normal'),
+    [
+        ('*IDN?', '*IDN'),
+        ('*opc?', '*OPC'),
+        ('MOD', 'MODE'),
+        ('SOURce:GAIN:PREamp:SPL', 'GAIN:PRE:SPLIT'),
+        ('Sense:Average:Delay:Constant:Value', 'AVER:DEL:CONS'),
+        ('SYSTEM:ERROR:NEXT', 'SYST:ERR'),
+        ('TRIGGERING:INTERVAL', 'TRIG:INT'),
+    ],
+)
+def test_normalize_header_more_forms(header: str, normal: str) -> None:
+    assert normalize_header(header) == normal
+
+
+def test_fake_queues_113_for_unknown_nodes_and_stores_nothing() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    before = dict(fake._values)
+    fake.write('GAINX 10')
+    fake.write('FREQUE 50 MHZ')
+    errors = plug.check_errors()
+    assert [e.split(',')[0] for e in errors] == ['-113', '-113']
+    assert fake._values == before
+
+
+def test_apply_setup_with_an_unknown_node_writes_nothing() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    fake.log.clear()
+    with pytest.raises(RuntimeError, match=r"GAINX.*unknown SCPI node 'GAINX'"):
+        plug.apply_setup({'GAINX': 10})
+    assert fake.log == []
+
+
+def test_apply_setup_unknown_node_does_not_stop_the_other_keys() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    with pytest.raises(RuntimeError, match='FREQUE'):
+        plug.apply_setup({'GAIN': 4, 'FREQUE': '50 MHZ', 'TRAN:DUR': 2})
+    assert not any(e.startswith('FREQUE') for e in fake.log)
+    assert plug.query('GAIN?') == '4' and plug.query('TRAN:DUR?') == '2'
+
+
+# ── 14. per-stream state ─────────────────────────────────────────────────────
+
+
+def test_stream_state_lives_in_one_object() -> None:
+    plug = _plug()
+    got: list[AScan] = []
+    assert plug._stream is None
+    plug.start_stream(got.append)
+    stream = plug._stream
+    assert stream is not None
+    assert stream.thread is not None and stream.thread.name == 'a1580-stream'
+    assert stream.socket is _fake(plug).sockets[0]
+    assert stream.reader.stats is not None
+    assert not stream.stop_event.is_set()
+    assert _wait_for(lambda: stream.count >= 2)
+    n = plug.stop_stream()
+    assert n == stream.count == len(got)
+    assert stream.stop_event.is_set()
+    assert plug._stream is None
+    assert not hasattr(plug, '_stream_thread') and not hasattr(plug, '_stream_count')
+
+
+def test_a_second_stream_does_not_inherit_the_first_ones_state() -> None:
+    plug = _plug()
+    plug.start_stream(lambda s: None)
+    first = plug._stream
+    assert first is not None and _wait_for(lambda: first.count >= 1)
+    plug.stop_stream()
+    plug.start_stream(lambda s: None)
+    second = plug._stream
+    assert second is not None and second is not first
+    assert second.stop_event is not first.stop_event
+    plug.stop_stream()
+
+
+def test_a_stop_stream_that_cannot_join_leaves_a_zombie() -> None:
+    plug = _plug()
+    gate = threading.Event()
+    entered = threading.Event()
+
+    def stuck(scan: AScan) -> None:
+        entered.set()
+        gate.wait(10)
+
+    try:
+        plug.start_stream(stuck, timeout_s=0.05)  # join timeout = 1.05 s
+        assert entered.wait(2.0)
+        with pytest.raises(RuntimeError, match='did not stop in time'):
+            plug.stop_stream()
+        zombie = plug._stream
+        assert zombie is not None and zombie.zombie
+        with pytest.raises(RuntimeError, match='previous stream thread still alive'):
+            plug.start_stream(lambda s: None)
+        with pytest.raises(RuntimeError, match='previous stream thread still alive'):
+            plug.acquire(1)
+        with pytest.raises(RuntimeError, match='previous stream thread still alive'):
+            plug.stop_stream()
+    finally:
+        gate.set()
+    assert zombie.thread is not None
+    zombie.thread.join(2.0)
+    assert not zombie.thread.is_alive()
+    plug.start_stream(lambda s: None)  # the dead zombie is cleared
+    assert plug._stream is not zombie
+    plug.stop_stream()
+
+
+def test_the_reader_thread_records_any_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    from a1580_openhtf.stream import FrameReader
+
+    def explode(self: FrameReader, n: int, timeout_s: float) -> list[bytes]:
+        raise KeyError('reader exploded')
+
+    monkeypatch.setattr(FrameReader, 'read', explode)
+    plug = _plug()
+    plug.start_stream(lambda s: None)
+    stream = plug._stream
+    assert stream is not None and stream.thread is not None
+    stream.thread.join(2.0)
+    assert not stream.thread.is_alive()
+    with pytest.raises(KeyError, match='reader exploded'):
+        plug.stop_stream()
+
+
+def test_a_bad_packet_in_the_stream_is_a_stream_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def bad(cls: Any, packet: bytes, fs: float, delay: int) -> AScan:
+        raise ValueError('bad packet')
+
+    monkeypatch.setattr(AScan, 'from_packet', classmethod(bad))
+    plug = _plug()
+    plug.start_stream(lambda s: None)
+    stream = plug._stream
+    assert stream is not None and stream.thread is not None
+    stream.thread.join(2.0)
+    assert stream.callback_failure is None
+    with pytest.raises(ValueError, match='bad packet'):
+        plug.stop_stream()
+
+
+def test_callback_failure_is_reraised_after_logging_the_other_problems(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plug = _plug()
+    fake = _fake(plug)
+
+    def boom(scan: AScan) -> None:
+        raise ValueError('callback exploded')
+
+    plug.start_stream(boom)
+    stream = plug._stream
+    assert stream is not None and stream.thread is not None
+    stream.thread.join(2.0)
+    stream.failure = TimeoutError('also stalled')
+    _flaky(fake, 'write', lambda c: c == 'STOP', OSError('STOP lost'))
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match='callback exploded'):
+            plug.stop_stream()
+    assert 'besides the callback failure' in caplog.text
+    assert 'also stalled' in caplog.text and 'STOP lost' in caplog.text
+
+
+def test_a_device_side_close_ends_the_stream_and_acquire_says_so() -> None:
+    plug = _plug()
+    plug.start_stream(lambda s: time.sleep(0.001))
+    stream = plug._stream
+    assert stream is not None and stream.thread is not None
+    assert _wait_for(lambda: stream.count >= 1)
+    _fake(plug).sockets[0].shut = True  # the device closes the data socket
+    stream.thread.join(2.0)
+    assert not stream.thread.is_alive()
+    assert stream.peer_closed
+    with pytest.raises(RuntimeError, match='stream has ended.*closed the data socket') as exc:
+        plug.acquire(1)
+    assert 'is running' not in str(exc.value)
+    with pytest.raises(RuntimeError, match='stream has ended'):
+        plug.start_stream(lambda s: None)
+    with pytest.raises(ConnectionError):
+        plug.stop_stream()
+    assert len(plug.acquire(1)) == 1  # and everything works again
+
+
+def test_acquire_while_running_still_says_running() -> None:
+    plug = _plug()
+    plug.start_stream(lambda s: None)
+    try:
+        with pytest.raises(RuntimeError, match='while a stream is running'):
+            plug.acquire(1)
+    finally:
+        plug.stop_stream()
+
+
+# ── 15. the SCPI lock ────────────────────────────────────────────────────────
+
+
+def test_write_and_query_hold_the_scpi_lock() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    owned: list[bool] = []
+    original_write, original_query = fake.write, fake.query
+
+    def write(cmd: str) -> None:
+        owned.append(plug._scpi_lock._is_owned())  # type: ignore[attr-defined]
+        original_write(cmd)
+
+    def query(cmd: str) -> str:
+        owned.append(plug._scpi_lock._is_owned())  # type: ignore[attr-defined]
+        return original_query(cmd)
+
+    fake.write = write  # type: ignore[method-assign]
+    fake.query = query  # type: ignore[method-assign]
+    plug.write('GAIN 3')
+    assert plug.query('GAIN?') == '3'
+    plug.check_errors()
+    assert owned and all(owned)
+    assert not plug._scpi_lock._is_owned()  # type: ignore[attr-defined]
+
+
+def test_a_callback_may_query_while_the_stream_runs() -> None:
+    plug = _plug()
+    replies: list[str] = []
+
+    def callback(scan: AScan) -> None:
+        replies.append(plug.query('GAIN?'))
+
+    plug.start_stream(callback)
+    for _ in range(20):
+        assert plug.query('FREQ?') == '100000000'  # the main thread uses the resource too
+    assert _wait_for(lambda: len(replies) >= 5)
+    assert plug.stop_stream() >= 5
+    assert set(replies) == {'0'}
+
+
+def test_class_docstring_mentions_the_shared_resource_and_the_lock() -> None:
+    doc = A1580Plug.__doc__ or ''
+    assert '_scpi_lock' in doc and 'shared' in doc and 'callback' in doc
+
+
+# ── 16. visa errors from the fake ────────────────────────────────────────────
+
+
+def test_apply_setup_collects_a_visa_timeout_and_applies_later_keys() -> None:
+    pyvisa = pytest.importorskip('pyvisa')
+    plug = _plug(visa_errors=True)
+    fake = _fake(plug)
+    with pytest.raises(
+        RuntimeError, match=r'SYST:VERS.*no answer to SYST:VERS\?: VisaIOError'
+    ) as exc:
+        # SYST:VERS is a valid node chain the fake has no value for: rejected, query times out
+        plug.apply_setup({'GAIN': 6, 'SYST:VERS': 1, 'FREQ': '50 MHZ'})
+    assert 'GAIN' not in str(exc.value).split('apply_setup failed:')[1]
+    assert plug.query('GAIN?') == '6'
+    assert plug.query('FREQ?') == '50000000'  # applied after the failure
+    assert 'flush' in fake.log
+    assert plug.check_errors() == []
+    assert issubclass(pyvisa.errors.VisaIOError, Exception)
+
+
+def test_get_state_with_visa_errors_omits_the_unanswered_header() -> None:
+    pytest.importorskip('pyvisa')
+
+    class Lacking(FakeA1580Resource):
+        def query(self, cmd: str) -> str:
+            if cmd == 'GAIN:PRE:SPLIT?':
+                self._errors.append('-113,"Undefined header"')
+                raise self._timeout_error('no reply')
+            return super().query(cmd)
+
+    plug = A1580Plug(resource=Lacking(visa_errors=True), restore_state=True)
+    assert plug._initial_state is not None
+    assert 'GAIN:PRE:SPLIT' not in plug._initial_state

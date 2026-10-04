@@ -141,25 +141,30 @@ be consistent and use the vendor example's forms where it has one):
 | `write_checked(cmd)` | write, then `check_errors()`; raise `RuntimeError(f'{cmd!r}: {errors}')` if any |
 | `reset()` | `*RST`, then `check_errors()`; invalidates cached length/fs |
 | `apply_capture(capture_or_path, *, reset=False) -> Capture` | delegates to `capture.apply_capture` (SPEC-capture) |
-| `apply_setup(settings: Mapping[str, object]) -> None` | for each key in order: `write_checked(f'{key} {value}')`, then `query(f'{key}?')`, compare with `values_match` (section 3.1). Collect all failures and raise one `RuntimeError` listing them. |
-| `get_state() -> dict[str, str]` | query every header in `STATE_HEADERS` (section 3.2), return `{header: reply}` |
-| `set_state(state)` | `TRAN:ENAB OFF` first (checked), then the other headers in `STATE_HEADERS` order with `write_checked`, then the snapshot's `TRAN:ENAB` last; `AVER:DEL:CONS` is written only when `AVER:DEL:CONS:AUTO` is `OFF`/`0` in `state` |
+| `apply_setup(settings: Mapping[str, object]) -> None` | before anything is written: every header must normalise (section 3.1) and `TRAN:PULS` must not be set by keyword (`MIN`/`MAX`/`DEF`/`UP`/`DOWN`), else `ValueError`. Then for each key in order, inside one try/except per key: write, `check_errors()`, `query(f'{key}?')`, compare with `values_match`. Any exception or mismatch becomes a failure entry and later keys are still applied; after a transport exception the read buffer is flushed (best effort). One `RuntimeError` listing all failures at the end. |
+| `get_state() -> dict[str, str]` | query every header in `STATE_HEADERS` (section 3.2), return `{header: reply}`. A header that raises is logged, its queued error drained, and omitted. After 3 consecutive transport errors the rest is skipped (dead link). |
+| `set_state(state)` | `TRAN:ENAB OFF` first (unchecked, before any drain), then the other headers in `STATE_HEADERS` order with `write_checked`, failures collected, empty values skipped; `AVER:DEL:CONS` only when `AVER:DEL:CONS:AUTO` is `OFF`/`0`; always ends with a checked `TRAN:ENAB OFF` (a snapshot with the pulser ON is never re-enabled, a warning says so); one `RuntimeError` at the end if anything failed. Dead-link abort as in `get_state`. |
 | `stop()` | `STOP` |
-| `acquire(n=1, *, timeout_s=5.0) -> list[AScan]` | section 3.3 |
+| `acquire(n=1, *, timeout_s=None) -> list[AScan]` | section 3.3; `None` means `max(5, 2*n*TRIG:INT + 2)` seconds |
 | `start_stream(callback, *, timeout_s=5.0)` / `stop_stream()` | section 3.4 |
-| `tearDown()` | `stop_stream()` if running (swallow errors), `STOP`, then restore state if enabled, otherwise `TRAN:ENAB OFF` (both best effort: try/except, `self.logger.warning`, never raise), close the data socket if open, close the resource, close the resource manager if we made one. The device is never left with the pulser on. |
+| `tearDown()` | first action, before anything else and unchecked: `TRAN:ENAB OFF`; then `stop_stream()` if running (swallow errors), `STOP`, then restore state if enabled, otherwise a checked `TRAN:ENAB OFF` (all best effort: try/except, `self.logger.warning`, never raise), close the data socket if open, close the resource, close the resource manager if we made one. The device is never left with the pulser on. |
 
 ### 3.1 `values_match(header, sent, reply) -> bool` (module-level function)
 
-- Booleans: `ON`/`OFF`/`1`/`0` in either position match by truth value.
-- Enumerations: match if `reply.upper() == sent.upper()` or `reply.upper()` equals the
-  capitals of the sent mnemonic (`INTernal` -> `INT`) or the sent token is a prefix of the
-  reply (`INT` vs `INTERNAL`). Case-insensitive.
+- Headers must normalise against an explicit node table (short and long form of every mnemonic in `PROTOCOL.md`); an unknown node raises `ValueError`. `sent == ''` never matches.
+- Booleans: `ON`/`OFF`/`1`/`0` in either position match by truth value, only for `BOOLEAN_HEADERS` (`TRAN:ENAB`, `TRAN:REV`, `TRAN:DAMP`, `GAIN:PRE:COMB`, `GAIN:PRE:SPLIT`, `AVER:DEL:CONS:AUTO`).
+- Enumerations (alphabetic tokens of 3+ letters only, never numbers): match if equal
+  case-insensitively, or `reply.upper()` equals the capitals of the sent mnemonic
+  (`INTernal` -> `INT`), or the shorter token (3 or 4 letters) is a prefix of the longer
+  (`INT` vs `INTERNAL`). `LINear` vs `LINEARX` is False.
 - Numbers with an optional unit suffix in `sent` (`100 MHZ`, `2500 KHz`, `100000 US`,
   `0 NS`, `100 V`, `10 DB`): convert to the reply's base unit using `REPLY_UNITS`
   (`FREQ`, `TRAN:FREQ` -> Hz; `TRIG:INT`, `AVER:DEL:CONS`, `AVER:DEL:RAND` -> s;
   `TRIG:DEL`, `TRAN:GAP`, `TRAN:DAMP:GAP` -> ns; `TRAN:PULS` -> V; `GAIN` -> dB;
-  unit-less otherwise) and compare with `math.isclose(rel_tol=1e-6, abs_tol=1e-12)`.
+  unit-less otherwise) and compare with `math.isclose(rel_tol=1e-6, abs_tol=1e-12)`;
+  headers whose reply is an integer (`FREQ`, `TRAN:FREQ`, `TRIG:DEL`, `TRAN:GAP`,
+  `TRAN:DAMP:GAP`, `DATA:LENG`, `TRAN:PULS`, `AVER:COUN`, `FILT:HPAS:IND`) use
+  `abs_tol=0.5` in reply units instead, so a clamp of one LSB is a mismatch.
   Header lookup must accept long and short forms and an optional leading `SOUR:`/`SENS:`
   (normalise the header first: upper-case, strip the optional roots, keep only the
   capital letters of each mnemonic).
@@ -172,7 +177,7 @@ be consistent and use the vendor example's forms where it has one):
 In this order: `FREQ`, `DATA:LENG`, `MODE`, `TRAN:TYPE`, `TRAN:REV`, `TRAN:PULS`,
 `TRAN:FREQ`, `TRAN:DUR`, `TRAN:GAP`, `TRAN:DAMP`, `TRAN:DAMP:GAP`, `TRAN:IMP`,
 `TRAN:ENAB`, `TRIG:MODE`, `TRIG:INT`, `TRIG:DEL`, `GAIN`, `GAIN:PRE:COMB`,
-`GAIN:PRE:SPLIT`, `GAIN:TGC:MODE`, `GAIN:TGC:LIN`, `GAIN:TGC:ARB`, `AVER:COUN`,
+`GAIN:PRE:SPLIT`, `GAIN:TGC:LIN`, `GAIN:TGC:ARB`, `GAIN:TGC:MODE`, `AVER:COUN`,
 `AVER:DEL:CONS:AUTO`, `AVER:DEL:CONS`, `AVER:DEL:RAND`, `FILT:HPAS:IND`.
 `set_state` switches the pulser off before any other write and restores `TRAN:ENAB` last,
 so the pulser is off while amplitude, frequency and impedance change. If the device's real short forms differ, that is a hardware finding; keep
@@ -180,16 +185,20 @@ the list in one place.
 
 ### 3.3 `acquire(n, timeout_s)`
 
-1. `length = int(query('DATA:LENG?'))`, `fs = float(query('FREQ?'))`,
-   `delay = int(float(query('TRIG:DEL?')))`, `port = int(query('DATA:PORT?'))`.
+1. `length` from `DATA:LENG?` (must be an integral number, else `RuntimeError` naming the
+   reply), `fs = float(query('FREQ?'))`, `delay = int(round(float(query('TRIG:DEL?'))))`
+   (warning if not integral, see CONFLICT 4), `port = int(query('DATA:PORT?'))`; if `port`
+   equals the SCPI port raise `RuntimeError` citing CONFLICT 1 before opening anything.
 2. Open the data socket via the factory. Create `FrameReader(sock, length)`.
 3. `write('STAR AUTO')`.
 4. `reader.read(n, timeout_s)`.
-5. In `finally`: `write('STOP')`, close the socket, then `check_errors()`; if errors,
-   raise `RuntimeError`.
+5. In `finally`: `write('STOP')`, close the socket, log `reader.stats` (warning if bytes
+   were dropped or packets misaligned), then `check_errors()`; device errors found here are
+   logged as warnings and the packets are still returned (a failed `STOP` still raises).
 6. Return `[AScan.from_packet(p, fs, delay) for p in packets]`.
-`ValueError` if `n < 1` or `timeout_s <= 0`. A `TimeoutError` from the reader propagates
-after the `finally` cleanup, with its message extended by `'(DATA:LENG=..., port=...)'`.
+`ValueError` if `n < 1` or `timeout_s <= 0`. A `TimeoutError` or `ConnectionError` from the
+reader propagates after the `finally` cleanup, with its message extended by
+`'(DATA:LENG=..., port=...)'`.
 
 ### 3.4 `start_stream(callback, timeout_s)` / `stop_stream()`
 
@@ -198,7 +207,10 @@ Same steps 1 to 3, then a daemon thread loops `reader.read(1, timeout_s)` and ca
 sends `STOP`, joins the thread (timeout `timeout_s + 1`), closes the socket, returns the
 number of A-scans delivered. A callback exception is logged (`self.logger.exception`) and
 stops the stream; `stop_stream()` re-raises it. `start_stream` while running raises
-`RuntimeError`. `acquire()` while streaming raises `RuntimeError`.
+`RuntimeError`. `acquire()` while streaming raises `RuntimeError`. Per-stream state lives
+in one `_Stream` object; a thread that does not stop in time leaves a zombie marker that
+blocks a new stream until it dies. A device-side close ends the thread and is reported as
+"the stream has ended". `write`/`query` hold an `RLock`, so a callback may query.
 
 ## 4. `fake_resource.py`
 

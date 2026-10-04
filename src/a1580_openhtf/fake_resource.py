@@ -94,7 +94,13 @@ def _short_enum(token: str) -> str:
 
 
 class FakeA1580Resource:
-    """Emulate the pyvisa message interface of an A1580 plus its A-scan data port."""
+    """Emulate the pyvisa message interface of an A1580 plus its A-scan data port.
+
+    `visa_errors=True`: unknown-header queries raise `pyvisa.errors.VisaIOError` (timeout)
+    like the real resource instead of `TimeoutError`, when pyvisa is importable. A header
+    with an unknown node (`GAINX`, `FREQUE`, see `normalize_header`) queues `-113` and
+    stores nothing.
+    """
 
     def __init__(
         self,
@@ -105,6 +111,7 @@ class FakeA1580Resource:
         chunk: int | None = None,
         garbage_prefix: bytes = b'',
         signal: str = 'burst',
+        visa_errors: bool = False,
     ) -> None:
         if signal not in _SIGNALS:
             raise ValueError(f'signal must be one of {_SIGNALS}, got {signal!r}')
@@ -120,6 +127,7 @@ class FakeA1580Resource:
         self.chunk = chunk
         self.garbage_prefix = garbage_prefix
         self.signal = signal
+        self.visa_errors = visa_errors
         self.connections: list[tuple[str, int]] = []
         self.sockets: list[FakeDataSocket] = []
         self.connect_count = 0
@@ -137,7 +145,11 @@ class FakeA1580Resource:
         self.log.append(cmd)
         text = cmd.strip()
         head, _, arg = text.partition(' ')
-        header = normalize_header(head)
+        try:
+            header = normalize_header(head)
+        except ValueError:  # an unknown node (GAINX, FREQUE): the device does not know it
+            self._errors.append(f'-113,"Undefined header;Command: {text}"')
+            return
         arg = arg.strip()
         if header in self._reject:
             self._errors.append(self._reject[header])
@@ -166,7 +178,11 @@ class FakeA1580Resource:
     def query(self, cmd: str) -> str:
         self.log.append(cmd)
         text = cmd.strip()
-        header = normalize_header(text)
+        try:
+            header = normalize_header(text)
+        except ValueError:  # an unknown node: nothing answers
+            self._errors.append(f'-113,"Undefined header;Command: {text}"')
+            raise self._timeout_error(f'no reply to {text!r}') from None
         if header == '*IDN':
             return self.idn
         if header == 'SYST:ERR':
@@ -181,7 +197,33 @@ class FakeA1580Resource:
             return self._values[header]
         # A real socket resource would time out waiting for the reply of a bad query.
         self._errors.append(f'-113,"Undefined header;Command: {text}"')
-        raise TimeoutError(f'no reply to {text!r}')
+        raise self._timeout_error(f'no reply to {text!r}')
+
+    def _timeout_error(self, message: str) -> Exception:
+        """What a SCPI read that gets no reply raises: pyvisa's VisaIOError or TimeoutError.
+
+        With `visa_errors=True` and pyvisa importable it is
+        `pyvisa.errors.VisaIOError(StatusCode.error_timeout)`, which is what the real
+        resource raises (and which is not an OSError). The data socket is a plain socket and
+        keeps raising TimeoutError.
+        """
+        if self.visa_errors:
+            try:
+                import pyvisa.constants
+                import pyvisa.errors
+            except ImportError:
+                pass
+            else:
+                return pyvisa.errors.VisaIOError(pyvisa.constants.StatusCode.error_timeout)
+        return TimeoutError(message)
+
+    def flush(self, mask: object = None) -> None:
+        """Stand-in for `resource.flush(mask)`: discards nothing, records itself."""
+        self.log.append('flush')
+
+    def clear(self) -> None:
+        """Stand-in for `resource.clear()`: discards nothing, records itself."""
+        self.log.append('clear')
 
     def _store(self, header: str, arg: str) -> None:
         """Convert `arg` to the reply format of `header` and keep it (clamping hook for tests)."""
@@ -256,7 +298,7 @@ class FakeA1580Resource:
 
     def _packet(self, number: int) -> bytes:
         """One synthetic A-scan packet from the current settings."""
-        length = int(self._values['DATA:LENG'])
+        length = int(float(self._values['DATA:LENG']))
         if self.signal == 'zeros':
             samples = np.zeros(length, dtype=np.int16)
         else:

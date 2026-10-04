@@ -12,12 +12,15 @@ first hardware session.**
 import openhtf as htf
 from a1580_openhtf import A1580Plug
 
+
 @htf.measures(htf.Measurement('num_points'), htf.Measurement('peak_counts'))
 @htf.plug(pr=A1580Plug)
 def phase(test, pr):
-    pr.apply_capture('captures/vendor_example.yaml')    # validated, written, read back, errors drained
-    scans = pr.acquire(4)                                # four A-scans, then STOP
-    test.measurements.num_points = len(scans[0].raw)    # raw int16 counts, no volts
+    pr.apply_capture(
+        'captures/vendor_example.yaml'
+    )  # validated, written, read back, errors drained
+    scans = pr.acquire(4)  # four A-scans, then STOP
+    test.measurements.num_points = len(scans[0].raw)  # raw int16 counts, no volts
     test.measurements.peak_counts = int(abs(scans[0].raw.astype(int)).max())
 ```
 
@@ -68,9 +71,8 @@ Also on the plug: `write(cmd)`, `query(cmd)` (strips the reply), `idn()`, `stop(
 (`manufacturer`, `model`, `serial`, `firmware`, parsed from `*IDN?` at construction).
 
 What `tearDown()` leaves on the device: acquisition stopped (`STOP`), the pulser switched off while the other
-settings are restored, and then the snapshot's own `TRAN:ENAB` value, so a pulser that was on when the plug was
-created is on again afterwards. With `a1580_restore_state` off, the settings stay as the test left them and the
-pulser is switched off. The pulser write in `tearDown` is best effort: a failure is logged, not raised.
+settings are restored, and then `TRAN:ENAB OFF` once more, so the device ends with the snapshot restored and the
+pulser off. With `a1580_restore_state` off, the settings stay as the test left them and the pulser is switched off. The pulser write in `tearDown` is best effort: a failure is logged, not raised.
 
 `acquire()` returns `AScan` named tuples:
 

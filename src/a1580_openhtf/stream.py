@@ -131,11 +131,17 @@ def build_packet(
 # ── framing ─────────────────────────────────────────────────────────────────
 
 
-def _split(buffer: bytearray, length: int) -> tuple[list[bytes], int]:
-    """`split_packets` that also returns how many bytes were thrown away."""
+def _split(buffer: bytearray, length: int) -> tuple[list[bytes], int, int]:
+    """`split_packets` that also returns the bytes thrown away and the misalignment count.
+
+    A packet is "misaligned" when, right after a packet was cut, at least 4 bytes remain
+    and they do not start with `MAGIC`: the length that was assumed (`DATA:LENG`) is
+    probably wrong, or the stream lost bytes. The vendor algorithm does not notice that.
+    """
     size = packet_size(length)
     packets: list[bytes] = []
     dropped = 0
+    misaligned = 0
     pos = 0
     while True:
         idx = buffer.find(MAGIC, pos)
@@ -153,8 +159,10 @@ def _split(buffer: bytearray, length: int) -> tuple[list[bytes], int]:
             break  # incomplete packet, wait for more data (step 6)
         packets.append(bytes(buffer[pos : pos + size]))
         pos += size
+        if len(buffer) - pos >= len(MAGIC) and buffer[pos : pos + len(MAGIC)] != MAGIC:
+            misaligned += 1
     del buffer[:pos]
-    return packets, dropped
+    return packets, dropped, misaligned
 
 
 def split_packets(buffer: bytearray, length: int) -> list[bytes]:
@@ -176,6 +184,7 @@ class FrameStats:
     packets: int = 0  # complete packets cut from the stream
     dropped_bytes: int = 0  # bytes discarded by resynchronisation
     resyncs: int = 0  # number of times some bytes had to be discarded
+    misaligned: int = 0  # packets after which the next bytes did not start with `FtH1`
 
 
 class FrameReader:
@@ -185,8 +194,8 @@ class FrameReader:
     completed by the next one, and packets that arrived beyond the requested count are
     handed out by later calls.
 
-    `stats` is a `FrameStats` (`packets`, `dropped_bytes`, `resyncs`, all plain ints);
-    the same three counters are also readable directly on the reader.
+    `stats` is a `FrameStats` (`packets`, `dropped_bytes`, `resyncs`, `misaligned`, all
+    plain ints); the same four counters are also readable directly on the reader.
     """
 
     def __init__(self, sock: _RecvSocket, length: int) -> None:
@@ -208,6 +217,10 @@ class FrameReader:
     @property
     def resyncs(self) -> int:
         return self.stats.resyncs
+
+    @property
+    def misaligned(self) -> int:
+        return self.stats.misaligned
 
     def read(self, n: int, timeout_s: float) -> list[bytes]:
         """Return `n` complete packets.
@@ -240,8 +253,9 @@ class FrameReader:
                     f'({len(self._pending)} of {n} collected)'
                 )
             self._buffer += chunk
-            found, dropped = _split(self._buffer, self._length)
+            found, dropped, misaligned = _split(self._buffer, self._length)
             self.stats.packets += len(found)
+            self.stats.misaligned += misaligned
             if dropped:
                 self.stats.dropped_bytes += dropped
                 self.stats.resyncs += 1

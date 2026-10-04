@@ -315,3 +315,59 @@ def test_packet_layout_is_the_documented_one() -> None:
     (packet,) = _read(fake, 1)
     assert packet[:4] == b'FtH1'
     assert len(packet) == struct.calcsize('<4s3IH2B6B2B') + 8
+
+
+# ── unknown nodes, visa errors, flush ────────────────────────────────────────
+
+
+@pytest.mark.parametrize('cmd', ['GAINX 10', 'FREQUE 50 MHZ', 'TRAN:PULSX 20 V', 'NOPE 1'])
+def test_a_write_with_an_unknown_node_queues_113_and_stores_nothing(cmd: str) -> None:
+    fake = FakeA1580Resource()
+    before = dict(fake._values)
+    fake.write(cmd)
+    errors = _drain(fake)
+    assert [e.split(',')[0] for e in errors] == ['-113']
+    assert fake._values == before
+
+
+@pytest.mark.parametrize('cmd', ['GAINX?', 'FREQUE?', 'NOPE:HDR?'])
+def test_a_query_with_an_unknown_node_queues_113_and_raises(cmd: str) -> None:
+    fake = FakeA1580Resource()
+    with pytest.raises(TimeoutError):
+        fake.query(cmd)
+    assert [e.split(',')[0] for e in _drain(fake)] == ['-113']
+
+
+def test_visa_errors_raise_visaioerror_for_unanswered_queries() -> None:
+    pyvisa = pytest.importorskip('pyvisa')
+    fake = FakeA1580Resource(visa_errors=True)
+    with pytest.raises(pyvisa.errors.VisaIOError) as exc:
+        fake.query('SYST:VERS?')  # a known node the fake has no value for
+    assert exc.value.error_code == pyvisa.constants.StatusCode.error_timeout
+    assert not isinstance(exc.value, OSError)
+    with pytest.raises(pyvisa.errors.VisaIOError):
+        fake.query('GAINX?')
+    assert [e.split(',')[0] for e in _drain(fake)] == ['-113', '-113']
+    assert fake.query('GAIN?') == '0'  # answered queries are unaffected
+
+
+def test_without_visa_errors_the_timeout_is_a_timeout_error() -> None:
+    fake = FakeA1580Resource()
+    with pytest.raises(TimeoutError):
+        fake.query('SYST:VERS?')
+
+
+def test_the_data_socket_keeps_raising_timeout_error_with_visa_errors() -> None:
+    fake = FakeA1580Resource(visa_errors=True, signal='none')
+    sock = fake.data_socket_factory('x', 1)
+    fake.write('STAR AUTO')
+    with pytest.raises(TimeoutError):
+        sock.recv(10)
+
+
+def test_flush_and_clear_record_themselves() -> None:
+    fake = FakeA1580Resource()
+    fake.flush()
+    fake.flush(object())
+    fake.clear()
+    assert fake.log == ['flush', 'flush', 'clear']

@@ -95,7 +95,11 @@ def check_allowed(cmd: str, *, is_write: bool) -> None:
     if '/config' in cmd.lower():
         raise ForbiddenCommand(f'refusing to send {cmd!r}: /config is never touched')
     head = cmd.strip().split(' ', 1)[0]
-    if is_write and normalize_header(head) in FORBIDDEN_WRITES:
+    try:
+        normal = normalize_header(head)
+    except ValueError:
+        return  # unknown (like the deliberate ZZZ:NOPE of step 5): none of the forbidden ones
+    if is_write and normal in FORBIDDEN_WRITES:
         raise ForbiddenCommand(f'refusing to send {cmd!r}')
 
 

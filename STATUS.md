@@ -1,6 +1,6 @@
 # STATUS.md
 
-Last updated: 2026-10-04 by the project owner agent.
+Last updated: 2026-10-04 (evening) by the project owner agent.
 
 ## Decisions taken (with the human owner)
 
@@ -23,10 +23,26 @@ Last updated: 2026-10-04 by the project owner agent.
 - [x] Plug, fake, stream parser, tests (SPEC.md). 375 hardware-free tests green.
 - [x] Capture YAML (SPEC-capture.md).
 - [x] Example test and README (README is pre-hardware; the vendor material is its only source).
-- [ ] Independent code review of the core (in progress), findings folded in.
-- [ ] `tools/hw_probe.py` implementing phases A and B of `HARDWARE-SESSION.md` (in progress).
+- [x] Independent code review of the core; all 16 findings fixed with tests (586 tests).
+      Key outcomes: pulser off is the first thing tearDown sends and a snapshot never
+      re-enables it; apply_setup/set_state collect all failures; strict SCPI header table;
+      values_match false positives closed; dead-link abort; per-stream state and SCPI lock.
+- [x] `tools/hw_probe.py` implementing phases A and B of `HARDWARE-SESSION.md`, with
+      `--dry-run` and `--fake`. Phase C (pulser on) is not implemented yet on purpose.
 - [ ] First hardware session (needs the device reachable from the agent, see HARDWARE-SESSION.md preconditions).
 - [ ] SPEC-golden (golden A-scan comparison), not written yet.
+
+## Blocked: waiting for the human owner
+
+The next step is the first hardware session (`HARDWARE-SESSION.md`). It needs:
+1. The A1580 reachable from the agent: forward TCP 5025 and the data port (default 2758,
+   confirmed by `DATA:PORT?`) to the cloud box, or run the session on the local machine.
+2. Confirmation of what is connected to the `IN`/`OUT` sockets and the safe pulser ceiling
+   (default 20 V; phases A and B do not enable the pulser at all).
+3. Nobody else using the device during the session.
+
+Command to run first: `A1580_HOST=<ip> .venv/bin/python tools/hw_probe.py --phase A`
+(after `--dry-run` to see the plan).
 
 ## Open questions for the first hardware session
 

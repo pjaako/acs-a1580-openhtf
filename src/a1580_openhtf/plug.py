@@ -15,6 +15,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -48,20 +49,67 @@ CONF.declare(
 
 _ROOTS = ('SOUR', 'SENS')
 _TRAILING_OPTIONAL = ('LEV', 'VAL', 'NEXT')  # PULSe[:LEVel], CONStant[:VALue], ERRor[:NEXT]
-_SHORT_ALIASES = {'MOD': 'MODE', 'SPL': 'SPLIT'}  # vendor writes MODe but also uses MODE/SPLIT
-_VOWELS = 'AEIOU'
+
+# Every SCPI node the A1580 documents (PROTOCOL.md command list): canonical short form ->
+# all accepted spellings, upper case. A node outside this table is an error, never guessed:
+# a typo such as `GAINX` or `FREQUE` must not be taken for `GAIN` or `FREQ`. The vendor writes
+# `MODe` and `SPLIT` but its code also sends `MODE`, so both spellings of those are accepted.
+_NODE_FORMS: dict[str, tuple[str, ...]] = {
+    'TRAN': ('TRAN', 'TRANSMITTER'),
+    'PULS': ('PULS', 'PULSE'),
+    'FREQ': ('FREQ', 'FREQUENCY'),
+    'ENAB': ('ENAB', 'ENABLE'),
+    'REV': ('REV', 'REVERSE'),
+    'DAMP': ('DAMP',),
+    'IMP': ('IMP', 'IMPEDANCE'),
+    'TRIG': ('TRIG', 'TRIGGERING'),
+    'MODE': ('MOD', 'MODE'),
+    'INT': ('INT', 'INTERVAL'),
+    'DEL': ('DEL', 'DELAY'),
+    'GAIN': ('GAIN',),
+    'LEV': ('LEV', 'LEVEL'),
+    'PRE': ('PRE', 'PREAMP'),
+    'COMB': ('COMB', 'COMBINED'),
+    'SPLIT': ('SPL', 'SPLIT'),
+    'TGC': ('TGC',),
+    'LIN': ('LIN', 'LINEAR'),
+    'ARB': ('ARB', 'ARBITRARY'),
+    'AVER': ('AVER', 'AVERAGE'),
+    'COUN': ('COUN', 'COUNT'),
+    'CONS': ('CONS', 'CONSTANT'),
+    'VAL': ('VAL', 'VALUE'),
+    'AUTO': ('AUTO',),
+    'RAND': ('RAND', 'RANDOM'),
+    'FILT': ('FILT', 'FILTER'),
+    'HPAS': ('HPAS', 'HPASS'),
+    'IND': ('IND', 'INDEX'),
+    'DATA': ('DATA',),
+    'LENG': ('LENG', 'LENGTH'),
+    'PORT': ('PORT',),
+    'MEM': ('MEM', 'MEMORY'),
+    'CLE': ('CLE', 'CLEAR'),
+    'SYST': ('SYST', 'SYSTEM'),
+    'ERR': ('ERR', 'ERROR'),
+    'NEXT': ('NEXT',),
+    'VERS': ('VERS', 'VERSION'),
+    'SOUR': ('SOUR', 'SOURCE'),
+    'SENS': ('SENS', 'SENSE'),
+    'STAR': ('STAR', 'START'),
+    'STOP': ('STOP',),
+    'DUR': ('DUR', 'DURATION'),
+    'TYPE': ('TYPE',),
+    'GAP': ('GAP',),
+}
+_NODES: dict[str, str] = {form: short for short, forms in _NODE_FORMS.items() for form in forms}
+# IEEE 488.2 common commands (PROTOCOL.md "Common commands"), one `*` node each.
+_COMMON_COMMANDS = frozenset(
+    {'*IDN', '*CLS', '*ESE', '*ESR', '*OPC', '*RST', '*SRE', '*STB', '*TST', '*WAI'}
+)
 
 
-def _short_mnemonic(node: str) -> str:
-    """Short form of one mnemonic: `TRANsmitter` -> `TRAN`, `FREQUENCY` -> `FREQ`."""
-    lead = re.match(r'[A-Z0-9]+', node)
-    if lead and len(lead.group()) >= 3 and node != node.upper():
-        short = lead.group()  # mixed case: the capitals are the short form
-    else:
-        short = node.upper()
-        if len(short) > 4:  # SCPI: first four letters, three if the fourth is a vowel
-            short = short[:3] if short[3] in _VOWELS else short[:4]
-    return _SHORT_ALIASES.get(short, short)
+# Consecutive transport-type failures (not a device-reported RuntimeError) after which
+# `get_state` / `set_state` give up on the remaining headers instead of timing out on each.
+_DEAD_LINK_LIMIT = 3
 
 
 def normalize_header(header: str) -> str:
@@ -70,9 +118,22 @@ def normalize_header(header: str) -> str:
     Upper-cases, drops a trailing `?`, a leading `:` and a leading `SOUR:`/`SENS:` root,
     reduces each mnemonic to its short form and drops the optional last nodes `:ENAB` of
     `TRAN:DAMP`, `:LEV`, `:VAL` and `:NEXT`. `TRANsmitter:PULSe:LEVel` -> `TRAN:PULS`.
+
+    Every node must be a known short or long form from the A1580 command list (see
+    `_NODE_FORMS`) or a common command such as `*IDN`; anything else raises `ValueError`
+    naming the node (`GAINX`, `FREQUE`, the empty header).
     """
     text = header.strip().removesuffix('?').lstrip(':')
-    nodes = [_short_mnemonic(n) for n in text.split(':') if n]
+    raw_nodes = [n for n in text.split(':') if n]
+    if not raw_nodes:
+        raise ValueError(f'empty SCPI header {header!r}')
+    nodes: list[str] = []
+    for raw in raw_nodes:
+        upper = raw.upper()
+        node = _NODES.get(upper) or (upper if upper in _COMMON_COMMANDS else None)
+        if node is None:
+            raise ValueError(f'unknown SCPI node {raw!r} in header {header!r}')
+        nodes.append(node)
     if len(nodes) > 1 and nodes[0] in _ROOTS:
         nodes.pop(0)
     if len(nodes) > 1 and nodes[-1] in _TRAILING_OPTIONAL:
@@ -126,6 +187,27 @@ _KEYWORDS = frozenset({'MIN', 'MINIMUM', 'MAX', 'MAXIMUM', 'DEF', 'DEFAULT', 'UP
 _TRUE = frozenset({'ON', '1'})
 _FALSE = frozenset({'OFF', '0'})
 
+#: Headers whose argument is a boolean: only these compare `ON`/`OFF`/`1`/`0` by truth value.
+BOOLEAN_HEADERS: frozenset[str] = frozenset(
+    {'TRAN:ENAB', 'TRAN:REV', 'TRAN:DAMP', 'GAIN:PRE:COMB', 'GAIN:PRE:SPLIT', 'AVER:DEL:CONS:AUTO'}
+)
+#: Headers whose reply is an integer in its reply unit: compared with an absolute tolerance
+#: of half a unit (a relative tolerance would accept a clamped 2147483647 NS as 2147483000).
+INTEGER_REPLY_HEADERS: frozenset[str] = frozenset(
+    {
+        'FREQ',
+        'TRAN:FREQ',
+        'TRIG:DEL',
+        'TRAN:GAP',
+        'TRAN:DAMP:GAP',
+        'DATA:LENG',
+        'TRAN:PULS',
+        'AVER:COUN',
+        'FILT:HPAS:IND',
+    }
+)
+_INTEGER_ABS_TOL = 0.5
+
 
 def _to_float(text: str) -> float | None:
     try:
@@ -157,32 +239,44 @@ def _enum_match(sent: str, reply: str) -> bool:
     up_sent, up_reply = sent.upper(), reply.upper()
     if up_sent == up_reply:
         return True
+    # Short and long forms (INT vs INTERNAL) only for an alphabetic token of 3+ letters: a
+    # number such as `200` is never a "short form" of `2000 OHM`.
+    if not (sent.isalpha() and len(sent) >= 3):
+        return False
     capitals = ''.join(c for c in sent if c.isupper())  # INTernal -> INT
     if len(capitals) >= 3 and up_reply == capitals:
         return True
-    short, long_ = sorted((up_sent, up_reply), key=len)
     # INT vs INTERNAL in either direction (SPEC 3.1 names one direction, its own test list
-    # needs the other: sent INTERNAL, reply INT).
-    return len(short) >= 3 and long_.startswith(short)
+    # needs the other: sent INTERNAL, reply INT). The shorter word must look like a SCPI
+    # short form (3 or 4 letters); LINEAR is not a short form of LINEARX.
+    short, long_ = sorted((up_sent, up_reply), key=len)
+    return 3 <= len(short) <= 4 and long_.startswith(short)
 
 
 def values_match(header: str, sent: str, reply: str) -> bool:
     """Whether a read-back `reply` agrees with the `sent` argument of `header`.
 
-    Handles booleans, enumerations (long/short/case), numbers with a unit suffix
-    (converted to the reply unit of the header, see `REPLY_UNITS`) and comma lists.
-    A bare number is compared as it is, in the reply unit, because the unit the device
-    assumes for a bare number is UNKNOWN (PROTOCOL.md). `MIN`/`MAX`/`DEF`/`UP`/`DOWN` cannot
-    be verified and return True.
+    Handles booleans (only for `BOOLEAN_HEADERS`), enumerations (long/short/case), numbers
+    with a unit suffix (converted to the reply unit of the header, see `REPLY_UNITS`) and
+    comma lists. Headers in `INTEGER_REPLY_HEADERS` are compared with an absolute tolerance
+    of 0.5 reply units, the others with a relative one of 1e-6. A bare number is compared as
+    it is, in the reply unit, because the unit the device assumes for a bare number is
+    UNKNOWN (PROTOCOL.md). An empty `sent` never matches. `MIN`/`MAX`/`DEF`/`UP`/`DOWN`
+    cannot be verified and return True (`apply_setup` refuses them for `TRAN:PULS`).
+    Raises ValueError for a header with an unknown node.
     """
+    normal = normalize_header(header)
     sent, reply = sent.strip(), reply.strip()
+    if not sent:
+        return False
     if sent.upper() in _KEYWORDS:
         return True
     if ',' in sent or ',' in reply:
         return _lists_match(sent, reply)
     up_sent, up_reply = sent.upper(), reply.upper()
     if (
-        {up_sent, up_reply} & {'ON', 'OFF'}
+        normal in BOOLEAN_HEADERS
+        and {up_sent, up_reply} & {'ON', 'OFF'}
         and up_sent in _TRUE | _FALSE
         and up_reply in _TRUE | _FALSE
     ):
@@ -192,16 +286,23 @@ def values_match(header: str, sent: str, reply: str) -> bool:
     if match and reply_num is not None:
         value = float(match.group(1))
         suffix = match.group(2).upper()
-        reply_unit = REPLY_UNITS.get(normalize_header(header))
+        reply_unit = REPLY_UNITS.get(normal)
+        integer = normal in INTEGER_REPLY_HEADERS
         if not suffix:
+            if integer:
+                return abs(value - reply_num) <= _INTEGER_ABS_TOL
             return _numbers_close(value, reply_num)
         if suffix in _UNIT_SUFFIXES:
             dimension, factor = _UNIT_SUFFIXES[suffix]
-            if reply_unit is None:
-                return _numbers_close(value, reply_num)  # no base unit known: unit ignored
+            if reply_unit is None:  # no base unit known: unit ignored
+                if integer:
+                    return abs(value - reply_num) <= _INTEGER_ABS_TOL
+                return _numbers_close(value, reply_num)
             reply_dimension, reply_factor = _REPLY_UNIT_SI[reply_unit]
             if dimension != reply_dimension:
                 return False
+            if integer:
+                return abs(value * factor / reply_factor - reply_num) <= _INTEGER_ABS_TOL
             return _numbers_close(value * factor, reply_num * reply_factor)
     return _enum_match(sent, reply)
 
@@ -210,7 +311,8 @@ def values_match(header: str, sent: str, reply: str) -> bool:
 
 #: Headers captured by `get_state` and written back, in this order, by `set_state`.
 #: Short forms as in the vendor example. If the device's real short forms differ, that is a
-#: hardware finding; keep the list in this one place.
+#: hardware finding; keep the list in this one place. The TGC curves come before
+#: `GAIN:TGC:MODE` so that the mode is switched on only after its curve is in place.
 STATE_HEADERS: tuple[str, ...] = (
     'FREQ',
     'DATA:LENG',
@@ -231,9 +333,9 @@ STATE_HEADERS: tuple[str, ...] = (
     'GAIN',
     'GAIN:PRE:COMB',
     'GAIN:PRE:SPLIT',
-    'GAIN:TGC:MODE',
     'GAIN:TGC:LIN',
     'GAIN:TGC:ARB',
+    'GAIN:TGC:MODE',
     'AVER:COUN',
     'AVER:DEL:CONS:AUTO',
     'AVER:DEL:CONS',
@@ -324,10 +426,73 @@ class AScan(NamedTuple):
 _ERROR_QUEUE_QUERY = 'SYSTem:ERRor?'
 _MAX_ERROR_READS = 20
 _STREAM_SLICE_S = 0.1  # the stream thread reads in slices so that stop_stream is prompt
+_PULSER_OFF = 'TRAN:ENAB OFF'
+_MIN_ACQUIRE_TIMEOUT_S = 5.0
+
+
+def _reply_float(command: str, reply: str) -> float:
+    """`reply` as a finite float, else RuntimeError naming the command and the reply."""
+    try:
+        value = float(reply)
+    except ValueError:
+        raise RuntimeError(f'{command} reply {reply!r} is not a number') from None
+    if not math.isfinite(value):
+        raise RuntimeError(f'{command} reply {reply!r} is not a finite number')
+    return value
+
+
+def _reply_int(command: str, reply: str) -> int:
+    """`reply` as an int; an integral float text such as `1024.0` is accepted."""
+    value = _reply_float(command, reply)
+    if not value.is_integer():
+        raise RuntimeError(f'{command} reply {reply!r} is not an integer')
+    return int(value)
+
+
+class _Session(NamedTuple):
+    """What `_begin_acquisition` set up: the reader, its socket and the time-base facts."""
+
+    reader: FrameReader
+    sock: Any
+    length: int
+    fs: float
+    delay: int
+    port: int
+
+
+@dataclass(eq=False)
+class _Stream:
+    """Everything one `start_stream` call owns; the reader thread gets this object only."""
+
+    reader: FrameReader
+    socket: Any
+    timeout_s: float
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    count: int = 0
+    failure: Exception | None = None  # transport failure, stall or any reader-thread error
+    callback_failure: Exception | None = None
+    peer_closed: bool = False  # the device closed the data socket
+    zombie: bool = False  # stop_stream could not join the thread in time
+
+    def alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
 
 
 class A1580Plug(BasePlug):
-    """OpenHTF plug for one A1580 over SCPI (TCP 5025) plus the A-scan data socket."""
+    """OpenHTF plug for one A1580 over SCPI (TCP 5025) plus the A-scan data socket.
+
+    Threading: the pyvisa resource is shared between the caller and, while a stream runs,
+    the stream thread, whose callback may call `query` and `write` (for example to read a
+    setting for every A-scan). `write` and `query` therefore hold `self._scpi_lock` (an
+    `RLock`) for the duration of one command. Sequences such as write, drain, read-back
+    are not atomic: do not run them from two threads at once.
+
+    Pulser safety: `tearDown` sends one unchecked `TRAN:ENAB OFF` before anything else, and
+    `set_state` never writes `TRAN:ENAB ON` (a snapshot taken with the pulser on is restored
+    with the pulser off; the plug warns). The device ends with the snapshot restored and
+    the pulser off.
+    """
 
     auto_placeholder = True
 
@@ -338,15 +503,12 @@ class A1580Plug(BasePlug):
         host: str | None = None,
         restore_state: bool | None = None,
     ) -> None:
+        self._scpi_lock = threading.RLock()
         self._rm: Any = None
         self._owns_resource = False
         self._data_sock: Any = None
-        self._stream_thread: threading.Thread | None = None
-        self._stream_stop = threading.Event()
-        self._stream_count = 0
-        self._stream_failure: Exception | None = None  # transport failure or stall
-        self._callback_failure: Exception | None = None
-        self._stream_timeout_s = 5.0
+        self._stream: _Stream | None = None
+        self._scpi_port = int(CONF.a1580_scpi_port)
         self.host = CONF.a1580_host if host is None else host
         self.identity = Identity('', '', '', '')
         self._initial_state: dict[str, str] | None = None
@@ -364,7 +526,7 @@ class A1580Plug(BasePlug):
             self._rm = pyvisa.ResourceManager('@py')
             try:
                 self._resource = self._rm.open_resource(
-                    f'TCPIP::{self.host}::{CONF.a1580_scpi_port}::SOCKET'
+                    f'TCPIP::{self.host}::{self._scpi_port}::SOCKET'
                 )
             except Exception:
                 self._rm.close()
@@ -381,6 +543,11 @@ class A1580Plug(BasePlug):
             self.identity = self.idn()
             if self._restore_state:
                 self._initial_state = self.get_state()
+                if _is_on(self._initial_state.get('TRAN:ENAB', '')):
+                    self.logger.warning(
+                        'pulser was already enabled when the plug was created; '
+                        'it will be switched off in tearDown'
+                    )
         except Exception:
             if self._owns_resource:
                 self._close_resource()
@@ -389,10 +556,12 @@ class A1580Plug(BasePlug):
     # ── low level ────────────────────────────────────────────────────────────
 
     def write(self, cmd: str) -> None:
-        self._resource.write(cmd)
+        with self._scpi_lock:
+            self._resource.write(cmd)
 
     def query(self, cmd: str) -> str:
-        return str(self._resource.query(cmd)).strip()
+        with self._scpi_lock:
+            return str(self._resource.query(cmd)).strip()
 
     def idn(self) -> Identity:
         reply = self.query('*IDN?')
@@ -403,6 +572,30 @@ class A1580Plug(BasePlug):
 
     def stop(self) -> None:
         self.write('STOP')
+
+    def _discard_late_reply(self) -> None:
+        """After a failed read, drop a reply that may still arrive (best effort, never raises).
+
+        A query that timed out can be answered late; that reply would then be taken for the
+        answer to the next query. Uses `flush` (pyvisa: discard the read buffer) or, failing
+        that, `clear`, whichever the resource has.
+        """
+        with self._scpi_lock:
+            for name in ('flush', 'clear'):
+                method = getattr(self._resource, name, None)
+                if method is None:
+                    continue
+                try:
+                    if name == 'flush' and self._owns_resource:
+                        from pyvisa.constants import BufferOperation  # lazy
+
+                        method(BufferOperation.discard_read_buffer)
+                    else:
+                        method()
+                except Exception as exc:  # noqa: BLE001 - best effort only
+                    self.logger.debug('%s() after a failed read did not work: %s', name, exc)
+                    continue
+                return
 
     # ── errors, setup, state ─────────────────────────────────────────────────
 
@@ -438,53 +631,163 @@ class A1580Plug(BasePlug):
         """Write each `header: value`, read it back and compare; raise one RuntimeError.
 
         Every write is followed by an error-queue drain and a `<header>?` query. All
-        failures (device error, no answer, read-back mismatch) are collected and reported
-        together; settings after a failed one are still applied.
+        failures (unknown header node, device error, no answer, any exception, read-back
+        mismatch) are collected and reported together; settings after a failed one are still
+        applied. After an exception from the resource the late reply is discarded
+        (`flush`/`clear`, if the resource has them).
+
+        Raises ValueError, before anything is written, for a `MIN`/`MAX`/`DEF`/`UP`/`DOWN`
+        argument on `TRAN:PULS`: the pulser voltage is never set by keyword.
         """
+        items = [(key, _format_value(value)) for key, value in settings.items()]
+        for key, sent in items:
+            if sent.strip().upper() in _KEYWORDS and _normal_or_none(key) == 'TRAN:PULS':
+                raise ValueError(
+                    f'{key} {sent}: refuse to set the pulser voltage by keyword; '
+                    'give a number with a unit, for example 20 V'
+                )
         failures: list[str] = []
-        for key, value in settings.items():
-            sent = _format_value(value)
-            self.write(f'{key} {sent}')
-            errors = self.check_errors()
-            reply: str | None
+        for key, sent in items:
             try:
-                reply = self.query(f'{key}?')
-            except Exception as exc:  # noqa: BLE001 - an unknown header is never answered
-                reply = None
-                errors += [f'no answer to {key}?: {type(exc).__name__}'] + self.check_errors()
-            if reply is not None and sent.strip().upper() in _KEYWORDS:
-                self.logger.warning('%s %s cannot be verified by read-back (%r)', key, sent, reply)
-            if errors or reply is None or not values_match(key, sent, reply):
-                failures.append(f'{key}: sent={sent!r} readback={reply!r} errors={errors}')
+                failure = self._apply_one(key, sent)
+            except Exception as exc:  # noqa: BLE001 - one bad setting must not stop the others
+                self._discard_late_reply()
+                failure = f'{key}: sent={sent!r} raised {type(exc).__name__}: {exc}'
+            if failure is not None:
+                failures.append(failure)
         if failures:
             raise RuntimeError('apply_setup failed: ' + '; '.join(failures))
 
+    def _apply_one(self, key: str, sent: str) -> str | None:
+        """Apply one setting; return the failure text or None. May raise."""
+        try:
+            normalize_header(key)
+        except ValueError as exc:  # an unknown node: nothing is written, nothing to flush
+            return f'{key}: sent={sent!r} nothing written: {exc}'
+        self.write(f'{key} {sent}')
+        errors = self.check_errors()
+        reply: str | None
+        try:
+            reply = self.query(f'{key}?')
+        except Exception as exc:  # noqa: BLE001 - an unknown header is never answered
+            reply = None
+            self._discard_late_reply()
+            errors += [f'no answer to {key}?: {type(exc).__name__}'] + self.check_errors()
+        if reply is not None and sent.strip().upper() in _KEYWORDS:
+            self.logger.warning('%s %s cannot be verified by read-back (%r)', key, sent, reply)
+        if errors or reply is None or not values_match(key, sent, reply):
+            return f'{key}: sent={sent!r} readback={reply!r} errors={errors}'
+        return None
+
+    def _warn_dead_link(self, errors: int, skipped: int) -> None:
+        self.logger.warning(
+            'link appears dead after %d consecutive transport errors; '
+            'skipping the remaining %d headers',
+            errors,
+            skipped,
+        )
+
     def get_state(self) -> dict[str, str]:
-        """Query every header of `STATE_HEADERS`; return `{header: reply}`."""
-        return {header: self.query(f'{header}?') for header in STATE_HEADERS}
+        """Query every header of `STATE_HEADERS`; return `{header: reply}`.
+
+        A header that raises (typically a timeout because this firmware does not know it)
+        is logged, its error-queue entry drained, and left out of the snapshot; the
+        constructor therefore survives a header that is wrong on a first hardware session.
+        After `_DEAD_LINK_LIMIT` consecutive transport-type failures (anything but a
+        `RuntimeError`) the link is taken as dead: a warning is logged and the remaining
+        headers are skipped.
+        """
+        state: dict[str, str] = {}
+        transport_errors = 0
+        for index, header in enumerate(STATE_HEADERS):
+            try:
+                state[header] = self.query(f'{header}?')
+                transport_errors = 0
+            except Exception as exc:  # noqa: BLE001 - one unknown header must not abort the snapshot
+                transport_errors = 0 if isinstance(exc, RuntimeError) else transport_errors + 1
+                self.logger.warning(
+                    'get_state: %s? failed (%s: %s); left out of the snapshot',
+                    header,
+                    type(exc).__name__,
+                    exc,
+                )
+                self._discard_late_reply()
+                try:
+                    self.check_errors()  # drain the -113 the failed query queued
+                except Exception as drain_exc:  # noqa: BLE001 - best effort
+                    self.logger.warning(
+                        'get_state: draining the error queue after %s? failed: %s',
+                        header,
+                        drain_exc,
+                    )
+                if transport_errors >= _DEAD_LINK_LIMIT:
+                    self._warn_dead_link(transport_errors, len(STATE_HEADERS) - index - 1)
+                    break
+        return state
 
     def set_state(self, state: Mapping[str, str]) -> None:
-        """Write a `get_state` snapshot back, each write with write_checked.
+        """Write a `get_state` snapshot back; the pulser is off at the end, always.
 
-        The pulser is switched off first (`TRAN:ENAB OFF`, before any other restore write)
-        so that it is off while amplitude, frequency and impedance change. Then come the
-        other headers in `STATE_HEADERS` order and, last, the snapshot's `TRAN:ENAB` value
-        (nothing is written for it if the snapshot has none, so the pulser stays off).
+        Order: `TRAN:ENAB OFF` (unchecked, before anything else), a drain of the error
+        queue (stale entries and the answer to that write are discarded; if the drain
+        itself raises it is logged and the restore goes on), then every other header of
+        `STATE_HEADERS` in order with `write_checked`, then `TRAN:ENAB OFF` again, checked.
+        `TRAN:ENAB ON` is never written from a snapshot: if the snapshot had the pulser on,
+        a warning says so and the pulser stays off.
 
-        `AVER:DEL:CONS` is skipped unless `AVER:DEL:CONS:AUTO` is OFF (the device answers
-        -221 otherwise). Errors queued before the call are discarded first.
+        Headers whose snapshot value is empty are skipped. `AVER:DEL:CONS` is skipped
+        unless `AVER:DEL:CONS:AUTO` is OFF (the device answers -221 otherwise). A failed
+        header does not stop the restore; after the final OFF one RuntimeError lists all
+        failures. After `_DEAD_LINK_LIMIT` consecutive transport-type failures (anything but
+        a `RuntimeError`) the remaining headers are skipped with a warning; the final OFF is
+        still attempted.
         """
-        self.check_errors()
         auto = state.get('AVER:DEL:CONS:AUTO', '').strip().upper()
-        self.write_checked('TRAN:ENAB OFF')
-        for header in STATE_HEADERS:
-            if header == 'TRAN:ENAB' or header not in state:
-                continue
-            if header == 'AVER:DEL:CONS' and auto not in ('OFF', '0'):
-                continue
-            self.write_checked(f'{header} {_restore_value(header, state[header])}')
-        if 'TRAN:ENAB' in state:
-            self.write_checked(f'TRAN:ENAB {_restore_value("TRAN:ENAB", state["TRAN:ENAB"])}')
+        try:
+            self.write(_PULSER_OFF)
+        except Exception as exc:
+            raise RuntimeError(
+                f'set_state: {_PULSER_OFF!r} could not be sent, nothing restored: {exc}'
+            ) from exc
+        try:
+            self.check_errors()
+        except Exception as exc:  # noqa: BLE001 - the restore must go on
+            self.logger.warning('set_state: draining the error queue failed: %s', exc)
+        if _is_on(state.get('TRAN:ENAB', '')):
+            self.logger.warning(
+                'set_state: the snapshot had the pulser ON; it is NOT restored, '
+                'the pulser is left off'
+            )
+        failures: list[str] = []
+        todo = [
+            header
+            for header in STATE_HEADERS
+            if header != 'TRAN:ENAB'
+            and header in state
+            and state[header].strip()
+            and not (header == 'AVER:DEL:CONS' and auto not in ('OFF', '0'))
+        ]
+        transport_errors = 0
+        for index, header in enumerate(todo):
+            try:
+                self.write_checked(f'{header} {_restore_value(header, state[header])}')
+                transport_errors = 0
+            except Exception as exc:  # noqa: BLE001 - restore the rest, report at the end
+                failures.append(f'{header}: {exc}')
+                if isinstance(exc, RuntimeError):  # a device error, not a transport error
+                    transport_errors = 0
+                else:
+                    transport_errors += 1
+                    self._discard_late_reply()
+                if transport_errors >= _DEAD_LINK_LIMIT:
+                    self._warn_dead_link(transport_errors, len(todo) - index - 1)
+                    break
+        try:
+            self.write_checked(_PULSER_OFF)
+        except Exception as exc:  # noqa: BLE001 - report with the others
+            failures.append(f'{_PULSER_OFF}: {exc}')
+        if failures:
+            raise RuntimeError('set_state failed: ' + '; '.join(failures))
 
     def apply_capture(
         self, capture_or_path: Capture | str | Path, *, reset: bool = False
@@ -501,12 +804,26 @@ class A1580Plug(BasePlug):
 
     # ── acquisition ──────────────────────────────────────────────────────────
 
-    def _begin_acquisition(self) -> tuple[FrameReader, int, float, int, int]:
+    def _begin_acquisition(self) -> _Session:
         """Steps 1 to 3 of SPEC 3.3: query the geometry, open the data socket, `STAR AUTO`."""
-        length = int(self.query('DATA:LENG?'))
-        fs = float(self.query('FREQ?'))
-        delay = int(float(self.query('TRIG:DEL?')))
-        port = int(self.query('DATA:PORT?'))
+        length = _reply_int('DATA:LENG?', self.query('DATA:LENG?'))
+        fs = _reply_float('FREQ?', self.query('FREQ?'))
+        delay_reply = self.query('TRIG:DEL?')
+        delay_value = _reply_float('TRIG:DEL?', delay_reply)
+        delay = int(round(delay_value))
+        if not delay_value.is_integer():
+            self.logger.warning(
+                'TRIG:DEL? reply %r is not an integer; rounded to %d. The unit may not be '
+                'nanoseconds (PROTOCOL.md CONFLICT 4)',
+                delay_reply,
+                delay,
+            )
+        port = _reply_int('DATA:PORT?', self.query('DATA:PORT?'))
+        if port == self._scpi_port:
+            raise RuntimeError(
+                f'DATA:PORT? returned the SCPI port {port}; refusing to open the data '
+                'socket on it; see PROTOCOL.md CONFLICT 1'
+            )
         sock = self._data_socket_factory(self.host, port)
         self._data_sock = sock
         try:
@@ -515,28 +832,31 @@ class A1580Plug(BasePlug):
         except BaseException:
             self._end_acquisition()
             raise
-        return reader, length, fs, delay, port
+        return _Session(reader, sock, length, fs, delay, port)
 
     def _end_acquisition(
         self, thread: threading.Thread | None = None, join_timeout_s: float = 0.0
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str]]:
         """`STOP`, join `thread` if given, close the data socket, drain the error queue.
 
-        Never raises; returns what went wrong (a failed `STOP`, queued instrument errors).
+        Never raises. Returns `(failures, device_errors)`: what went wrong in the cleanup
+        itself (a failed `STOP`, an error queue that could not be read) and the entries the
+        instrument had queued.
         """
-        problems: list[str] = []
+        failures: list[str] = []
+        device_errors: list[str] = []
         try:
             self.stop()
         except Exception as exc:  # noqa: BLE001 - cleanup must run to the end
-            problems.append(f'STOP failed: {exc}')
+            failures.append(f'STOP failed: {exc}')
         if thread is not None:
             thread.join(join_timeout_s)
         self._close_data_socket()
         try:
-            problems += self.check_errors()
+            device_errors += self.check_errors()
         except Exception as exc:  # noqa: BLE001 - cleanup must run to the end
-            problems.append(f'{_ERROR_QUEUE_QUERY} failed: {exc}')
-        return problems
+            failures.append(f'{_ERROR_QUEUE_QUERY} failed: {exc}')
+        return failures, device_errors
 
     def _close_data_socket(self) -> None:
         sock, self._data_sock = self._data_sock, None
@@ -551,110 +871,188 @@ class A1580Plug(BasePlug):
         except OSError:
             pass
 
-    def acquire(self, n: int = 1, *, timeout_s: float = 5.0) -> list[AScan]:
+    def _log_frame_stats(self, where: str, reader: FrameReader) -> None:
+        stats = reader.stats
+        self.logger.info('%s: frame stats %s', where, stats)
+        if stats.dropped_bytes > 0 or stats.misaligned > 0:
+            self.logger.warning(
+                '%s: framing problems (dropped_bytes=%d, misaligned=%d); DATA:LENG may not '
+                'match the stream: %s',
+                where,
+                stats.dropped_bytes,
+                stats.misaligned,
+                stats,
+            )
+
+    def _default_acquire_timeout(self, n: int) -> float:
+        """`max(5, 2 * n * TRIG:INT + 2)` seconds: n acquisitions at the trigger interval."""
+        try:
+            interval = _reply_float('TRIG:INT?', self.query('TRIG:INT?'))
+        except Exception as exc:  # noqa: BLE001 - fall back to the minimum
+            self.logger.warning(
+                'acquire: TRIG:INT? failed (%s); using %s s as the timeout',
+                exc,
+                _MIN_ACQUIRE_TIMEOUT_S,
+            )
+            self._discard_late_reply()
+            return _MIN_ACQUIRE_TIMEOUT_S
+        return max(_MIN_ACQUIRE_TIMEOUT_S, 2.0 * n * interval + 2.0)
+
+    def _refuse_while_stream(self, running: str) -> None:
+        """Raise RuntimeError if a stream exists (running, ended or zombie)."""
+        stream = self._stream
+        if stream is None:
+            return
+        if stream.alive():
+            if stream.zombie:
+                raise RuntimeError('previous stream thread still alive')
+            raise RuntimeError(running)
+        if stream.zombie:  # it finished meanwhile; nobody is left to report to
+            self.logger.warning('the earlier stream thread has finished; clearing it')
+            self._stream = None
+            return
+        if stream.peer_closed:
+            reason = 'the device closed the data socket'
+        elif stream.callback_failure is not None:
+            reason = 'the callback raised'
+        elif stream.failure is not None:
+            reason = f'{type(stream.failure).__name__}: {stream.failure}'
+        else:
+            reason = 'it stopped'
+        raise RuntimeError(f'the stream has ended ({reason}); call stop_stream() first')
+
+    def acquire(self, n: int = 1, *, timeout_s: float | None = None) -> list[AScan]:
         """Start the acquisition, collect `n` A-scans, stop. See SPEC 3.3.
 
-        Raises ValueError for bad arguments, RuntimeError while a stream is running or when
-        the instrument queued errors, TimeoutError (with DATA:LENG and port) when fewer than
-        `n` packets arrive within `timeout_s`.
+        `timeout_s=None` means `max(5, 2 * n * TRIG:INT + 2)` seconds, from a `TRIG:INT?`
+        query. Raises ValueError for bad arguments, RuntimeError while a stream exists, for
+        a `DATA:PORT?` that names the SCPI port and for a cleanup that failed (`STOP`, error
+        queue unreadable), TimeoutError or ConnectionError (with DATA:LENG and port) when
+        fewer than `n` packets arrive. Instrument errors queued during the acquisition are
+        logged as a warning; the packets are still returned.
         """
         if n < 1:
             raise ValueError(f'n must be >= 1, got {n}')
-        if timeout_s <= 0:
+        if timeout_s is not None and timeout_s <= 0:
             raise ValueError(f'timeout_s must be > 0, got {timeout_s}')
-        if self._stream_thread is not None:
-            raise RuntimeError('acquire() while a stream is running; call stop_stream() first')
-        reader, length, fs, delay, port = self._begin_acquisition()
+        self._refuse_while_stream('acquire() while a stream is running; call stop_stream() first')
+        if timeout_s is None:
+            timeout_s = self._default_acquire_timeout(n)
+        session = self._begin_acquisition()
+        reader = session.reader
+        suffix = f'(DATA:LENG={session.length}, port={session.port})'
+        failures: list[str] = []
         try:
             packets = reader.read(n, timeout_s)
         except TimeoutError as exc:
-            raise TimeoutError(f'{exc} (DATA:LENG={length}, port={port})') from exc
+            raise TimeoutError(f'{exc} {suffix}') from exc
+        except ConnectionError as exc:
+            raise ConnectionError(f'{exc} {suffix}') from exc
         finally:
-            problems = self._end_acquisition()
-            if problems:
-                self.logger.warning('acquire cleanup: %s', problems)
-        if problems:
-            raise RuntimeError(f'acquire: {problems}')
-        return [AScan.from_packet(p, fs, delay) for p in packets]
+            failures, device_errors = self._end_acquisition()
+            self._log_frame_stats('acquire', reader)
+            if failures or device_errors:
+                self.logger.warning(
+                    'acquire cleanup: failures=%s instrument errors=%s', failures, device_errors
+                )
+        if failures:
+            raise RuntimeError(f'acquire: {failures}')
+        return [AScan.from_packet(p, session.fs, session.delay) for p in packets]
 
     def start_stream(self, callback: Callable[[AScan], object], *, timeout_s: float = 5.0) -> None:
         """Start the acquisition and call `callback(ascan)` from a daemon thread. SPEC 3.4.
 
         `timeout_s` is how long the stream may stay silent before it counts as stalled.
+        The callback may use `query`/`write` (they hold the SCPI lock per command).
         """
         if timeout_s <= 0:
             raise ValueError(f'timeout_s must be > 0, got {timeout_s}')
-        if self._stream_thread is not None:
-            raise RuntimeError('a stream is already running; call stop_stream() first')
-        reader, _length, fs, delay, _port = self._begin_acquisition()
-        self._stream_stop = threading.Event()
-        self._stream_count = 0
-        self._stream_failure = None
-        self._callback_failure = None
-        self._stream_timeout_s = timeout_s
-        self._stream_thread = threading.Thread(
+        self._refuse_while_stream('a stream is already running; call stop_stream() first')
+        session = self._begin_acquisition()
+        stream = _Stream(reader=session.reader, socket=session.sock, timeout_s=timeout_s)
+        thread = threading.Thread(
             target=self._stream_loop,
-            args=(reader, fs, delay, callback, timeout_s, self._stream_stop),
+            args=(stream, session.fs, session.delay, callback),
             name='a1580-stream',
             daemon=True,
         )
-        self._stream_thread.start()
+        stream.thread = thread
+        self._stream = stream
+        thread.start()
 
     def _stream_loop(
-        self,
-        reader: FrameReader,
-        fs: float,
-        delay: int,
-        callback: Callable[[AScan], object],
-        timeout_s: float,
-        stop: threading.Event,
+        self, stream: _Stream, fs: float, delay: int, callback: Callable[[AScan], object]
     ) -> None:
         last = time.monotonic()
-        while not stop.is_set():
-            try:
-                packets = reader.read(1, _STREAM_SLICE_S)
-            except TimeoutError:
-                if stop.is_set():
+        try:
+            while not stream.stop_event.is_set():
+                try:
+                    packets = stream.reader.read(1, _STREAM_SLICE_S)
+                except TimeoutError:
+                    if stream.stop_event.is_set():
+                        return
+                    if time.monotonic() - last > stream.timeout_s:
+                        stream.failure = TimeoutError(
+                            f'no A-scan for {stream.timeout_s} s after {stream.count} delivered'
+                        )
+                        return
+                    continue
+                last = time.monotonic()
+                ascan = AScan.from_packet(packets[0], fs, delay)
+                try:
+                    callback(ascan)
+                except Exception as exc:  # noqa: BLE001 - re-raised by stop_stream
+                    self.logger.exception('A-scan callback raised; stopping the stream')
+                    stream.callback_failure = exc
                     return
-                if time.monotonic() - last > timeout_s:
-                    self._stream_failure = TimeoutError(
-                        f'no A-scan for {timeout_s} s after {self._stream_count} delivered'
-                    )
-                    return
-                continue
-            except (OSError, ValueError) as exc:  # ConnectionError is an OSError
-                if not stop.is_set():
-                    self._stream_failure = exc
-                return
-            last = time.monotonic()
-            try:
-                callback(AScan.from_packet(packets[0], fs, delay))
-            except Exception as exc:  # noqa: BLE001 - re-raised by stop_stream
-                self.logger.exception('A-scan callback raised; stopping the stream')
-                self._callback_failure = exc
-                return
-            self._stream_count += 1
+                stream.count += 1
+        except Exception as exc:  # noqa: BLE001 - whatever it is, stop_stream reports it
+            if not stream.stop_event.is_set():
+                stream.failure = exc
+                if isinstance(exc, ConnectionError):
+                    stream.peer_closed = True
+                    self.logger.warning('the device closed the data socket: %s', exc)
 
     def stop_stream(self) -> int:
         """Stop the stream and return the number of A-scans delivered (0 if none running).
 
         Sends `STOP`, joins the thread, closes the data socket and drains the error queue.
-        Afterwards it re-raises, in this order: the callback's exception, a stream failure
-        (stall or lost connection), a failed `STOP`, queued instrument errors.
+        Afterwards it re-raises, in this order: the callback's exception (the other
+        problems are logged first), a stream failure (stall, lost connection, any error in
+        the reader thread), a thread that did not stop in time, a failed `STOP`, queued
+        instrument errors. A thread that cannot be joined leaves the stream marked as a
+        zombie: `start_stream` and `acquire` then raise until the thread has finished.
         """
-        thread = self._stream_thread
-        if thread is None:
+        stream = self._stream
+        if stream is None:
             return 0
-        self._stream_stop.set()
-        problems = self._end_acquisition(thread, self._stream_timeout_s + 1)
-        alive = thread.is_alive()
-        self._stream_thread = None
-        count = self._stream_count
-        callback_failure, self._callback_failure = self._callback_failure, None
-        stream_failure, self._stream_failure = self._stream_failure, None
+        if stream.zombie and stream.alive():
+            raise RuntimeError('previous stream thread still alive')
+        stream.stop_event.set()
+        failures, device_errors = self._end_acquisition(stream.thread, stream.timeout_s + 1)
+        problems = failures + device_errors
+        alive = stream.alive()
+        if alive:
+            stream.zombie = True  # keep self._stream: the thread is still running
+        else:
+            self._stream = None
+        self._log_frame_stats('stop_stream', stream.reader)
+        count = stream.count
+        callback_failure, stream.callback_failure = stream.callback_failure, None
+        stream_failure, stream.failure = stream.failure, None
+        others: list[str] = []
+        if stream_failure is not None:
+            others.append(f'stream failure: {type(stream_failure).__name__}: {stream_failure}')
+        if alive:
+            others.append('the stream thread did not stop in time')
+        others += problems
         if callback_failure is not None:
+            if others:
+                self.logger.warning('stop_stream: besides the callback failure: %s', others)
             raise callback_failure
         if stream_failure is not None:
+            if len(others) > 1:
+                self.logger.warning('stop_stream: besides the stream failure: %s', others[1:])
             raise stream_failure
         if alive:
             raise RuntimeError('the stream thread did not stop in time')
@@ -665,14 +1063,19 @@ class A1580Plug(BasePlug):
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def tearDown(self) -> None:
-        """Stop, make the pulser safe, optionally restore the settings, close everything.
+        """Make the pulser safe first, then stop, optionally restore the settings, close all.
 
-        Order: stop a running stream, `STOP`, then either restore the initial settings
-        (`restore_state` on: `set_state` writes `TRAN:ENAB OFF` first and the snapshot's
-        value last) or, when `restore_state` is off, write `TRAN:ENAB OFF` so that a station
-        that does not restore never leaves the high-voltage pulser running. That write is
-        best effort. Every failure is logged, nothing is raised.
+        Order: one unchecked best-effort `TRAN:ENAB OFF` (before the stream is stopped,
+        before `STOP`, before any error-queue read); stop a running stream; `STOP`; then
+        either restore the initial settings (`restore_state` on: `set_state` switches the
+        pulser off again around the restore and ends with it off) or, with `restore_state`
+        off, a checked `TRAN:ENAB OFF`. The device ends with the snapshot restored and the
+        pulser off. Every failure is logged, nothing is raised.
         """
+        try:
+            self.write(_PULSER_OFF)
+        except Exception as exc:  # noqa: BLE001 - tearDown must not raise
+            self.logger.warning('Failed to switch the pulser off first in tearDown: %s', exc)
         try:
             self.stop_stream()
         except Exception as exc:  # noqa: BLE001 - tearDown must not raise
@@ -688,7 +1091,7 @@ class A1580Plug(BasePlug):
                 self.logger.warning('Failed to restore A1580 state: %s', exc)
         elif not self._restore_state:
             try:
-                self.write_checked('TRAN:ENAB OFF')
+                self.write_checked(_PULSER_OFF)
             except Exception as exc:  # noqa: BLE001 - best effort, must not block closing
                 self.logger.warning('Failed to switch the pulser off in tearDown: %s', exc)
         self._close_data_socket()
@@ -705,6 +1108,17 @@ class A1580Plug(BasePlug):
             except Exception as exc:  # noqa: BLE001 - tearDown must not raise
                 self.logger.warning('closing the resource manager failed: %s', exc)
             self._rm = None
+
+
+def _is_on(text: str) -> bool:
+    return text.strip().upper() in _TRUE
+
+
+def _normal_or_none(header: str) -> str | None:
+    try:
+        return normalize_header(header)
+    except ValueError:
+        return None
 
 
 def _default_data_socket(host: str, port: int) -> socket.socket:

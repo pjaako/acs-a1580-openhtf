@@ -14,6 +14,7 @@ from a1580_openhtf.stream import (
     MAGIC,
     AScanHeader,
     FrameReader,
+    _split,
     build_packet,
     packet_size,
     parse_header,
@@ -159,6 +160,44 @@ def test_split_magic_split_across_chunks_is_not_lost() -> None:
     assert split_packets(buf, LENGTH) == []
     buf += p[2:]
     assert split_packets(buf, LENGTH) == [p]
+
+
+# ── 2b. misalignment ─────────────────────────────────────────────────────────
+
+
+def test_split_counts_a_packet_not_followed_by_magic() -> None:
+    a, b = _pkt(0), _pkt(1)
+    buf = bytearray(a + b'XXXXXXXX' + b)  # the next 4+ bytes do not start with FtH1
+    assert _split(buf, LENGTH)[0] == [a, b]
+    buf = bytearray(a + b'XXXXXXXX' + b)
+    _packets, dropped, misaligned = _split(buf, LENGTH)
+    assert (dropped, misaligned) == (8, 1)
+
+
+def test_split_aligned_and_short_tails_are_not_misaligned() -> None:
+    a, b = _pkt(0), _pkt(1)
+    assert _split(bytearray(a + b), LENGTH)[2] == 0
+    assert _split(bytearray(a + b[:3]), LENGTH)[2] == 0  # fewer than 4 bytes: cannot tell
+    assert _split(bytearray(a + b[:4]), LENGTH)[2] == 0  # starts with the magic
+    assert _split(bytearray(b'junk' + a), LENGTH)[2] == 0  # garbage before is dropped, not this
+
+
+def test_reader_counts_misaligned_packets() -> None:
+    a, b = _pkt(0), _pkt(1)
+    reader = FrameReader(StubSocket([a + b'XXXXXXXX' + b]), LENGTH)
+    assert reader.read(2, 1.0) == [a, b]
+    assert reader.misaligned == reader.stats.misaligned == 1
+    assert reader.dropped_bytes == 8
+    clean = FrameReader(StubSocket([a + b]), LENGTH)
+    clean.read(2, 1.0)
+    assert clean.misaligned == 0
+
+
+def test_reader_with_too_small_a_length_is_misaligned() -> None:
+    wide = build_packet(range(LENGTH * 2), packet_number=0)  # 16 samples on an 8-sample reader
+    reader = FrameReader(StubSocket([wide]), LENGTH)
+    assert len(reader.read(1, 1.0)) == 1
+    assert reader.misaligned == 1
 
 
 # ── 3. FrameReader against a scripted stub ───────────────────────────────────
