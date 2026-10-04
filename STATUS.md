@@ -19,11 +19,14 @@ Last updated: 2026-10-04 by the project owner agent.
 ## State
 
 - [x] Vendor material digested into `PROTOCOL.md`.
-- [ ] Scaffold (SPEC.md section 0).
-- [ ] Plug, fake, stream parser, tests (SPEC.md).
-- [ ] Capture YAML (SPEC-capture.md).
-- [ ] Example test and README.
-- [ ] First hardware session (needs the device reachable from the agent).
+- [x] Scaffold (SPEC.md section 0).
+- [x] Plug, fake, stream parser, tests (SPEC.md). 375 hardware-free tests green.
+- [x] Capture YAML (SPEC-capture.md).
+- [x] Example test and README (README is pre-hardware; the vendor material is its only source).
+- [ ] Independent code review of the core (in progress), findings folded in.
+- [ ] `tools/hw_probe.py` implementing phases A and B of `HARDWARE-SESSION.md` (in progress).
+- [ ] First hardware session (needs the device reachable from the agent, see HARDWARE-SESSION.md preconditions).
+- [ ] SPEC-golden (golden A-scan comparison), not written yet.
 
 ## Open questions for the first hardware session
 
