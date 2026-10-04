@@ -10,6 +10,8 @@ marked `UNKNOWN default` or `UNKNOWN`. Nothing is done until it has run on the i
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .plug import _NUMBER_WITH_UNIT, _REPLY_UNIT_SI, _UNIT_SUFFIXES, REPLY_UNITS, normalize_header
@@ -303,6 +305,7 @@ class FakeDataSocket:
             return b''  # like a real socket after shutdown: end of stream
         resource = self._resource
         if not resource.started or resource.signal == 'none':
+            time.sleep(0.001)  # like a blocking recv: readers must not spin at 100 % CPU
             raise TimeoutError('fake data socket: nothing to receive')
         if not self._out:
             if not self._prefix_sent:

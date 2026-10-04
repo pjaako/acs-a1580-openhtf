@@ -406,8 +406,11 @@ def test_set_state_writes_in_order_with_units_and_checks_each() -> None:
     assert fake.log[1::2] == writes
     assert fake.log[2::2] == [ERR] * len(writes)
     heads = [w.split(' ', 1)[0] for w in writes]
-    expected = [h for h in STATE_HEADERS if h != 'AVER:DEL:CONS']
+    # TRAN:ENAB OFF first, the rest in STATE_HEADERS order, the snapshot's TRAN:ENAB last
+    expected = ['TRAN:ENAB'] + [h for h in STATE_HEADERS if h not in ('TRAN:ENAB', 'AVER:DEL:CONS')]
+    expected.append('TRAN:ENAB')
     assert heads == expected
+    assert writes[0] == 'TRAN:ENAB OFF'
     assert 'FREQ 100 MHZ' in writes
     assert 'TRAN:FREQ 5000 KHZ' in writes
     assert 'TRIG:INT 10000 US' in writes
@@ -415,6 +418,22 @@ def test_set_state_writes_in_order_with_units_and_checks_each() -> None:
     assert 'TRAN:PULS 20 V' in writes
     assert 'GAIN 0' in writes
     assert 'AVER:DEL:RAND 2000 NS' in writes
+
+
+def test_set_state_switches_the_pulser_off_before_any_other_restore_write() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    plug.apply_setup({'TRAN:ENAB': 'ON'})
+    state = plug.get_state()
+    assert state['TRAN:ENAB'] == 'ON'
+    fake.log.clear()
+    plug.set_state(state)
+    writes = [e for e in fake.log if e != ERR]
+    assert writes[0] == 'TRAN:ENAB OFF'
+    assert writes[-1] == 'TRAN:ENAB ON'
+    assert writes.count('TRAN:ENAB OFF') == 1
+    assert fake.log[:3] == [ERR, 'TRAN:ENAB OFF', ERR]  # checked, right after the stale drain
+    assert plug.query('TRAN:ENAB?') == 'ON'
 
 
 def test_set_state_skips_constant_delay_while_auto_is_on() -> None:
@@ -472,6 +491,7 @@ def test_restore_state_true_snapshots_and_restores() -> None:
     assert fake._values == initial
     assert fake.log[0] == 'STOP'
     assert fake.stop_count == 1
+    assert fake.log[1:4] == [ERR, 'TRAN:ENAB OFF', ERR]  # pulser off before the other writes
     assert any(e.startswith('FREQ ') for e in fake.log)
 
 
@@ -490,10 +510,34 @@ def test_restore_state_false_stops_and_closes_only() -> None:
     changed = dict(fake._values)
     fake.log.clear()
     plug.tearDown()
-    assert fake.log == ['STOP']
-    assert fake._values == changed
+    # STOP, then the pulser off (checked, so one error-queue drain), nothing else restored
+    assert fake.log == ['STOP', 'TRAN:ENAB OFF', ERR]
+    assert fake._values == {**changed, 'TRAN:ENAB': 'OFF'}
     assert fake.closed
-    assert not any(e.endswith('?') for e in fake.log)
+
+
+def test_teardown_without_restore_switches_the_pulser_off_after_stop() -> None:
+    plug = _plug(restore_state=False)
+    fake = _fake(plug)
+    plug.apply_setup({'TRAN:ENAB': 'ON'})
+    assert fake.query('TRAN:ENAB?') == 'ON'
+    fake.log.clear()
+    plug.tearDown()
+    assert fake.log[:2] == ['STOP', 'TRAN:ENAB OFF']
+    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake.closed
+
+
+def test_teardown_without_restore_logs_a_failed_pulser_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plug = _plug(restore_state=False)
+    fake = _fake(plug)
+    fake._reject['TRAN:ENAB'] = '-222,"Data out of range"'
+    with caplog.at_level(logging.WARNING):
+        plug.tearDown()  # must not raise
+    assert 'pulser off' in caplog.text
+    assert fake.closed
 
 
 def test_failing_restore_is_logged_not_raised(caplog: pytest.LogCaptureFixture) -> None:
@@ -903,6 +947,45 @@ def test_real_resource_path_cleans_up_when_construction_fails(
     assert fake.closed and rm.closed
 
 
+# ── 11. apply_capture ────────────────────────────────────────────────────────
+
+
+def test_apply_capture_applies_the_vendor_example_file() -> None:
+    from a1580_openhtf.capture import Capture, load_capture
+
+    plug = _plug()
+    fake = _fake(plug)
+    fake.log.clear()
+    capture = plug.apply_capture(ROOT / 'captures' / 'vendor_example.yaml')
+    assert isinstance(capture, Capture)
+    assert capture == load_capture(ROOT / 'captures' / 'vendor_example.yaml')
+    assert fake.log[0] != '*RST'  # reset defaults to False
+    assert '*RST' not in fake.log
+    # TRAN:ENAB is the last header: its write, the error drain, then the read-back
+    assert fake.log[-3:] == ['TRAN:ENAB ON', ERR, 'TRAN:ENAB?']
+    assert fake._values['TRAN:ENAB'] == 'ON'
+    assert fake._values['TRAN:PULS'] == '20'
+
+
+def test_apply_capture_reset_sends_rst_first() -> None:
+    plug = _plug()
+    fake = _fake(plug)
+    fake.log.clear()
+    plug.apply_capture(ROOT / 'captures' / 'vendor_example.yaml', reset=True)
+    assert fake.log[0] == '*RST'
+
+
+def test_apply_capture_broken_file_raises_and_writes_nothing() -> None:
+    from a1580_openhtf.capture import CaptureError
+
+    plug = _plug()
+    fake = _fake(plug)
+    fake.log.clear()
+    with pytest.raises(CaptureError):
+        plug.apply_capture(ROOT / 'tests' / 'data' / 'broken.yaml')
+    assert fake.log == []
+
+
 # ── importing and running without hardware or pyvisa ─────────────────────────
 
 
@@ -935,7 +1018,15 @@ def test_public_names() -> None:
     import a1580_openhtf
 
     assert a1580_openhtf.__version__ == '0.1.0'
-    assert set(a1580_openhtf.__all__) >= {'A1580Plug', 'AScan', 'AScanHeader'}
+    assert set(a1580_openhtf.__all__) >= {
+        'A1580Plug',
+        'AScan',
+        'AScanHeader',
+        'Capture',
+        'CaptureError',
+        'FakeA1580Resource',
+        'load_capture',
+    }
 
 
 def test_example_runs_in_fake_mode() -> None:

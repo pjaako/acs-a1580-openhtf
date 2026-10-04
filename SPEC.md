@@ -140,13 +140,14 @@ be consistent and use the vendor example's forms where it has one):
 | `check_errors() -> list[str]` | drain `SYST:ERR?` until the number is 0, at most 20 reads; return the non-zero entries |
 | `write_checked(cmd)` | write, then `check_errors()`; raise `RuntimeError(f'{cmd!r}: {errors}')` if any |
 | `reset()` | `*RST`, then `check_errors()`; invalidates cached length/fs |
+| `apply_capture(capture_or_path, *, reset=False) -> Capture` | delegates to `capture.apply_capture` (SPEC-capture) |
 | `apply_setup(settings: Mapping[str, object]) -> None` | for each key in order: `write_checked(f'{key} {value}')`, then `query(f'{key}?')`, compare with `values_match` (section 3.1). Collect all failures and raise one `RuntimeError` listing them. |
 | `get_state() -> dict[str, str]` | query every header in `STATE_HEADERS` (section 3.2), return `{header: reply}` |
-| `set_state(state)` | write them back in `STATE_HEADERS` order with `write_checked`; `AVER:DEL:CONS` is written only when `AVER:DEL:CONS:AUTO` is `OFF`/`0` in `state` |
+| `set_state(state)` | `TRAN:ENAB OFF` first (checked), then the other headers in `STATE_HEADERS` order with `write_checked`, then the snapshot's `TRAN:ENAB` last; `AVER:DEL:CONS` is written only when `AVER:DEL:CONS:AUTO` is `OFF`/`0` in `state` |
 | `stop()` | `STOP` |
 | `acquire(n=1, *, timeout_s=5.0) -> list[AScan]` | section 3.3 |
 | `start_stream(callback, *, timeout_s=5.0)` / `stop_stream()` | section 3.4 |
-| `tearDown()` | `stop_stream()` if running (swallow errors), `STOP`, restore state if enabled (try/except, `self.logger.warning`, never raise), close the data socket if open, close the resource, close the resource manager if we made one |
+| `tearDown()` | `stop_stream()` if running (swallow errors), `STOP`, then restore state if enabled, otherwise `TRAN:ENAB OFF` (both best effort: try/except, `self.logger.warning`, never raise), close the data socket if open, close the resource, close the resource manager if we made one. The device is never left with the pulser on. |
 
 ### 3.1 `values_match(header, sent, reply) -> bool` (module-level function)
 
@@ -173,8 +174,8 @@ In this order: `FREQ`, `DATA:LENG`, `MODE`, `TRAN:TYPE`, `TRAN:REV`, `TRAN:PULS`
 `TRAN:ENAB`, `TRIG:MODE`, `TRIG:INT`, `TRIG:DEL`, `GAIN`, `GAIN:PRE:COMB`,
 `GAIN:PRE:SPLIT`, `GAIN:TGC:MODE`, `GAIN:TGC:LIN`, `GAIN:TGC:ARB`, `AVER:COUN`,
 `AVER:DEL:CONS:AUTO`, `AVER:DEL:CONS`, `AVER:DEL:RAND`, `FILT:HPAS:IND`.
-`TRAN:ENAB` is restored last among transmitter settings on purpose (pulser off while the
-rest changes). If the device's real short forms differ, that is a hardware finding; keep
+`set_state` switches the pulser off before any other write and restores `TRAN:ENAB` last,
+so the pulser is off while amplitude, frequency and impedance change. If the device's real short forms differ, that is a hardware finding; keep
 the list in one place.
 
 ### 3.3 `acquire(n, timeout_s)`

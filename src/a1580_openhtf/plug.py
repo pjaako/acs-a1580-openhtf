@@ -15,13 +15,17 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Mapping
-from typing import Any, NamedTuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 from openhtf.plugs import BasePlug
 from openhtf.util import configuration
 
 from .stream import HEADER_SIZE, AScanHeader, FrameReader, parse_header
+
+if TYPE_CHECKING:
+    from .capture import Capture
 
 CONF = configuration.CONF
 CONF.declare(
@@ -460,19 +464,40 @@ class A1580Plug(BasePlug):
         return {header: self.query(f'{header}?') for header in STATE_HEADERS}
 
     def set_state(self, state: Mapping[str, str]) -> None:
-        """Write a `get_state` snapshot back in `STATE_HEADERS` order, each with write_checked.
+        """Write a `get_state` snapshot back, each write with write_checked.
+
+        The pulser is switched off first (`TRAN:ENAB OFF`, before any other restore write)
+        so that it is off while amplitude, frequency and impedance change. Then come the
+        other headers in `STATE_HEADERS` order and, last, the snapshot's `TRAN:ENAB` value
+        (nothing is written for it if the snapshot has none, so the pulser stays off).
 
         `AVER:DEL:CONS` is skipped unless `AVER:DEL:CONS:AUTO` is OFF (the device answers
         -221 otherwise). Errors queued before the call are discarded first.
         """
         self.check_errors()
         auto = state.get('AVER:DEL:CONS:AUTO', '').strip().upper()
+        self.write_checked('TRAN:ENAB OFF')
         for header in STATE_HEADERS:
-            if header not in state:
+            if header == 'TRAN:ENAB' or header not in state:
                 continue
             if header == 'AVER:DEL:CONS' and auto not in ('OFF', '0'):
                 continue
             self.write_checked(f'{header} {_restore_value(header, state[header])}')
+        if 'TRAN:ENAB' in state:
+            self.write_checked(f'TRAN:ENAB {_restore_value("TRAN:ENAB", state["TRAN:ENAB"])}')
+
+    def apply_capture(
+        self, capture_or_path: Capture | str | Path, *, reset: bool = False
+    ) -> Capture:
+        """Apply a capture file (or a `Capture`) with read-back verification; return the Capture.
+
+        Thin delegate to `a1580_openhtf.capture.apply_capture`: the capture is loaded and
+        validated before anything is sent, `reset=True` sends `*RST` first, then
+        `apply_setup(capture.to_scpi())` runs. Raises `CaptureError` for an invalid capture.
+        """
+        from .capture import apply_capture  # lazy: keeps yaml out of the plug's import
+
+        return apply_capture(self, capture_or_path, reset=reset)
 
     # ── acquisition ──────────────────────────────────────────────────────────
 
@@ -640,7 +665,14 @@ class A1580Plug(BasePlug):
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def tearDown(self) -> None:
-        """Stop, restore the initial settings, close everything. Never raises."""
+        """Stop, make the pulser safe, optionally restore the settings, close everything.
+
+        Order: stop a running stream, `STOP`, then either restore the initial settings
+        (`restore_state` on: `set_state` writes `TRAN:ENAB OFF` first and the snapshot's
+        value last) or, when `restore_state` is off, write `TRAN:ENAB OFF` so that a station
+        that does not restore never leaves the high-voltage pulser running. That write is
+        best effort. Every failure is logged, nothing is raised.
+        """
         try:
             self.stop_stream()
         except Exception as exc:  # noqa: BLE001 - tearDown must not raise
@@ -654,6 +686,11 @@ class A1580Plug(BasePlug):
                 self.set_state(self._initial_state)
             except Exception as exc:  # noqa: BLE001 - must not block closing the resource
                 self.logger.warning('Failed to restore A1580 state: %s', exc)
+        elif not self._restore_state:
+            try:
+                self.write_checked('TRAN:ENAB OFF')
+            except Exception as exc:  # noqa: BLE001 - best effort, must not block closing
+                self.logger.warning('Failed to switch the pulser off in tearDown: %s', exc)
         self._close_data_socket()
         self._close_resource()
 
