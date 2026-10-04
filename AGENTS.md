@@ -49,6 +49,13 @@ different instrument. Read this file, then `STATUS.md`, then the SPEC you were g
   Never store derived float arrays. Count-to-volt scaling is UNKNOWN (see `PROTOCOL.md`),
   so there is no `v` array until it is measured.
 - Hand-written hardware checks wrap their work in `try: ... finally: plug.tearDown()`.
+  The first sessions use `tools/hw_probe.py` and follow `HARDWARE-SESSION.md`.
+- Known limitation of the fake: it converts values with the plug's own unit and
+  reply-format tables (`REPLY_UNITS` and friends). A wrong table entry is therefore
+  invisible to every test; only the device can confirm those tables. Each hardware
+  session checks the read-back formats first (protocol step 2).
+- The pulser is never re-enabled automatically. `tearDown` switches it off before anything
+  else, and a restored snapshot ends with `TRAN:ENAB OFF` even if it was ON at construction.
 - Public repository: `192.168.200.18` is the vendor factory default and may appear in
   docs. Any other real address, serial number or site detail stays out of git.
   Tools read the address from the environment variable `A1580_HOST`.
