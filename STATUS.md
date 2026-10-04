@@ -49,3 +49,23 @@ Command to run first: `A1580_HOST=<ip> .venv/bin/python tools/hw_probe.py --phas
 See `PROTOCOL.md`, section "Unknowns to verify on hardware". The ones that block design
 choices are: the real `DATA:PORT?` value, whether a single-shot acquisition exists,
 the meaning of `AVER:COUN` and the header `ascan_count`, and count-to-volt scaling.
+
+## Resuming as the owner agent on the local machine
+
+The work so far was done in a cloud session with no device access. The next session runs
+on the machine next to the A1580, with the human owner at the terminal. The local agent
+takes the project-owner role described in `AGENTS.md`: it talks to the device itself,
+following `HARDWARE-SESSION.md` step by step, and delegates code changes (fake, tests,
+README edits) to coder subagents that never touch the device.
+
+Checklist for that session, in order:
+1. `git fetch && git checkout claude/friendly-brown-vhwy3d && git pull`.
+2. Python 3.12+ (`uv python install 3.13` if needed), `uv sync --extra dev`, then run the
+   gates from `CLAUDE.md`; expect 586 tests passing before anything else.
+3. Ask the human for the three preconditions in `HARDWARE-SESSION.md` and record the
+   answers in the session log. Do not assume any of them.
+4. `tools/hw_probe.py --phase A --dry-run`, show the plan, get a go, run phase A, then
+   phase B. Phase C (pulser on) only after an explicit go with the voltage named.
+5. After each phase: README section "Measured on the device" (date, firmware), fake
+   updated for every discrepancy with a test, `STATUS.md` unknowns resolved or sharpened,
+   commit with the co-author line, push.
