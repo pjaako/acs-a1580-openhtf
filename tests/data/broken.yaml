@@ -1,0 +1,25 @@
+sampling:
+  rate: 3 MHz                # not an A1580 sampling rate
+  length: 40000              # above 36864
+mode: maser                  # typo in the choice
+pulser:
+  voltage: 12 V              # not a multiple of 5 V
+  frequency: 2.5             # no unit
+  periods: 17                # above 16
+  impedance: 200             # must be quoted
+  gap: 5 ns
+  gap: 10 ns                 # duplicate key
+receiver:
+  gain: 90 dB                # above 80 dB
+  high_pass: 2 kHz           # not one of the four filters
+  tgc:
+    mode: linear             # no 'linear' curve below
+trigger:
+  mdoe: internal             # typo in the key
+  interval: 50 ms            # fine
+  delay: -1 us               # negative
+averaging:
+  count: 9                   # above 8
+  constant_delay: soon       # neither 'auto' nor a time
+extra:
+  FOO BAR: 1                 # a header has no spaces

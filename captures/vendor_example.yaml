@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../capture.schema.json
+# $schema: ../capture.schema.json
+# The settings of the vendor example (PROTOCOL.md, "Vendor example call sequence"), with the
+# pulser at 20 V instead of the vendor's 100 V.
+sampling:
+  rate: 100 MHz
+  length: 8192
+mode: master
+pulser:
+  enabled: true
+  type: single
+  reverse_polarity: false
+  voltage: 20 V
+  frequency: 2.5 MHz
+  periods: 1
+  gap: 5 ns
+  damping: true
+  damping_gap: 30 ns
+  impedance: '200'
+receiver:
+  gain: 10 dB
+  tgc:
+    mode: 'off'
+trigger:
+  mode: internal
+  interval: 100 ms
+  delay: 0 ns
+averaging:
+  count: 0
+  constant_delay: auto
+  random_delay: 2 us

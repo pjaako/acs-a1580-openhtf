@@ -42,7 +42,7 @@ quote-style = "single"
 [tool.mypy]
 strict = true
 # capture.py is added by SPEC-capture.
-files = ["src/a1580_openhtf/stream.py"]
+files = ["src/a1580_openhtf/stream.py", "src/a1580_openhtf/capture.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

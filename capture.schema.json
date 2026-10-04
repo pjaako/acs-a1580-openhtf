@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ACS A1580 capture conditions",
+  "description": "Everything a test condition can set. All groups and fields are optional.",
+  "$defs": {
+    "frequency": {
+      "type": "string",
+      "pattern": "^\\s*[-+]?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d{1,3})?\\s*([kK][hH][zZ]|[mM][hH][zZ]|[hH][zZ])\\s*$",
+      "description": "A frequency with a unit (Hz, kHz or MHz), e.g. '2.5 MHz'."
+    },
+    "time": {
+      "type": "string",
+      "pattern": "^\\s*[-+]?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d{1,3})?\\s*([nN][sS]|[uUµ][sS]|[mM][sS]|[sS])\\s*$",
+      "description": "A time with a unit (ns, us, ms or s), e.g. '10 us'."
+    },
+    "voltage": {
+      "type": "string",
+      "pattern": "^\\s*[-+]?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d{1,3})?\\s*([vV])\\s*$",
+      "description": "A voltage with a unit (V), e.g. '20 V'."
+    },
+    "gain": {
+      "type": "string",
+      "pattern": "^\\s*[-+]?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d{1,3})?\\s*([dD][bB])\\s*$",
+      "description": "A gain with a unit (dB), e.g. '10 dB'."
+    },
+    "slope": {
+      "type": "string",
+      "pattern": "^\\s*[-+]?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d{1,3})?\\s*([dD][bB]\\s*/\\s*[uUµ][sS])\\s*$",
+      "description": "A gain slope with a unit (dB/us), e.g. '0.1 dB/us'."
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rate": {
+          "$ref": "#/$defs/frequency",
+          "examples": [
+            "1 MHz",
+            "2 MHz",
+            "5 MHz",
+            "10 MHz",
+            "25 MHz",
+            "50 MHz",
+            "100 MHz"
+          ],
+          "description": "Sampling frequency; only 1, 2, 5, 10, 25, 50 and 100 MHz exist. SCPI: FREQ."
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 36864,
+          "description": "Samples per A-scan. Whether odd sizes are accepted is UNKNOWN. Allowed: 1024 to 36864. SCPI: DATA:LENG."
+        }
+      },
+      "description": "A-scan sampling."
+    },
+    "mode": {
+      "enum": [
+        "master",
+        "slave"
+      ],
+      "description": "master or slave operation. SCPI: MODE."
+    },
+    "pulser": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Pulser on or off. Emitted after every other header so the pulser stays in its old state while the rest changes. SCPI: TRAN:ENAB."
+        },
+        "type": {
+          "enum": [
+            "single",
+            "dual"
+          ],
+          "description": "single: single crystal, burst on IN. dual: dual crystal, burst on OUT. SCPI: TRAN:TYPE."
+        },
+        "reverse_polarity": {
+          "type": "boolean",
+          "description": "true: the burst starts negative; false: positive. SCPI: TRAN:REV."
+        },
+        "voltage": {
+          "$ref": "#/$defs/voltage",
+          "examples": [
+            "20 V"
+          ],
+          "description": "Burst amplitude. Above 50 V `check` prints a warning. Allowed: 5 V to 100 V, multiples of 5 V. SCPI: TRAN:PULS."
+        },
+        "frequency": {
+          "$ref": "#/$defs/frequency",
+          "examples": [
+            "2.5 MHz"
+          ],
+          "description": "Burst frequency. Emitted in kHz, like the vendor example. Allowed: 10 kHz to 20 MHz. SCPI: TRAN:FREQ."
+        },
+        "periods": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 16,
+          "multipleOf": 0.5,
+          "description": "Number of periods in the burst (the vendor code questions whether this is half-periods). Allowed: 0.5 to 16, multiples of 0.5. SCPI: TRAN:DUR."
+        },
+        "gap": {
+          "$ref": "#/$defs/time",
+          "examples": [
+            "5 ns"
+          ],
+          "description": "Gap between transmitter pulses (the vendor calls it a debug parameter). Allowed: 0 ns to 500 ns, multiples of 5 ns. SCPI: TRAN:GAP."
+        },
+        "damping": {
+          "type": "boolean",
+          "description": "Pulse damping on or off. SCPI: TRAN:DAMP."
+        },
+        "damping_gap": {
+          "$ref": "#/$defs/time",
+          "examples": [
+            "30 ns"
+          ],
+          "description": "Timing gap of the damping circuit. Allowed: 10 ns to 500 ns, multiples of 5 ns. SCPI: TRAN:DAMP:GAP."
+        },
+        "impedance": {
+          "enum": [
+            "high",
+            "200",
+            "1000"
+          ],
+          "description": "Input impedance: 'high', '200' or '1000' (ohm). Quote the numbers. SCPI: TRAN:IMP."
+        }
+      },
+      "description": "Transmitter."
+    },
+    "receiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gain": {
+          "$ref": "#/$defs/gain",
+          "examples": [
+            "10 dB"
+          ],
+          "description": "Constant gain; the base level of the TGC modes. Allowed: 0 dB to 80 dB. SCPI: GAIN."
+        },
+        "preamp_combined": {
+          "type": "boolean",
+          "description": "Combined preamplifier path, adds 20 dB. SCPI: GAIN:PRE:COMB."
+        },
+        "preamp_split": {
+          "type": "boolean",
+          "description": "Split preamplifier path, adds 20 dB. Whether both paths may be on at once is UNKNOWN. SCPI: GAIN:PRE:SPLIT."
+        },
+        "high_pass": {
+          "enum": [
+            "1 kHz",
+            "100 kHz",
+            "500 kHz",
+            "1 MHz"
+          ],
+          "description": "Analog high-pass cut-off. Emitted as the device index 0..3. SCPI: FILT:HPAS:IND."
+        },
+        "tgc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "enum": [
+                "off",
+                "linear",
+                "arbitrary"
+              ],
+              "description": "Constant gain (off), linear ramp, or arbitrary curve. SCPI: GAIN:TGC:MODE."
+            },
+            "linear": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "offset": {
+                  "$ref": "#/$defs/time",
+                  "examples": [
+                    "20 us"
+                  ],
+                  "description": "Time before the gain starts to change."
+                },
+                "slope": {
+                  "$ref": "#/$defs/slope",
+                  "examples": [
+                    "0.1 dB/us"
+                  ],
+                  "description": "Gain change per time; may be negative or zero. The device stops at its own limits."
+                }
+              },
+              "required": [
+                "offset",
+                "slope"
+              ],
+              "description": "Curve for mode linear. SCPI: GAIN:TGC:LIN."
+            },
+            "arbitrary": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "time": {
+                    "$ref": "#/$defs/time",
+                    "examples": [
+                      "10 us"
+                    ],
+                    "description": "Time of the point, e.g. 10 us."
+                  },
+                  "gain": {
+                    "$ref": "#/$defs/gain",
+                    "examples": [
+                      "5 dB"
+                    ],
+                    "description": "Gain added to the receiver gain at this time."
+                  }
+                },
+                "required": [
+                  "time",
+                  "gain"
+                ],
+                "description": "One point of an arbitrary TGC curve."
+              },
+              "description": "Curve for mode arbitrary: points of time and gain, times strictly increasing. The gains are added to receiver.gain. Maximum number of points is UNKNOWN. SCPI: GAIN:TGC:ARB."
+            }
+          },
+          "description": "Time-gain compensation."
+        }
+      },
+      "description": "Receiver and gain."
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "internal",
+            "ctp",
+            "encoder",
+            "ttl"
+          ],
+          "description": "internal: periodic; ctp, encoder, ttl: external input. SCPI: TRIG:MODE."
+        },
+        "interval": {
+          "$ref": "#/$defs/time",
+          "examples": [
+            "10 ms"
+          ],
+          "description": "Time between acquisitions in internal mode. Emitted in us. Allowed: 100 us to 10 s. SCPI: TRIG:INT."
+        },
+        "delay": {
+          "$ref": "#/$defs/time",
+          "examples": [
+            "15 us"
+          ],
+          "description": "Delay between the trigger and the acquisition. Emitted in ns. Allowed: 0 ns to 2.147483647 s. SCPI: TRIG:DEL."
+        }
+      },
+      "description": "Acquisition trigger."
+    },
+    "averaging": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8,
+          "description": "Averaging count 0..8. Semantics UNKNOWN: it may be the number of acquisitions or an exponent (PROTOCOL.md CONFLICT 10); nothing here interprets it. Allowed: 0 to 8. SCPI: AVER:COUN."
+        },
+        "constant_delay": {
+          "anyOf": [
+            {
+              "const": "auto"
+            },
+            {
+              "$ref": "#/$defs/time"
+            }
+          ],
+          "description": "'auto' lets the device compute the constant delay (emits AUTO ON); a time emits AUTO OFF and then the value in ns. Allowed: 0 ns to 2.147483647 s. SCPI: AVER:DEL:CONS:AUTO, AVER:DEL:CONS."
+        },
+        "random_delay": {
+          "$ref": "#/$defs/time",
+          "examples": [
+            "2 us"
+          ],
+          "description": "Upper bound of the random part of the pause between averaged acquisitions. Emitted in ns. Allowed: 0 ns to 32.767 us. SCPI: AVER:DEL:RAND."
+        }
+      },
+      "description": "Device-side averaging."
+    },
+    "extra": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number"
+        ]
+      },
+      "description": "Raw SCPI header: argument, for settings this model does not cover, e.g. {'SENS:AVER:COUN': '3'}. Appended before TRAN:ENAB and never validated."
+    }
+  }
+}
