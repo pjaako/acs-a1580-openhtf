@@ -218,7 +218,7 @@ def test_constant_delay_while_auto_is_221() -> None:
     assert fake.query('AVER:DEL:CONS:AUTO?') == '1'
     fake.write('AVER:DEL:CONS 50 US')
     assert _drain(fake) == ['-221,"Settings conflict"']
-    assert fake.query('AVER:DEL:CONS?') == '1e-05'  # old value kept
+    assert fake.query('AVER:DEL:CONS?') == '0.00992925'  # automatic: TRIG:INT 10 ms - 70.75 us
     fake.write('AVER:DEL:CONS:AUTO OFF')
     fake.write('AVER:DEL:CONS 50 US')
     assert _drain(fake) == []
@@ -357,6 +357,8 @@ def test_packet_numbers_increment_and_wrap_at_256() -> None:
     packets = _read(fake, 300)
     numbers = [parse_header(p).packet_number for p in packets]
     assert numbers == [(2 + i) % 256 for i in range(300)]  # first one is 2: measured once
+    # ctp[0] is the same counter, not wrapped (past 255 is not measured); ctp[1], ctp[2] are 0
+    assert [parse_header(p).ctp for p in packets] == [(2 + i, 0, 0) for i in range(300)]
 
 
 @pytest.mark.parametrize('chunk', [1, 7, 25])
@@ -459,7 +461,7 @@ def test_power_on_state_has_the_pulser_on_and_rst_goes_to_the_vendor_defaults() 
     ('cmd', 'query', 'reply'),
     [
         ('TRIG:INT 1000000 US', 'TRIG:INT?', '1'),
-        ('TRIG:INT 10 MS', 'TRIG:INT?', '0.01'),  # extrapolated format, not measured
+        ('TRIG:INT 10 MS', 'TRIG:INT?', '0.01'),  # measured 2026-10-05, fw 1.16
         ('TRIG:INT 10 US', 'TRIG:INT?', '1e-05'),
         ('AVER:DEL:RAND 2000 NS', 'AVER:DEL:RAND?', '2e-06'),
         ('TRIG:INT 2 S', 'TRIG:INT?', '2'),
@@ -507,6 +509,28 @@ def test_header_length_fields_and_telemetry_as_measured() -> None:
     assert (header.length_lo, header.length_hi) == (1040, 0)
     assert (header.telemetry_a, header.telemetry_b, header.telemetry_c) == (120, 86, 52)
     assert (header.buffer_fill, header.is_full, header.ascan_count) == (0, 0, 1)
+
+
+@pytest.mark.parametrize(
+    ('length', 'size', 'length_lo', 'length_hi'),
+    [
+        (1024, 2076, 1040, 0),
+        (2048, 4124, 2064, 0),
+        (8192, 16412, 8208, 0),
+        (36864, 73756, 36880, 0),
+        (114688, 229404, 49168, 1),  # the 24-bit value 114704 = 114688 + 16
+    ],
+)
+def test_header_length_field_is_a_24_bit_sample_count_plus_16(
+    length: int, size: int, length_lo: int, length_hi: int
+) -> None:
+    fake = FakeA1580Resource(length=length)
+    fake.write('STAR AUTO')
+    (packet,) = _read(fake, 1)
+    header = parse_header(packet)
+    assert len(packet) == size
+    assert (header.length_lo, header.length_hi) == (length_lo, length_hi)
+    assert (header.reserved_b, header.reserved_c) == (0, 0)
 
 
 def test_a_real_packet_header_parses_and_frames_whatever_length_lo_says() -> None:
@@ -609,3 +633,52 @@ def test_flush_and_clear_record_themselves() -> None:
     fake.flush(object())
     fake.clear()
     assert fake.log == ['flush', 'flush', 'clear']
+
+
+@pytest.mark.parametrize(
+    ('value', 'reply'), [('MAX', '36864'), ('MIN', '1024'), ('DEF', '1024'), ('36864', '36864')]
+)
+def test_data_leng_keywords_and_the_upper_limit_are_accepted(value: str, reply: str) -> None:
+    fake = FakeA1580Resource(length=2048)
+    fake.write(f'DATA:LENG {value}')
+    assert _drain(fake) == []
+    assert fake.query('DATA:LENG?') == reply
+
+
+@pytest.mark.parametrize('value', ['36865', '65536', '114688', '1023'])
+def test_data_leng_outside_1024_to_36864_is_224_and_keeps_the_old_value(value: str) -> None:
+    fake = FakeA1580Resource(length=2048)
+    fake.write(f'DATA:LENG {value}')
+    assert _drain(fake) == ['-224,"Illegal parameter value"']
+    assert fake.query('DATA:LENG?') == '2048'  # no clamping
+
+
+def test_data_leng_1025_is_accepted_so_there_is_no_block_size_rule() -> None:
+    fake = FakeA1580Resource()
+    fake.write('DATA:LENG 1025')
+    assert _drain(fake) == []
+    assert fake.query('DATA:LENG?') == '1025'
+
+
+def test_automatic_constant_delay_is_the_trigger_interval_minus_70_75_us() -> None:
+    fake = FakeA1580Resource(power_on=True)  # TRIG:INT 1 s, AVER:DEL:CONS:AUTO on
+    assert fake.query('AVER:DEL:CONS?') == '0.99992925'
+    fake.write('TRIG:INT 10 MS')
+    assert fake.query('AVER:DEL:CONS?') == '0.00992925'
+    fake.write('AVER:DEL:CONS:AUTO OFF')
+    fake.write('AVER:DEL:CONS 50 US')
+    assert fake.query('AVER:DEL:CONS?') == '5e-05'  # no longer computed
+
+
+def test_packets_at_the_power_on_length_are_zero_from_sample_81906() -> None:
+    fake = FakeA1580Resource(power_on=True, signal='noise')
+    fake.write('STAR AUTO')
+    (packet,) = _read(fake, 1)
+    samples = np.frombuffer(packet[HEADER_SIZE:], dtype='<i2')
+    assert len(packet) == 229404
+    assert len(samples) == 114688
+    assert not samples[81906:].any()
+    assert samples[81906 - 1000 : 81906].any()
+    fake.write('DATA:LENG 36864')
+    (packet,) = _read(fake, 1)
+    assert np.frombuffer(packet[HEADER_SIZE:], dtype='<i2')[-1000:].any()  # legal length: all real

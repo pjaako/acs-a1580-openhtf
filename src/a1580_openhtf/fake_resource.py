@@ -41,8 +41,7 @@ DEFAULTS: dict[str, str] = {
     'TRAN:ENAB': '0',
     'TRIG:MODE': 'INTernal',  # UNKNOWN default (vendor example sets INTERNAL)
     # Time replies are shortest decimals (measured 2026-10-05, fw 1.16, see `_seconds`).
-    # `0.01` for 10 ms is an extrapolation from three measured replies (`1`, `0.99992925`,
-    # `2e-06`), not a measurement.
+    # `0.01` for 10 ms is measured too (2026-10-05, fw 1.16); `1e-05` for 10 us is not.
     'TRIG:INT': '0.01',
     'TRIG:DEL': '15000',
     'GAIN': '0',
@@ -53,7 +52,7 @@ DEFAULTS: dict[str, str] = {
     'GAIN:TGC:ARB': '0,5,2,20,5,20,10,40,30,10',  # UNKNOWN default (vendor example points)
     'AVER:COUN': '0',
     'AVER:DEL:CONS:AUTO': '1',  # UNKNOWN default (vendor example sets ON)
-    'AVER:DEL:CONS': '1e-05',  # extrapolated format, see TRIG:INT
+    'AVER:DEL:CONS': '1e-05',  # only seen while AUTO is off; with AUTO on `query` computes it
     'AVER:DEL:RAND': '2e-06',
     'FILT:HPAS:IND': '1',  # UNKNOWN default (doc example reply)
 }
@@ -101,8 +100,30 @@ _READ_ONLY = frozenset({'DATA:PORT'})
 _SIGNALS = ('burst', 'zeros', 'noise', 'none')
 _ERROR_QUEUE_DEPTH = 16  # measured 2026-10-05, fw 1.16: 16 entries, then `-350` as the 17th
 _QUEUE_OVERFLOW = '-350,"Queue overflow"'
-# measured for DATA:LENG out of range, assumed for out-of-range values of the other headers and
-# for bad enumeration words
+# measured for DATA:LENG out of range (2026-10-05, fw 1.16), assumed for out-of-range values
+# of the other headers and for bad enumeration words
+_DATA_LENG_MIN = 1024  # measured 2026-10-05, fw 1.16: `DATA:LENG MIN`; 1023 is refused
+_DATA_LENG_MAX = 36864  # measured: `DATA:LENG MAX`; 36865, 65536 and 114688 are refused
+_DATA_LENG_DEFAULT = 1024  # measured: `DATA:LENG DEF`
+# `DATA:LENG MIN/MAX/DEF` answer these on the next query (measured for the short forms; the
+# long forms are the same SCPI keywords, not measured). The other headers' limits are unknown.
+_DATA_LENG_KEYWORDS = {
+    'MIN': _DATA_LENG_MIN,
+    'MINIMUM': _DATA_LENG_MIN,
+    'MAX': _DATA_LENG_MAX,
+    'MAXIMUM': _DATA_LENG_MAX,
+    'DEF': _DATA_LENG_DEFAULT,
+    'DEFAULT': _DATA_LENG_DEFAULT,
+}
+# Automatic `AVER:DEL:CONS` = `TRIG:INT` minus this many seconds. Measured 2026-10-05, fw 1.16
+# at `AVER:COUN` 0 and `FREQ` 100 MHz only: 0.99992925 at 1 s, 0.00992925 at 10 ms. Whether it
+# depends on `AVER:COUN` or `FREQ` is not measured.
+_AUTO_CONSTANT_DELAY_OFFSET_S = 70.75e-6
+# `DATA:LENG` above the limit (only the power-on value 114688 gets there) gives packets that
+# are partly invalid: measured 2026-10-05, fw 1.16 at 114688, samples from this index on are
+# exactly 0 (81906 = 5 * 16384 - 14). The device also has a long constant stretch (30 counts)
+# in the first 65522 samples, at a different start in every packet; not modelled.
+_ZERO_TAIL_START = 81906
 _ILLEGAL_PARAMETER = '-224,"Illegal parameter value"'
 _MAX_LINE = 256  # see `write`
 
@@ -117,8 +138,8 @@ def _plain(value: float) -> str:
 def _seconds(value: float) -> str:
     """Seconds reply: shortest decimal, lower-case `e`, no `.0` (`1`, `0.01`, `2e-06`).
 
-    Measured 2026-10-05, fw 1.16: `1`, `0.99992925`, `2e-06`. That `0.01` and `1e-05` come
-    out the same way is an extrapolation from these three replies.
+    Measured 2026-10-05, fw 1.16: `1`, `0.01`, `0.99992925`, `0.00992925`, `2e-06`. That
+    `1e-05` comes out the same way is an extrapolation from these replies.
     """
     value = float(f'{value:.12g}')  # drop the float noise of unit conversion (2000 ns)
     if value.is_integer():
@@ -186,7 +207,8 @@ class FakeA1580Resource:
         # measured 2026-10-05, fw 1.16: the first packet after the first `STAR AUTO` after
         # power-on had number 2 and the numbering went on across STOP/START (2..11, then
         # 12..21). Seen once: nothing may be built on the value 2, only on the counter not
-        # restarting. The header field is one byte, so it wraps at 256 (layout, not measured).
+        # restarting. The header field is one byte, so `packet_number` wraps at 256 (layout, not
+        # measured); `_next_packet` itself does not wrap: it goes into `ctp[0]` (uint32).
         self._next_packet = 2
         self._flights = 0  # number of STOPs that found the stream running
 
@@ -260,6 +282,13 @@ class FakeA1580Resource:
             return '1'
         if header == '*TST':
             return '0'
+        if (
+            header == 'AVER:DEL:CONS'
+            and text.endswith('?')
+            and self._values['AVER:DEL:CONS:AUTO'] == '1'
+        ):
+            # measured 2026-10-05, fw 1.16 at AVER:COUN 0, FREQ 100 MHz only (see the constant)
+            return _seconds(float(self._values['TRIG:INT']) - _AUTO_CONSTANT_DELAY_OFFSET_S)
         if text.endswith('?') and header in self._values:
             return self._values[header]
         # A real socket resource would time out waiting for the reply of a bad query.
@@ -316,16 +345,19 @@ class FakeA1580Resource:
     def _check_range(header: str, value: str) -> None:
         """Raise ValueError for a number the device refuses (error, old value kept).
 
-        Measured 2026-10-05, fw 1.16: `DATA:LENG 114688` -> `-224,"Illegal parameter value"`,
-        value unchanged, while `DATA:LENG 1024` is accepted. The real limit is not measured:
-        the documented maximum 36864 is used. No other header has a range here.
+        Measured 2026-10-05, fw 1.16: `DATA:LENG` 1024 and 36864 are accepted, 1023, 36865,
+        65536 and 114688 give `-224,"Illegal parameter value"` and the value is unchanged (no
+        clamping); 1025 is accepted, so there is no block-size rule. No other header has a
+        range here.
         """
-        if header == 'DATA:LENG' and float(value) > 36864:
+        if header == 'DATA:LENG' and not _DATA_LENG_MIN <= float(value) <= _DATA_LENG_MAX:
             raise ValueError(f'{value} is out of range')
 
     def _convert(self, header: str, arg: str) -> str:
         """Reply text for a written `arg`. Raises ValueError for text the header cannot take."""
         upper = arg.upper()
+        if header == 'DATA:LENG' and upper in _DATA_LENG_KEYWORDS:
+            return str(_DATA_LENG_KEYWORDS[upper])
         if upper in _KEYWORDS:
             return self._values[header]  # MIN/MAX/DEF/UP/DOWN: the fake does not know the limits
         if header in _BOOLEAN:
@@ -384,7 +416,7 @@ class FakeA1580Resource:
     def _packet(self) -> bytes:
         """One synthetic A-scan packet from the current settings; numbers never restart."""
         number = self._next_packet
-        self._next_packet = (number + 1) % 256
+        self._next_packet = number + 1
         length = int(float(self._values['DATA:LENG']))
         averaging = int(float(self._values['AVER:COUN']))
         if self.signal == 'zeros':
@@ -407,13 +439,19 @@ class FakeA1580Resource:
             amplitude = 1000.0 * 10.0 ** (gain_db / 20.0)
             wave = amplitude * envelope * np.sin(2.0 * np.pi * freq * (t - t0))
             samples = np.rint(np.clip(wave, -32768, 32767)).astype(np.int16)
+        if length > _DATA_LENG_MAX:
+            samples[_ZERO_TAIL_START:] = 0
         return build_packet(
             samples.tolist(),
-            packet_number=number,
-            # measured 2026-10-05, fw 1.16 at DATA:LENG 1024 only: length_lo = sample count + 16
-            # (one data point; what the 16 is, is unknown), length_hi 0; telemetry 120, 86, 52.
-            # Above 65519 samples the sum does not fit length_lo: assumed to carry into
-            # length_hi (a 24-bit length), not measured.
+            packet_number=number % 256,
+            # measured 2026-10-05, fw 1.16 in `TRIG:MODE INT`: ctp[0] equals the packet number
+            # (35, 36, ... 112 seen, 2, 3, 4 right after power-on), ctp[1] = ctp[2] = 0. Whether
+            # ctp[0] goes on past 255 is not measured; here it does (the counter is not wrapped).
+            ctp=(number, 0, 0),
+            # measured 2026-10-05, fw 1.16 at DATA:LENG 1024, 2048, 8192, 36864 and 114688:
+            # (length_hi << 16 | length_lo) = sample count + 16 (a 24-bit value; at 114688 it is
+            # 114704, length_hi 1, length_lo 49168); what the 16 is, is unknown. Telemetry 120,
+            # 86, 52; reserved bytes 0.
             length_lo=(length + 16) & 0xFFFF,
             length_hi=(length + 16) >> 16,
             telemetry_a=120,

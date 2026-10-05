@@ -39,8 +39,10 @@ Last updated: 2026-10-05 (after hardware phases A and B) by the project owner ag
       power cycle. README entries 5 to 11; fake: queue depth 16 + `-350`, `-224` for illegal values,
       averaging as a mean over 2^N, `length_lo` = samples + 16, two packets after `STOP`, seconds
       replies as shortest decimals, `power_on=True` state; 676 tests.
-- [ ] Results of B2 into README and the fake comments (measured at four lengths, `ctp[0]` is a
-      packet counter, `DATA:LENG` range is the documented one, `TRIG:INT 10 MS` reads `0.01`).
+- [x] Results of B2 in README (entries 12 and 13) and the fake: `DATA:LENG` range is the documented
+      one, the length field is a 24-bit "samples + 16", `ctp[0]` is the packet counter, packets at
+      the power-on length 114688 are partly invalid, automatic `AVER:DEL:CONS` is `TRIG:INT` minus
+      70.75 us; 692 tests.
 - [ ] Phase C (pulser on, transducer connected). The probe tool has no phase C yet; SPEC first.
 - [ ] SPEC-golden (golden A-scan comparison), not written yet.
 
@@ -58,7 +60,7 @@ New questions:
 - The device powers on with `DATA:LENG` 114688, which its own setter refuses. A snapshot taken
   after power-on therefore cannot be restored completely. Decision needed for the plug: skip a
   value the device refuses, or keep reporting the failure (current behaviour: failure reported,
-  everything else restored). What the device streams at 114688 is being measured (B2 part 3).
+  everything else restored). At 114688 the device streams partly invalid packets (README entry 13).
 - The device powers on with the pulser enabled at 20 V. The plug switches it off at `tearDown`
   only; should construction switch it off too? Owner decision.
 - A second connection to port 5025 killed the first (seen once). Open or close? The data port does
