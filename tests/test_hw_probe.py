@@ -209,6 +209,70 @@ def test_phase_a_is_read_only_except_bad_headers(tmp_path: Path) -> None:
     assert all(c.startswith('ZZZ:NOPE') for c in before_teardown), before_teardown
 
 
+def _teardown_block(out: str) -> list[str]:
+    """Commands of the TEARDOWN block of a dry-run, in order."""
+    lines = out.split('\n\n')
+    block = next(b for b in lines if b.startswith('TEARDOWN')).splitlines()[1:]
+    return [line.strip().split('   (')[0] for line in block]
+
+
+def _fake_teardown_commands(phase: str, out_dir: Path) -> list[str]:
+    fake = FakeA1580Resource()
+    assert hw_probe.main(['--fake', '--phase', phase, '--out', str(out_dir)], fake=fake) == 0
+    start = max(i for i, c in enumerate(fake.log) if c == 'STOP') - 1
+    return fake.log[start:]
+
+
+def test_phase_a_sends_no_restore_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeA1580Resource()
+    assert hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)], fake=fake) == 0
+    out = capsys.readouterr().out
+    after_stop = fake.log[max(i for i, c in enumerate(fake.log) if c == 'STOP') :]
+    writes = [c for c in after_stop if not c.rstrip().endswith('?')]
+    assert writes == ['STOP', 'TRAN:ENAB OFF'], writes
+    assert 'no restore' in out
+    assert 'no differences' in out
+
+
+@pytest.mark.parametrize('phase', ['B', 'AB'])
+def test_phases_b_and_ab_still_restore(tmp_path: Path, phase: str) -> None:
+    after_stop = _fake_teardown_commands(phase, tmp_path)
+    assert any(c.startswith('FREQ ') for c in after_stop)
+    assert any(c.startswith('DATA:LENG ') for c in after_stop)
+    assert any(c.startswith('GAIN ') for c in after_stop)
+
+
+def test_dry_run_snapshot_values_only_when_restoring(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert hw_probe.main(['--dry-run', '--phase', 'A']) == 0
+    assert '<snapshot value>' not in capsys.readouterr().out
+    assert hw_probe.main(['--dry-run', '--phase', 'AB']) == 0
+    out = capsys.readouterr().out
+    assert '<snapshot value>' in out
+    assert 'TRAN:ENAB <snapshot value>' not in out
+
+
+@pytest.mark.parametrize('phase', ['A', 'B', 'AB'])
+def test_dry_run_teardown_matches_what_the_fake_run_sends(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], phase: str
+) -> None:
+    assert hw_probe.main(['--dry-run', '--phase', phase]) == 0
+    planned = _teardown_block(capsys.readouterr().out)
+    sent = _fake_teardown_commands(phase, tmp_path)
+    if phase == 'A':
+        assert planned == sent
+        return
+
+    # the plan has `<header> <snapshot value>` where the run has the value; the fake skips
+    # AVER:DEL:CONS (its AUTO is ON), and with it the error-queue read that follows the write
+    skipped = planned.index('AVER:DEL:CONS <snapshot value>')
+    planned = planned[:skipped] + planned[skipped + 2 :]
+    assert [c.split(' ')[0] for c in planned] == [c.split(' ')[0] for c in sent]
+
+
 def test_pulser_is_switched_off_and_checked_before_any_other_phase_b_write(
     tmp_path: Path,
 ) -> None:

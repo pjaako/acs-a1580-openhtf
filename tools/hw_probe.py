@@ -9,11 +9,13 @@ Safety, enforced in code and not only by convention:
 
 - Every SCPI string goes through `GuardedResource`, which refuses `TRAN:PULS` writes, `*RST`
   and anything that mentions `/config`. The tool never changes `TRAN:PULS`; the restore at
-  the end leaves it out of the snapshot it writes back.
+  the end (phases B and AB only) leaves it out of the snapshot it writes back.
 - After the snapshot (step 2) the run stops if the device's `TRAN:PULS` is above
   `--max-pulse-v` or cannot be read.
-- Everything runs inside `try: ... finally: plug.tearDown()` (restore the snapshot), then
-  the state headers are queried again and diffed against the snapshot (protocol step 14).
+- Everything runs inside `try: ... finally: plug.tearDown()`. Phases B and AB restore the
+  snapshot there; phase A changes no settings and restores nothing (the pulser is only
+  switched off). Then the state headers are queried again and diffed against the snapshot
+  (protocol step 14).
 
 Usage:
     A1580_HOST=... tools/hw_probe.py --dry-run          # command list, no connection
@@ -944,24 +946,37 @@ def plan(phase: str) -> list[tuple[str, list[str]]]:
                 )
             )
         blocks.append((f'STEP {number}: {STEPS[number][0]}', commands[number]))
-    restore = [
-        f'{h} <snapshot value>'
-        for h in STATE_HEADERS
-        if h not in UNSNAPSHOTTED and h != 'TRAN:ENAB'
-    ]
-    blocks.append(
-        (
-            'TEARDOWN (plug.tearDown with restore_state=True) then FINAL DIFF (protocol step 14)',
-            [
-                'STOP',
-                ERR_QUERY + '   (drain)',
-                'TRAN:ENAB OFF',
-                *restore,
-                'TRAN:ENAB <snapshot value>   (last)',
-                *[f'{h}?' for h in STATE_HEADERS],
-            ],
+    final_queries = [f'{h}?' for h in STATE_HEADERS]
+    if any(n >= 6 for n in chosen):
+        restore = [
+            line
+            for h in STATE_HEADERS
+            if h not in UNSNAPSHOTTED and h != 'TRAN:ENAB'
+            for line in (f'{h} <snapshot value>', ERR_QUERY)
+        ]
+        blocks.append(
+            (
+                'TEARDOWN (plug.tearDown, restore_state=True) then FINAL DIFF (protocol step 14)',
+                [
+                    'TRAN:ENAB OFF',
+                    'STOP',
+                    'TRAN:ENAB OFF',
+                    ERR_QUERY + '   (drain)',
+                    *restore,
+                    'TRAN:ENAB OFF',
+                    ERR_QUERY,
+                    *final_queries,
+                ],
+            )
         )
-    )
+    else:
+        blocks.append(
+            (
+                'TEARDOWN (plug.tearDown, no restore: phase A is read-only) then FINAL DIFF '
+                '(protocol step 14)',
+                ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF', ERR_QUERY, *final_queries],
+            )
+        )
     return blocks
 
 
@@ -1073,9 +1088,10 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
     code = 0
     diff: dict[str, Any] | None = None
     try:
-        # From here on tearDown restores; until step 2 has run there is nothing to restore.
-        plug._restore_state = True
-        for number in steps_for(args.phase):
+        # tearDown restores only after a phase that changes settings (step 6 and above).
+        steps = steps_for(args.phase)
+        plug._restore_state = any(n >= 6 for n in steps)
+        for number in steps:
             if number == 6:
                 probe.run_block('PULSER-OFF CHECK', 'TRAN:ENAB OFF and read-back', pulser_off_check)
             title, func = STEPS[number]
@@ -1091,10 +1107,14 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
         code = exc.code
         print(f'RUN STOPPED: {exc}', file=sys.stderr)
     finally:
-        probe.current = StepRecord('TEARDOWN', 'plug.tearDown(), restore_state=True')
+        restore = plug._restore_state
+        probe.current = StepRecord('TEARDOWN', f'plug.tearDown(), restore_state={restore}')
         probe.records.append(probe.current)
         probe.say('')
-        probe.say('TEARDOWN: STOP, restore the snapshot, close (plug.tearDown)')
+        if restore:
+            probe.say('TEARDOWN: STOP, restore the snapshot, close (plug.tearDown)')
+        else:
+            probe.say('TEARDOWN: no restore: phase A is read-only; pulser OFF, STOP, close')
         plug.tearDown()
         diff = final_diff(probe)
         resource.shutdown()
