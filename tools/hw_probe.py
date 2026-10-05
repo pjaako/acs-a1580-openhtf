@@ -3,29 +3,39 @@
 
 Phase A is read-only (experiments 1 to 5, the only writes are the deliberate bad headers of
 step 5). Phase B (experiments 6 to 9) switches the pulser off first, then changes a few
-acquisition settings and streams A-scans. Phase C (pulser on) is not implemented on purpose.
+acquisition settings and streams A-scans. Phase C (experiments 10, 10b and 11) is the only
+one that switches the pulser ON, at `--pulse-v`, with transducers connected; phase RST
+(experiment 13) sends `*RST` once. Experiment 12 is deferred.
 
 Safety, enforced in code and not only by convention:
 
-- Every SCPI string goes through `GuardedResource`, which refuses `TRAN:PULS` writes, `*RST`
-  and anything that mentions `/config`. The tool never changes `TRAN:PULS`; the restore at
-  the end (phases B and AB only) leaves it out of the snapshot it writes back.
+- Every SCPI string goes through `GuardedResource`. By default it refuses `TRAN:PULS` writes,
+  `*RST`, `TRAN:ENAB ON`, anything that mentions `/config` and anything that chains a second
+  command (`;`, a line break). Phase C opens two gates: a `TRAN:PULS` write that equals
+  `--pulse-v` (which is `<= --max-pulse-v`) and, only inside `pulsed_acquire`, `TRAN:ENAB ON`.
+  Phase RST opens `*RST`. Every such command is printed before it is sent.
+- The pulser is on only inside `pulsed_acquire`: the `finally` of that function sends
+  `TRAN:ENAB OFF`, `STOP`, closes the data socket and verifies the pulser off by read-back; a
+  read-back that is not off aborts the run (`EXIT_PULSER`).
 - After the snapshot (step 2) the run stops if the device's `TRAN:PULS` is above
   `--max-pulse-v` or cannot be read.
-- Everything runs inside `try: ... finally: plug.tearDown()`. Phases B and AB restore the
-  snapshot there; phase A changes no settings and restores nothing (the pulser is only
-  switched off). Then the state headers are queried again and diffed against the snapshot
-  (protocol step 14).
+- Everything runs inside `try: ... finally: plug.tearDown()`. Phases B, AB, C and RST restore
+  the snapshot there (`TRAN:PULS` is never part of it); phase A changes no settings and
+  restores nothing (the pulser is only switched off). Then the state headers are queried
+  again and diffed against the snapshot (protocol step 14).
 
 Usage:
     A1580_HOST=... tools/hw_probe.py --dry-run          # command list, no connection
     A1580_HOST=... tools/hw_probe.py --phase A
+    A1580_HOST=... tools/hw_probe.py --phase C --pulse-v 20
+    A1580_HOST=... tools/hw_probe.py --phase RST --allow-rst
     tools/hw_probe.py --fake --phase AB --out /tmp/probe # against FakeA1580Resource
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -33,13 +43,14 @@ import re
 import socket
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
-from a1580_openhtf.fake_resource import FakeA1580Resource
+from a1580_openhtf.fake_resource import DEFAULTS, FakeA1580Resource
 from a1580_openhtf.plug import STATE_HEADERS, A1580Plug, normalize_header, values_match
 from a1580_openhtf.stream import HEADER_SIZE, FrameReader, parse_header
 
@@ -63,6 +74,42 @@ ACQ_TIMEOUT_S = 10.0  # per acquisition (steps 6 and 7) and per read in steps 8 
 OBSERVE_S = 3.0  # how long steps 8 and 9 watch the data socket
 FORBIDDEN_WRITES = frozenset({'TRAN:PULS', '*RST'})
 UNSNAPSHOTTED = frozenset({'TRAN:PULS'})  # never written back by the restore
+
+# phase C and phase RST (SPEC-phaseC.md)
+PULSE_V_MIN = 5.0  # --pulse-v below this is a usage error
+BASELINE_PACKETS = 5  # step 10: pulser off
+STEP10_PACKETS = 10
+STEP10B_PACKETS = 5
+STEP10B_AVER = 4
+STEP11_PACKETS = 5
+STEP11_DELAYS = ('0 NS', '1000 US', '2000 US')  # TRIG:DEL values of step 11, first is the reference
+SHIFT_TOLERANCE_SAMPLES = 2  # "by the delay" means within this many samples
+ONSET_FACTOR = 10.0  # onset threshold: max(ONSET_FACTOR * noise std, ONSET_MIN_COUNTS)
+ONSET_MIN_COUNTS = 20.0
+FLAT_TOP_RUN = 4  # this many equal extreme samples in a row: a flat top
+TAIL_FRACTION = 0.05  # "the end of the record"
+PRE_ONSET_MIN_SAMPLES = 50
+SAMPLE_MAX = 32767
+SAMPLE_MIN = -32768
+PHASES = ('A', 'B', 'AB', 'C', 'RST')
+PULSER_OFF_BEFORE = (6, 10, 13)  # the pulser-off check runs before the first of these steps
+# Phase C settings are words that go into SCPI strings: letters, digits, blanks, `.`, `+`, `-`.
+_SAFE_SETTING = re.compile(r'[A-Za-z0-9 .+\-]+')
+# `DEFAULTS` entries of the fake that its source marks `UNKNOWN default`: a guess, not the vendor's
+GUESSED_DEFAULTS = frozenset(
+    {
+        'MODE',
+        'TRIG:MODE',
+        'GAIN:PRE:COMB',
+        'GAIN:PRE:SPLIT',
+        'GAIN:TGC:LIN',
+        'GAIN:TGC:ARB',
+        'AVER:DEL:CONS:AUTO',
+        'AVER:DEL:CONS',
+        'FILT:HPAS:IND',
+    }
+)
+EXPECTED_LENG_RANGE = (1024, 36864)  # the setter's range; the power-on value 114688 is outside
 
 EXIT_FAILED_STEP = 1
 EXIT_USAGE = 2
@@ -92,16 +139,73 @@ class ForbiddenCommand(RuntimeError):
     """Raised instead of sending a command this tool must never send."""
 
 
-def check_allowed(cmd: str, *, is_write: bool) -> None:
-    """Raise ForbiddenCommand for `TRAN:PULS` writes, `*RST` and anything about `/config`."""
+@dataclass(frozen=True)
+class GuardPolicy:
+    """What the guard opens beyond its defaults: phase C (voltage, pulser), phase RST (`*RST`)."""
+
+    phase: str = 'A'
+    pulse_v: float | None = None
+    max_pulse_v: float = 20.0
+
+
+_ON_WORDS = ('ON', '1')
+_OFF_WORDS = ('OFF', '0')
+
+
+def _write_arg(cmd: str) -> tuple[str, str]:
+    """`(head, argument)` of a command line; any whitespace separates them."""
+    parts = cmd.strip().split(None, 1)
+    if not parts:
+        return '', ''
+    return parts[0], (parts[1].strip() if len(parts) > 1 else '')
+
+
+def _pulse_write_allowed(arg: str, policy: GuardPolicy) -> bool:
+    """A `TRAN:PULS` write is let through only in phase C, as `<number> [V]` equal to --pulse-v."""
+    if policy.phase != 'C' or policy.pulse_v is None:
+        return False
+    match = re.fullmatch(r'([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(?:[vV])?', arg)
+    if match is None:
+        return False
+    volts = float(match.group(1))
+    return volts <= policy.max_pulse_v and abs(volts - policy.pulse_v) <= 1e-9
+
+
+def check_allowed(
+    cmd: str,
+    *,
+    is_write: bool,
+    policy: GuardPolicy | None = None,
+    enab_on_open: bool = False,
+) -> None:
+    """Raise ForbiddenCommand for what this tool must not send, see the module docstring.
+
+    Always refused: `/config`, a second command chained with `;` or a line break, and (writes)
+    `TRAN:ENAB` with anything but OFF/0 unless phase C has the gate open (`enab_on_open`, set
+    by `GuardedResource.pulser_gate` and only inside `pulsed_acquire`), `TRAN:PULS` unless phase
+    C and the value equals --pulse-v (which is <= --max-pulse-v), `*RST` unless phase RST.
+    """
+    policy = policy if policy is not None else GuardPolicy()
     if '/config' in cmd.lower():
         raise ForbiddenCommand(f'refusing to send {cmd!r}: /config is never touched')
-    head = cmd.strip().split(' ', 1)[0]
+    if ';' in cmd or '\n' in cmd or '\r' in cmd:
+        raise ForbiddenCommand(f'refusing to send {cmd!r}: one command per string')
+    head, arg = _write_arg(cmd)
     try:
         normal = normalize_header(head)
     except ValueError:
         return  # unknown (like the deliberate ZZZ:NOPE of step 5): none of the forbidden ones
-    if is_write and normal in FORBIDDEN_WRITES:
+    if not is_write:
+        return
+    if normal == 'TRAN:ENAB' and arg.upper() not in _OFF_WORDS:
+        if not (policy.phase == 'C' and enab_on_open and arg.upper() in _ON_WORDS):
+            raise ForbiddenCommand(
+                f'refusing to send {cmd!r}: only pulsed_acquire in phase C switches the pulser on'
+            )
+    elif normal == 'TRAN:PULS':
+        if not _pulse_write_allowed(arg, policy):
+            raise ForbiddenCommand(f'refusing to send {cmd!r}')
+    elif normal == '*RST' and policy.phase != 'RST':
         raise ForbiddenCommand(f'refusing to send {cmd!r}')
 
 
@@ -109,12 +213,22 @@ class GuardedResource:
     """Wrap the SCPI resource: log every string, refuse the forbidden ones, defer `close`.
 
     `close()` does nothing so that the plug's `tearDown` leaves the session usable for the
-    final read-back; `shutdown()` really closes it.
+    final read-back; `shutdown()` really closes it. `pulser_gate()` is the only way to let a
+    `TRAN:ENAB ON` through (phase C). `set_announce(f)` makes the guard call `f(cmd)` for every
+    `TRAN:PULS` write, `TRAN:ENAB ON` and `*RST` that it lets through, before it is sent.
     """
 
-    def __init__(self, inner: Any, closer: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        inner: Any,
+        closer: Callable[[], None] | None = None,
+        policy: GuardPolicy | None = None,
+    ) -> None:
         object.__setattr__(self, '_inner', inner)
         object.__setattr__(self, '_closer', closer)
+        object.__setattr__(self, '_policy', policy if policy is not None else GuardPolicy())
+        object.__setattr__(self, '_gate', {'enab_on': False})
+        object.__setattr__(self, '_announce', None)
         object.__setattr__(self, 'sent', [])
         object.__setattr__(self, 'replies', {})  # last reply per query string, exactly as received
 
@@ -124,13 +238,36 @@ class GuardedResource:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
+    def set_announce(self, announce: Callable[[str], None] | None) -> None:
+        object.__setattr__(self, '_announce', announce)
+
+    @contextlib.contextmanager
+    def pulser_gate(self) -> Iterator[None]:
+        """Let `TRAN:ENAB ON` through (phase C only) while the `with` block runs."""
+        self._gate['enab_on'] = True
+        try:
+            yield
+        finally:
+            self._gate['enab_on'] = False
+
     def write(self, cmd: str) -> None:
-        check_allowed(cmd, is_write=True)
+        check_allowed(cmd, is_write=True, policy=self._policy, enab_on_open=self._gate['enab_on'])
+        head, arg = _write_arg(cmd)
+        try:
+            normal = normalize_header(head)
+        except ValueError:
+            normal = ''
+        if self._announce is not None and (
+            normal in ('TRAN:PULS', '*RST') or (normal == 'TRAN:ENAB' and arg.upper() in _ON_WORDS)
+        ):
+            self._announce(cmd)
         self.sent.append(cmd)
         self._inner.write(cmd)
 
     def query(self, cmd: str) -> Any:
-        check_allowed(cmd, is_write=False)
+        # a "query" without the question mark is really a write and is checked as one (the
+        # pulser gate never opens for it)
+        check_allowed(cmd, is_write=not cmd.strip().endswith('?'), policy=self._policy)
         self.sent.append(cmd)
         reply = self._inner.query(cmd)
         self.replies[cmd] = reply
@@ -284,12 +421,32 @@ class Probe:
         self.acq: dict[str, dict[str, Any]] = {}
         self.sockets = data_factory.sockets
         self.serial = _clean(plug.identity.serial)
+        # phase C and RST
+        self.warnings: list[str] = []
+        self.pulses: list[dict[str, Any]] = []
+        self.baseline: np.ndarray | None = None  # step 10, pulser off, int16 (packets, samples)
+        self.pulsed10: np.ndarray | None = None
+        self.step10: dict[str, Any] | None = None
+        self.pulse_written = False  # phase C changed TRAN:PULS (it is never written back)
+        self.expected_diffs: dict[str, str] = {}  # header -> why a final-diff change is expected
+        resource.set_announce(self._announce)
 
     # report ---------------------------------------------------------------
 
     def say(self, line: str = '') -> None:
         print(line, flush=True)
         self.current.lines.append(line)
+
+    def warn(self, text: str) -> None:
+        """A measurement warning: printed now, repeated in WARNINGS, stored in the JSON."""
+        self.say(f'WARNING: {text}')
+        self.warnings.append(text)
+        self.current.data.setdefault('warnings', []).append(text)
+
+    def _announce(self, cmd: str) -> None:
+        """Called by the guard before it sends a `TRAN:PULS` write, `TRAN:ENAB ON` or `*RST`."""
+        kind = 'RESET' if cmd.strip().upper().startswith('*RST') else 'PULSER'
+        self.say(f'{kind}: about to send {cmd}')
 
     def run_block(self, label: str, title: str, func: Callable[[Probe], None]) -> None:
         """Run one step: a failing step prints `<label> FAILED: ...` and the run continues.
@@ -877,11 +1034,607 @@ def step_9(p: Probe) -> None:
     )
 
 
+# ── Phase C: pulser on (experiments 10, 10b, 11) ─────────────────────────────
+
+TRIG_DEL_ZERO = '0 NS'
+
+
+def phase_c_settings(args: argparse.Namespace) -> dict[str, object]:
+    """Section 3.1 of SPEC-phaseC.md: what the preparation writes (in this order)."""
+    return {
+        'DATA:LENG': int(args.length),
+        'FREQ': args.sample_freq,
+        'TRIG:MODE': 'INT',
+        'TRIG:INT': args.interval,
+        'TRAN:TYPE': 'DUAL',
+        'TRAN:FREQ': args.tran_freq,
+        'TRAN:DUR': 1,
+        'TRAN:IMP': 'HIGH',
+        'GAIN': format(float(args.gain), 'g'),
+        'GAIN:TGC:MODE': 'OFF',
+        'AVER:COUN': 0,
+        'FILT:HPAS:IND': 0,
+        'TRIG:DEL': TRIG_DEL_ZERO,
+    }
+
+
+def _apply_report(p: Probe, settings: dict[str, object]) -> dict[str, str | None]:
+    """`apply_setup` with a drain of the error queue before and a report of every read-back."""
+    stale = p.plug.check_errors()  # so that no old entry is blamed on the first setting
+    if stale:
+        p.say(f'error queue drained before the setup: {stale}')
+    p.say(f'apply_setup {settings}')
+    p.plug.apply_setup(settings)
+    readbacks = {key: p.resource.replies.get(f'{key}?') for key in settings}
+    for key, value in settings.items():
+        p.say(f'{key} {value} -> {key}? -> {bt(readbacks[key])}')
+    return readbacks
+
+
+@contextlib.contextmanager
+def _put_back(p: Probe, settings: dict[str, object]) -> Iterator[None]:
+    """Write `settings` again when the block ends, also after a failure (not after an abort)."""
+    try:
+        yield
+    except AbortRun:
+        raise  # the run stops and tearDown restores everything
+    except Exception:
+        try:
+            _apply_report(p, settings)
+        except Exception as exc:  # noqa: BLE001 - the original failure is the one to report
+            p.say(f'putting back {settings} failed as well: {exc}')
+        raise
+    _apply_report(p, settings)
+
+
+def _close_enough(a: float, b: float) -> bool:
+    return abs(a - b) <= 1e-6
+
+
+def _set_voltage(p: Probe) -> None:
+    """Section 3.1: write `TRAN:PULS` only if it differs; abort unless it reads back equal."""
+    wanted = float(p.args.pulse_v)
+    try:
+        reply = p.plug.query('TRAN:PULS?')
+        volts = _parse_volts(reply)
+        p.say(f'TRAN:PULS? -> {bt(reply)}; wanted --pulse-v {wanted:g} V')
+        if volts is not None and _close_enough(volts, wanted):
+            p.say('the pulser voltage is already right, TRAN:PULS is not written')
+            return
+        p.plug.write_checked(f'TRAN:PULS {format(wanted, "g")} V')  # announced by the guard
+        p.pulse_written = True
+        readback = p.plug.query('TRAN:PULS?')
+        p.say(f'TRAN:PULS? -> {bt(readback)}')
+        got = _parse_volts(readback)
+    except Exception as exc:  # noqa: BLE001 - the voltage is not known to be right: stop
+        raise AbortRun(
+            EXIT_CEILING, f'could not set the pulser voltage to {wanted:g} V: {exc}'
+        ) from exc
+    if got is None or not _close_enough(got, wanted):
+        raise AbortRun(EXIT_CEILING, f'TRAN:PULS? answered {readback!r} after writing {wanted:g} V')
+    p.say('pulser voltage confirmed by read-back')
+
+
+def prepare_phase_c(p: Probe) -> None:
+    """Section 3.1. Any failure aborts the run: nothing is pulsed with unverified settings."""
+    try:
+        p.current.data['readbacks'] = _apply_report(p, phase_c_settings(p.args))
+        _set_voltage(p)
+    except AbortRun:
+        raise
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        raise AbortRun(
+            EXIT_FAILED_STEP, f'the preparation failed, nothing was pulsed: {exc}'
+        ) from exc
+
+
+class PulsedPacket(NamedTuple):
+    raw: np.ndarray  # int16 samples
+    header: Any  # stream header
+
+
+def _stack(packets: Sequence[PulsedPacket]) -> np.ndarray:
+    return np.vstack([x.raw for x in packets]).astype(np.int16)
+
+
+def _make_pulser_safe(p: Probe, sock: RecordingSocket | None, t_on: float | None) -> None:
+    """The `finally` of `pulsed_acquire`: OFF (unchecked), STOP, close, verify OFF by read-back.
+
+    Every part is tried even if an earlier one failed. A read-back that is not OFF gets one
+    more `TRAN:ENAB OFF` and a second read-back; if that is not OFF either, or cannot be read,
+    PulserCheckError (the run aborts).
+    """
+    problems: list[str] = []
+    try:
+        p.plug.write('TRAN:ENAB OFF')
+    except Exception as exc:  # noqa: BLE001 - go on: STOP, close, and the read-back decides
+        problems.append(f'TRAN:ENAB OFF raised {type(exc).__name__}: {exc}')
+    on_s = None if t_on is None else time.monotonic() - t_on
+    try:
+        _stop_and_close(p, sock)
+    except Exception as exc:  # noqa: BLE001 - the pulser read-back below still has to happen
+        problems.append(f'STOP raised {type(exc).__name__}: {exc}')
+
+    def read_back() -> tuple[str | None, bool]:
+        try:
+            reply = p.plug.query('TRAN:ENAB?')
+        except Exception as exc:  # noqa: BLE001 - an unreadable pulser state is not "off"
+            problems.append(f'TRAN:ENAB? raised {type(exc).__name__}: {exc}')
+            return None, False
+        return reply, values_match('TRAN:ENAB', 'OFF', reply)
+
+    reply, off = read_back()
+    retried = False
+    if not off:
+        retried = True
+        p.say(f'TRAN:ENAB? -> {bt(reply)}: NOT OFF, sending TRAN:ENAB OFF once more (retry)')
+        try:
+            p.plug.write('TRAN:ENAB OFF')
+        except Exception as exc:  # noqa: BLE001 - the second read-back decides
+            problems.append(f'retry TRAN:ENAB OFF raised {type(exc).__name__}: {exc}')
+        reply, off = read_back()
+    errors: list[str] = []
+    try:
+        errors = p.plug.check_errors()
+    except Exception as exc:  # noqa: BLE001 - not worth hiding the pulser result
+        problems.append(f'draining the error queue raised {type(exc).__name__}: {exc}')
+    p.pulses.append(
+        {
+            'on_s': on_s,
+            'verified_off': off,
+            'retried_off': retried,
+            'tran_enab_reply': reply,
+            'device_errors': errors,
+            'problems': problems,
+        }
+    )
+    p.say(
+        f'pulser was ON for {"-" if on_s is None else f"{on_s:.3f} s"}; '
+        f'TRAN:ENAB? -> {bt(reply)}{" (after a retry)" if retried and off else ""}'
+    )
+    if errors:
+        p.say(f'error queue after the pulsed acquisition: {errors}')
+    for problem in problems:
+        p.say(f'pulser cleanup: {problem}')
+    if not off:
+        raise PulserCheckError(f'pulser not confirmed OFF after pulsed_acquire: {reply!r}')
+
+
+def pulsed_acquire(p: Probe, n: int) -> list[PulsedPacket]:
+    """The only place where the pulser is switched on (SPEC-phaseC.md 3.2).
+
+    Open the data stream (`STAR AUTO`), announce and send `TRAN:ENAB ON` through the guard's
+    gate with `write_checked`, read `TRAN:ENAB?`, read `n` packets. In a `finally`, whatever
+    happened: `TRAN:ENAB OFF`, `STOP`, close the socket, verify OFF (`_make_pulser_safe`).
+    """
+    sock: RecordingSocket | None = None
+    t_on: float | None = None
+    try:
+        length = int(p.plug.query('DATA:LENG?'))
+        port = int(p.plug.query('DATA:PORT?'))
+        sock = p.data_socket(port)
+        reader = FrameReader(sock, length)
+        p.plug.write('STAR AUTO')
+        t_on = time.monotonic()  # taken before the write: a failed ON write may still have worked
+        with p.resource.pulser_gate():
+            p.plug.write_checked('TRAN:ENAB ON')  # announced by the guard
+        reply = p.plug.query('TRAN:ENAB?')
+        p.say(f'TRAN:ENAB? -> {bt(reply)}')
+        if not values_match('TRAN:ENAB', 'ON', reply):
+            raise RuntimeError(f'TRAN:ENAB? answered {reply!r} after TRAN:ENAB ON')
+        raw = reader.read(n, ACQ_TIMEOUT_S)
+    finally:
+        _make_pulser_safe(p, sock, t_on)
+    # parsed only now: the pulser is already off
+    return [
+        PulsedPacket(
+            np.frombuffer(x, dtype='<i2', offset=HEADER_SIZE).astype(np.int16), parse_header(x)
+        )
+        for x in raw
+    ]
+
+
+# ── analysis of pulsed records (pure functions, int16 arrays in) ─────────────
+
+
+def baseline_stats(baseline: np.ndarray) -> tuple[float, float, float]:
+    """`(mean, std, threshold)`: medians over the baseline packets and `max(10 s, 20)`."""
+    base = np.asarray(baseline)
+    mean = float(np.median(base.mean(axis=1, dtype=np.float64)))
+    std = float(np.median(base.std(axis=1, dtype=np.float64)))
+    return mean, std, max(ONSET_FACTOR * std, ONSET_MIN_COUNTS)
+
+
+def _long_runs(mask: np.ndarray, minimum: int) -> np.ndarray:
+    """Boolean array: the True samples of `mask` that lie in a run of at least `minimum`."""
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    out = np.zeros(mask.size, dtype=bool)
+    for start, stop in zip(edges[0::2], edges[1::2], strict=True):
+        if stop - start >= minimum:
+            out[start:stop] = True
+    return out
+
+
+def _spread(values: Sequence[float | int | None]) -> float | int | None:
+    found = [v for v in values if v is not None]
+    return (max(found) - min(found)) if found else None
+
+
+def analyse_pulsed(baseline: np.ndarray, pulsed: np.ndarray, fs_hz: float) -> dict[str, Any]:
+    """Step 10 analysis (SPEC-phaseC.md 3.3.3 and 3.3.4) of int16 records, one row per packet."""
+    base = np.asarray(baseline)
+    pul = np.asarray(pulsed)
+    mean, std, threshold = baseline_stats(base)
+    base_peak = float(np.abs(base.astype(np.float64) - mean).max())
+    n = pul.shape[1]
+    tail = max(1, int(n * TAIL_FRACTION))
+    packets: list[dict[str, Any]] = []
+    saturated = flat_total = sat_packets = tail_packets = 0
+    for row in pul:
+        dev = np.abs(row.astype(np.float64) - mean)
+        peak_index = int(dev.argmax())
+        peak = float(dev[peak_index])
+        above = np.flatnonzero(dev > threshold)
+        onset = int(above[0]) if above.size else None
+        at_limit = (row >= SAMPLE_MAX) | (row <= SAMPLE_MIN)
+        flat = np.zeros(n, dtype=bool)
+        if peak > threshold:  # the largest value (furthest from the baseline) repeated in a row
+            flat = _long_runs(row == row[peak_index], FLAT_TOP_RUN)
+        bad = int(np.count_nonzero(at_limit | flat))
+        saturated += bad
+        flat_total += int(np.count_nonzero(flat))
+        sat_packets += bool(bad)
+        tail_packets += bool((dev[-tail:] > threshold).any())
+        packets.append(
+            {
+                'min': int(row.min()),
+                'max': int(row.max()),
+                'peak': peak,
+                'peak_index': peak_index,
+                'onset_index': onset,
+                'onset_us': None if onset is None else onset * 1e6 / fs_hz,
+                'peak_us': peak_index * 1e6 / fs_hz,
+            }
+        )
+    count = len(packets)
+    warnings: list[str] = []
+    if saturated:
+        warnings.append(
+            f'saturation: {saturated} samples at the int16 limit or in a flat top '
+            f'({flat_total} of them in a flat top of {FLAT_TOP_RUN} or more equal samples) '
+            f'in {sat_packets} of {count} pulsed packets'
+        )
+    if all(x['peak'] <= threshold for x in packets):
+        warnings.append(
+            f'no signal: peak <= {threshold:.1f} counts in every pulsed packet '
+            f'(largest peak {max(x["peak"] for x in packets):.1f})'
+        )
+    if base_peak > threshold:
+        warnings.append(
+            f'signal already present in the baseline (pulser off): baseline peak '
+            f'{base_peak:.1f} counts above the threshold {threshold:.1f}'
+        )
+    if tail_packets:
+        warnings.append(
+            f'signal still large at the end of the record: samples above {threshold:.1f} counts '
+            f'in the last {tail} samples of {tail_packets} of {count} pulsed packets; the window '
+            'is too short or the ringing runs into the next shot'
+        )
+    peaks = [x['peak'] for x in packets]
+    return {
+        'fs_hz': fs_hz,
+        'baseline_mean': mean,
+        'baseline_std': std,
+        'threshold': threshold,
+        'baseline_peak': base_peak,
+        'packets': packets,
+        'peak_median': float(np.median(peaks)),
+        'onset_spread_samples': _spread([x['onset_index'] for x in packets]),
+        'peak_index_spread_samples': _spread([x['peak_index'] for x in packets]),
+        'peak_spread': _spread(peaks),
+        'warnings': warnings,
+    }
+
+
+def cross_lag(ref: np.ndarray, other: np.ndarray) -> int:
+    """Integer lag with the largest cross-correlation: positive when `other` comes later."""
+    a = np.asarray(ref, dtype=np.float64)
+    b = np.asarray(other, dtype=np.float64)
+    a = a - a.mean()
+    b = b - b.mean()
+    n = a.size
+    size = 1 << (2 * n - 1).bit_length()
+    corr = np.fft.irfft(np.fft.rfft(b, size) * np.conj(np.fft.rfft(a, size)), size)
+    lags = np.concatenate((corr[size - (n - 1) :], corr[:n]))  # lag -(n-1) .. n-1
+    return int(np.argmax(lags)) - (n - 1)
+
+
+def shift_verdict(lag: int, expected_samples: float, in_window: bool) -> str:
+    """What `TRIG:DEL` did to the record: `lag` samples (positive: later) against the delay."""
+    if not in_window:
+        return 'the signal left the window'
+    tol = SHIFT_TOLERANCE_SAMPLES
+    if abs(lag - expected_samples) <= tol:
+        return f'the record moves later by the delay (within {tol} samples)'
+    if abs(lag + expected_samples) <= tol:
+        return f'the record moves earlier by the delay (within {tol} samples)'
+    if abs(lag) <= tol:
+        return 'the record does not move (TRIG:DEL has no effect on the position)'
+    direction = 'later' if lag > 0 else 'earlier'
+    ratio = f', {abs(lag) / expected_samples:.3g} x the delay' if expected_samples else ''
+    return f'something else: the record moves {direction} by {abs(lag)} samples{ratio}'
+
+
+def _save_npz(p: Probe, name: str, arrays: dict[str, np.ndarray], settings: dict[str, Any]) -> str:
+    """`<out>/phaseC-<serial>-<stamp>-<name>.npz`: int16 arrays plus the settings as JSON text."""
+    path = p.out_dir / f'phaseC-{p.serial}-{p.stamp}-{name}.npz'
+    p.out_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        **{key: np.asarray(value, dtype=np.int16) for key, value in arrays.items()},
+        settings=np.array(json.dumps(settings, default=str)),
+    )
+    return str(path)
+
+
+def _run_settings(p: Probe, **extra: Any) -> dict[str, Any]:
+    settings: dict[str, Any] = {str(k): v for k, v in phase_c_settings(p.args).items()}
+    settings.update(pulse_v=p.args.pulse_v, fs_hz=_sample_rate(p), **extra)
+    return settings
+
+
+def _sample_rate(p: Probe) -> float:
+    reply = p.resource.replies.get('FREQ?')
+    if reply is None:
+        raise RuntimeError('FREQ? was never read back: no time base')
+    return float(reply)
+
+
+def _report_analysis(p: Probe, result: dict[str, Any]) -> None:
+    p.say(
+        f'baseline (pulser off): mean {result["baseline_mean"]:.2f}, '
+        f'std {result["baseline_std"]:.2f} counts, peak {result["baseline_peak"]:.1f}; '
+        f'onset threshold {result["threshold"]:.1f} counts'
+    )
+    for i, x in enumerate(result['packets']):
+        onset = (
+            'none' if x['onset_index'] is None else f'{x["onset_index"]} ({x["onset_us"]:.1f} us)'
+        )
+        p.say(
+            f'pulsed packet {i}: min {x["min"]} max {x["max"]} peak {x["peak"]:.1f} at '
+            f'{x["peak_index"]} ({x["peak_us"]:.1f} us), onset {onset}'
+        )
+    p.say(
+        f'packet-to-packet spread: onset {result["onset_spread_samples"]} samples, peak position '
+        f'{result["peak_index_spread_samples"]} samples, '
+        f'peak amplitude {result["peak_spread"]:.1f} counts'
+    )
+
+
+def step_10(p: Probe) -> None:
+    """Experiment 10: where is the signal (pulser on, `--pulse-v`, the bench of the SPEC)."""
+    fs = _sample_rate(p)
+    scans = p.plug.acquire(BASELINE_PACKETS, timeout_s=ACQ_TIMEOUT_S)  # pulser off
+    baseline = np.vstack([x.raw for x in scans]).astype(np.int16)
+    p.baseline = baseline
+    for i, row in enumerate(baseline):
+        p.say(f'baseline packet {i}: mean {row.mean():.2f} std {row.std():.2f}')
+    pulsed = _stack(pulsed_acquire(p, STEP10_PACKETS))
+    p.pulsed10 = pulsed
+    result = analyse_pulsed(baseline, pulsed, fs)
+    p.step10 = result
+    _report_analysis(p, result)
+    for text in result['warnings']:
+        p.warn(text)
+    path = _save_npz(p, 'step10', {'baseline': baseline, 'pulsed': pulsed}, _run_settings(p))
+    p.say(f'raw samples saved to {path}')
+    p.current.data.update(analysis=result, npz=path)
+
+
+def step_10b(p: Probe) -> None:
+    """Experiment 10b: averaging with a real signal (`AVER:COUN 4`), compared with step 10."""
+    with _put_back(p, {'AVER:COUN': 0}):
+        _apply_report(p, {'AVER:COUN': STEP10B_AVER})
+        packets = pulsed_acquire(p, STEP10B_PACKETS)
+    pulsed = _stack(packets)
+    counts = sorted({x.header.ascan_count for x in packets})
+    p.say(f'ascan_count values: {counts}')
+    data: dict[str, Any] = {
+        'ascan_counts': counts,
+        'peak_ratio': None,
+        'noise_ratio': None,
+        'noise_note': None,
+    }
+    prev = p.step10
+    if prev is None or p.pulsed10 is None:
+        p.say('no step 10 result: no comparison')
+    else:
+        mean = prev['baseline_mean']
+        peak = float(np.median(np.abs(pulsed.astype(np.float64) - mean).max(axis=1)))
+        data['peak'] = peak
+        data['peak_ratio'] = peak / prev['peak_median']
+        p.say(
+            f'peak amplitude {peak:.1f} against {prev["peak_median"]:.1f} in step 10: ratio '
+            f'{data["peak_ratio"]:.3f} (1.0 means a mean, 16 a sum)'
+        )
+        onsets = [x['onset_index'] for x in prev['packets'] if x['onset_index'] is not None]
+        onset = min(onsets) if onsets else None
+        if onset is None or onset < PRE_ONSET_MIN_SAMPLES:
+            data['noise_note'] = 'no pre-onset samples'
+            p.say('noise std before the onset: no pre-onset samples')
+        else:
+            now = float(np.median(pulsed[:, :onset].std(axis=1)))
+            before = float(np.median(p.pulsed10[:, :onset].std(axis=1)))
+            data.update(noise_std=now, noise_std_step10=before, pre_onset_samples=onset)
+            data['noise_ratio'] = now / before if before else None
+            p.say(
+                f'noise std in the first {onset} samples: {now:.2f} against {before:.2f} in '
+                f'step 10: ratio {data["noise_ratio"]} (0.25 is a mean of 16)'
+            )
+    path = _save_npz(p, 'step10b', {'pulsed': pulsed}, _run_settings(p, aver_coun=STEP10B_AVER))
+    p.say(f'raw samples saved to {path}')
+    data['npz'] = path
+    p.current.data.update(data)
+
+
+_DELAY_UNITS_NS = {'NS': 1.0, 'US': 1e3, 'MS': 1e6, 'S': 1e9}
+
+
+def _delay_ns(readback: str | None, text: str) -> float:
+    """The delay in ns: the read-back (the device answers in ns) or else the written text."""
+    try:
+        return float(str(readback))
+    except ValueError:
+        pass
+    number, _, unit = text.partition(' ')
+    return float(number) * _DELAY_UNITS_NS[unit.strip().upper() or 'NS']
+
+
+def step_11(p: Probe) -> None:
+    """Experiment 11: what `TRIG:DEL` shifts. Needs the baseline of step 10 for the threshold."""
+    if p.baseline is None:
+        raise RuntimeError('no baseline from step 10: nothing is pulsed')
+    fs = _sample_rate(p)
+    mean, _std, threshold = baseline_stats(p.baseline)
+    entries: list[dict[str, Any]] = []
+    waves: list[np.ndarray] = []
+    arrays: dict[str, np.ndarray] = {}
+    with _put_back(p, {'TRIG:DEL': TRIG_DEL_ZERO}):
+        for i, delay in enumerate(STEP11_DELAYS):
+            readbacks = _apply_report(p, {'TRIG:DEL': delay})
+            pulsed = _stack(pulsed_acquire(p, STEP11_PACKETS))
+            dev = np.abs(pulsed.astype(np.float64) - mean)
+            onsets = [
+                int(np.flatnonzero(row > threshold)[0]) if (row > threshold).any() else None
+                for row in dev
+            ]
+            peaks = [int(row.argmax()) for row in dev]
+            in_window = bool((dev.max(axis=1) > threshold).any())
+            found = [x for x in onsets if x is not None]
+            entries.append(
+                {
+                    'delay': delay,
+                    'delay_readback': readbacks['TRIG:DEL'],
+                    'delay_ns': _delay_ns(readbacks['TRIG:DEL'], delay),
+                    'onset_indices': onsets,
+                    'onset_index': int(np.median(found)) if found else None,
+                    'peak_indices': peaks,
+                    'peak_index': int(np.median(peaks)),
+                    'in_window': in_window,
+                }
+            )
+            waves.append(pulsed.mean(axis=0))
+            arrays[f'pulsed_{i}'] = pulsed
+            x = entries[-1]
+            p.say(
+                f'TRIG:DEL {delay}: onset index {x["onset_indices"]}, '
+                f'peak index {x["peak_indices"]}'
+                f'{"" if in_window else " (no sample above the threshold)"}'
+            )
+    ref = entries[0]
+    for entry, wave in zip(entries, waves, strict=True):
+        if entry is ref:
+            entry.update(shift_samples=0, shift_us=0.0, verdict='reference')
+            continue
+        expected = (entry['delay_ns'] - ref['delay_ns']) * 1e-9 * fs
+        both = bool(entry['in_window'] and ref['in_window'])
+        lag = cross_lag(waves[0], wave) if both else 0
+        entry.update(
+            expected_shift_samples=expected,
+            shift_samples=lag if both else None,
+            shift_us=lag / fs * 1e6 if both else None,
+            verdict=shift_verdict(lag, expected, both),
+        )
+        shift = f'{lag} samples = {lag / fs * 1e6:.1f} us' if both else 'no shift measured'
+        p.say(
+            f'TRIG:DEL {entry["delay"]} against {ref["delay"]}: expected {expected:.1f} samples; '
+            f'cross-correlation {shift}: {entry["verdict"]}'
+        )
+    path = _save_npz(p, 'step11', arrays, _run_settings(p, delays=list(STEP11_DELAYS)))
+    p.say(f'raw samples saved to {path}')
+    p.current.data.update(delays=entries, threshold=threshold, baseline_mean=mean, npz=path)
+
+
+# ── Phase RST: experiment 13 ─────────────────────────────────────────────────
+
+
+def _same_value(a: str, b: str) -> bool:
+    a, b = a.strip().replace(' ', ''), b.strip().replace(' ', '')
+    if a.upper() == b.upper():
+        return True
+    try:
+        return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)), abs(float(b)))
+    except ValueError:
+        return False
+
+
+def step_13(p: Probe) -> None:
+    """Experiment 13: `*RST`, pulser off at once, every header against snapshot and default."""
+    try:
+        p.plug.write('*RST')  # announced by the guard, sent once
+        enab = p.plug.query('TRAN:ENAB?')  # at once: the pulser may come on with *RST
+        p.say(f'TRAN:ENAB? right after *RST -> {bt(enab)}')
+        if not _pulser_off(enab):
+            p.say('the pulser was ON right after *RST (a result, not an error); switching it off')
+        p.plug.write('TRAN:ENAB OFF')
+        errors = p.plug.check_errors()
+        confirm = p.plug.query('TRAN:ENAB?')
+    except Exception as exc:  # noqa: BLE001 - the pulser state after *RST is then unknown
+        raise PulserCheckError(f'could not switch the pulser off after *RST: {exc}') from exc
+    p.say(f'error queue after *RST: {errors if errors else "empty"}')
+    p.say(f'TRAN:ENAB? after TRAN:ENAB OFF -> {bt(confirm)}')
+    p.current.data.update(enab_after_rst=enab, errors_after_rst=errors, enab_confirmed=confirm)
+    if not values_match('TRAN:ENAB', 'OFF', confirm):
+        raise PulserCheckError(
+            f'TRAN:ENAB? answered {confirm!r} after TRAN:ENAB OFF following *RST'
+        )
+    p.say('pulser confirmed OFF by read-back')
+    rows: list[dict[str, Any]] = []
+    for header in (*STATE_HEADERS, 'DATA:PORT', 'SYST:ERR:COUN'):
+        reply, error, _dt = p.try_query(f'{header}?')
+        after = reply if error is None and reply is not None else f'<ERROR {error}>'
+        snapshot = p.state.get(header, '-')
+        default = DEFAULTS.get(header, '-') if header != 'SYST:ERR:COUN' else '-'
+        is_snapshot = snapshot != '-' and _same_value(after, snapshot)
+        is_default = default != '-' and _same_value(after, default)
+        mark = (
+            '= snapshot, = vendor default'
+            if is_snapshot and is_default
+            else '= snapshot'
+            if is_snapshot
+            else '= vendor default'
+            if is_default
+            else 'neither'
+        )
+        rows.append(
+            {
+                'header': header,
+                'after_rst': after,
+                'snapshot': snapshot,
+                'default': default,
+                'default_guessed': header in GUESSED_DEFAULTS,
+                'mark': mark,
+            }
+        )
+    p.say(
+        f'{"header":22s} {"after *RST":26s} {"snapshot (step 2)":26s} {"vendor DEFault":26s} mark'
+    )
+    for row in rows:
+        star = '*' if row['default_guessed'] else ''
+        p.say(
+            f'{row["header"]:22s} {row["after_rst"]:26s} {row["snapshot"]:26s} '
+            f'{row["default"] + star:26s} {row["mark"]}'
+        )
+    p.say('* = the fake uses a guess for this default (not documented by the vendor)')
+    p.current.data['table'] = rows
+
+
 # ── the plan (also what --dry-run prints) ────────────────────────────────────
 
 StepFn = Callable[[Probe], None]
 
-STEPS: dict[int, tuple[str, StepFn]] = {
+STEPS: dict[int | str, tuple[str, StepFn]] = {
     1: ('*IDN?, SYST:VERS?, SYST:ERR:COUN?', step_1),
     2: ('query every STATE_HEADERS entry, save the snapshot', step_2),
     3: ('DATA:PORT? stability', step_3),
@@ -891,14 +1644,28 @@ STEPS: dict[int, tuple[str, StepFn]] = {
     7: ('acquisition with AVER:COUN 4', step_7),
     8: ('STOP with the socket open; connect after STAR AUTO', step_8),
     9: ('GAIN change during acquisition', step_9),
+    10: ('pulser on: where is the signal', step_10),
+    '10b': ('pulser on: averaging with a real signal', step_10b),
+    11: ('pulser on: what TRIG:DEL shifts', step_11),
+    13: ('*RST: every header against snapshot and vendor default', step_13),
 }
 
 
-def steps_for(phase: str) -> list[int]:
-    """Step numbers of a phase. Phase B includes 1 and 2: the snapshot comes first."""
-    a = [1, 2, 3, 4, 5]  # step 4 is listed here but `run` and `plan` put it last
-    b = [1, 2, 6, 7, 8, 9]
-    return {'A': a, 'B': b, 'AB': a + [6, 7, 8, 9]}[phase]
+def steps_for(phase: str) -> list[int | str]:
+    """Step ids of a phase. Every phase but A includes 1 and 2: the snapshot comes first."""
+    a: list[int | str] = [1, 2, 3, 4, 5]  # step 4 is listed here but `run` and `plan` put it last
+    return {
+        'A': a,
+        'B': [1, 2, 6, 7, 8, 9],
+        'AB': a + [6, 7, 8, 9],
+        'C': [1, 2, 10, '10b', 11],
+        'RST': [1, 2, 13],
+    }[phase]
+
+
+def restores(phase: str) -> bool:
+    """Phase A changes no settings and restores nothing; every other phase restores."""
+    return phase != 'A'
 
 
 def _setup_commands(settings: dict[str, object]) -> list[str]:
@@ -911,9 +1678,74 @@ def _setup_commands(settings: dict[str, object]) -> list[str]:
 _ACQUIRE = ['DATA:LENG?', 'FREQ?', 'TRIG:DEL?', 'DATA:PORT?', 'STAR AUTO', 'STOP', ERR_QUERY]
 
 
-def plan(phase: str) -> list[tuple[str, list[str]]]:
+_ONLY_IF_VOLTAGE = '   (only if TRAN:PULS? differs from --pulse-v)'
+
+
+def _pulsed_commands(n: int) -> list[str]:
+    """What `pulsed_acquire(n)` sends, in order."""
+    return [
+        'DATA:LENG?',
+        'DATA:PORT?',
+        'STAR AUTO',
+        'TRAN:ENAB ON   (PULSER ON, announced, only from pulsed_acquire)',
+        ERR_QUERY,
+        'TRAN:ENAB?',
+        f'read {n} packets   (the pulser is on only while they are read)',
+        'TRAN:ENAB OFF   (always, in a finally)',
+        'STOP',
+        'TRAN:ENAB?',
+        ERR_QUERY + '   (drain)',
+    ]
+
+
+def _phase_c_commands(args: argparse.Namespace) -> dict[int | str, list[str]]:
+    volts = '<--pulse-v>' if args.pulse_v is None else format(args.pulse_v, 'g')
+    drain = [ERR_QUERY + '   (drain)']
+    return {
+        'prep': drain
+        + _setup_commands(phase_c_settings(args))
+        + [
+            'TRAN:PULS?',
+            f'TRAN:PULS {volts} V{_ONLY_IF_VOLTAGE}   (announced)',
+            ERR_QUERY + _ONLY_IF_VOLTAGE,
+            'TRAN:PULS?' + _ONLY_IF_VOLTAGE,
+        ],
+        10: [*_ACQUIRE, *_pulsed_commands(STEP10_PACKETS)],
+        '10b': [
+            *drain,
+            *_setup_commands({'AVER:COUN': STEP10B_AVER}),
+            *_pulsed_commands(STEP10B_PACKETS),
+            *drain,
+            *_setup_commands({'AVER:COUN': 0}),
+        ],
+        11: [
+            line
+            for delay in STEP11_DELAYS
+            for line in (
+                *drain,
+                *_setup_commands({'TRIG:DEL': delay}),
+                *_pulsed_commands(STEP11_PACKETS),
+            )
+        ]
+        + [*drain, *_setup_commands({'TRIG:DEL': TRIG_DEL_ZERO})],
+        13: [
+            '*RST   (announced, sent once)',
+            'TRAN:ENAB?',
+            'TRAN:ENAB OFF',
+            ERR_QUERY + '   (drain)',
+            'TRAN:ENAB?',
+            *[f'{h}?' for h in STATE_HEADERS],
+            'DATA:PORT?',
+            'SYST:ERR:COUN?',
+        ],
+    }
+
+
+def plan(phase: str, args: argparse.Namespace | None = None) -> list[tuple[str, list[str]]]:
     """`(heading, commands)` for every step of `phase`, in execution order."""
     chosen = steps_for(phase)
+    if args is None:
+        args = build_parser().parse_args(['--phase', phase])
     blocks: list[tuple[str, list[str]]] = [
         (
             'CONNECT (plug construction, restore_state snapshot deferred to step 2)',
@@ -962,19 +1794,24 @@ def plan(phase: str) -> list[tuple[str, list[str]]]:
             ERR_QUERY,
         ],
     }
+    phase_c = _phase_c_commands(args)
     for number in chosen:
         if number == 4:
             continue
-        if number == 6:
+        if number in PULSER_OFF_BEFORE:
             blocks.append(
                 (
                     'PULSER-OFF CHECK (aborts the run on failure)',
                     ['TRAN:ENAB OFF', ERR_QUERY, 'TRAN:ENAB?'],
                 )
             )
-        blocks.append((f'STEP {number}: {STEPS[number][0]}', commands[number]))
+        if number == 10:
+            blocks.append(('PREPARATION (aborts the run on failure)', phase_c['prep']))
+        blocks.append(
+            (f'STEP {number}: {STEPS[number][0]}', commands.get(number, phase_c.get(number, [])))
+        )
     final_queries = [f'{h}?' for h in STATE_HEADERS]
-    if any(n >= 6 for n in chosen):
+    if restores(phase):
         restore = [
             line
             for h in STATE_HEADERS
@@ -1015,15 +1852,32 @@ def plan(phase: str) -> list[tuple[str, list[str]]]:
     return blocks
 
 
-def print_plan(phase: str) -> None:
+_NEVER_SENT = {
+    'C': (
+        'NEVER SENT: TRAN:PULS writes other than --pulse-v (at most one, only if the device '
+        'differs), TRAN:ENAB ON outside pulsed_acquire, *RST, anything to /config/ '
+        '(refused in code).'
+    ),
+    'RST': (
+        'NEVER SENT: TRAN:PULS writes, TRAN:ENAB ON, anything to /config/ (refused in code); '
+        '*RST is sent once, in step 13.'
+    ),
+}
+
+
+def print_plan(phase: str, args: argparse.Namespace | None = None) -> None:
     print(f'DRY RUN, phase {phase}: nothing is connected. Commands per step:')
-    for heading, commands in plan(phase):
+    for heading, commands in plan(phase, args):
         print()
         print(heading)
         for cmd in commands:
             print(f'    {cmd}')
     print()
-    print('NEVER SENT: TRAN:PULS writes, *RST, anything to /config/ (refused in code).')
+    print(
+        _NEVER_SENT.get(
+            phase, 'NEVER SENT: TRAN:PULS writes, *RST, anything to /config/ (refused in code).'
+        )
+    )
     print('Safety stop: TRAN:PULS as found must be <= --max-pulse-v after the snapshot.')
 
 
@@ -1059,6 +1913,14 @@ def _pulser_off(value: str) -> bool:
     return value.strip().upper() in ('OFF', '0')
 
 
+def _diff_is_expected(p: Probe, header: str, now: str) -> bool:
+    """A phase C voltage change counts only if the device now has the voltage that was written."""
+    if header == 'TRAN:PULS':
+        volts = _parse_volts(now)
+        return p.pulse_written and volts is not None and _close_enough(volts, float(p.args.pulse_v))
+    return True
+
+
 def final_diff(p: Probe) -> dict[str, Any]:
     """Protocol step 14: query `STATE_HEADERS` again (fresh read) and diff against the snapshot.
 
@@ -1087,8 +1949,11 @@ def final_diff(p: Probe) -> dict[str, Any]:
                 continue
         if now != was:
             expected = header == 'TRAN:ENAB' and _pulser_off(now) and not _pulser_off(was)
-            changed[header] = {'was': was, 'now': now, **({'expected': True} if expected else {})}
             note = ' (expected: the tool always leaves the pulser off)' if expected else ''
+            if header in p.expected_diffs and _diff_is_expected(p, header, now):
+                expected = True
+                note = f' (expected: {p.expected_diffs[header]})'
+            changed[header] = {'was': was, 'now': now, **({'expected': True} if expected else {})}
             p.say(f'CHANGED {header}: was {bt(was)} now {bt(now)}{note}')
     if unreadable:
         p.say(
@@ -1108,9 +1973,17 @@ def _open(
     args: argparse.Namespace, fake: FakeA1580Resource | None
 ) -> tuple[GuardedResource, Callable[[str, int], Any], str]:
     """The guarded SCPI resource, the data socket factory and the host for the report."""
+    policy = GuardPolicy(
+        phase=args.phase, pulse_v=getattr(args, 'pulse_v', None), max_pulse_v=args.max_pulse_v
+    )
     if args.fake:
-        sim = fake if fake is not None else FakeA1580Resource()
-        return GuardedResource(sim), sim.data_socket_factory, args.host or 'fake'
+        # phase C needs a signal that depends on the pulser; the other phases keep the old fake
+        sim = (
+            fake
+            if fake is not None
+            else FakeA1580Resource(signal='transmission' if args.phase == 'C' else 'burst')
+        )
+        return GuardedResource(sim, policy=policy), sim.data_socket_factory, args.host or 'fake'
     import pyvisa  # lazy: --dry-run and --fake need no pyvisa
 
     rm = pyvisa.ResourceManager('@py')
@@ -1123,7 +1996,7 @@ def _open(
     def factory(host: str, port: int) -> socket.socket:
         return socket.create_connection((host, port), timeout=5)
 
-    return GuardedResource(inner, closer=rm.close), factory, args.host
+    return GuardedResource(inner, closer=rm.close, policy=policy), factory, args.host
 
 
 def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
@@ -1146,12 +2019,14 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
     try:
         # tearDown restores only after a phase that changes settings (step 6 and above).
         steps = steps_for(args.phase)
-        plug._restore_state = any(n >= 6 for n in steps)
+        plug._restore_state = restores(args.phase)
         for number in steps:
             if number == 4:
                 continue  # runs last, on its own connection, after the main one is closed
-            if number == 6:
+            if number in PULSER_OFF_BEFORE:
                 probe.run_block('PULSER-OFF CHECK', 'TRAN:ENAB OFF and read-back', pulser_off_check)
+            if number == 10:
+                probe.run_block('PREPARATION', 'settings and pulser voltage', prepare_phase_c)
             title, func = STEPS[number]
             probe.run_block(f'STEP {number}', title, func)
             if number == 2:
@@ -1175,8 +2050,23 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
             probe.say('TEARDOWN: no restore: phase A is read-only; pulser OFF, STOP, close')
         failures = _tear_down(plug)
         probe.current.data['restore_failures'] = failures
+        details = []
         for failure in failures:
-            probe.say(f'RESTORE FAILED: {failure}')
+            expected = _expected_restore_failure(probe, failure)
+            details.append({'failure': failure, 'expected': expected})
+            if expected:
+                probe.expected_diffs['DATA:LENG'] = 'known firmware defect, see the restore failure'
+                probe.say(
+                    'RESTORE FAILED (known firmware defect: power-on DATA:LENG is refused by '
+                    f'the setter): {failure}'
+                )
+            else:
+                probe.say(f'RESTORE FAILED: {failure}')
+        probe.current.data['restore_failure_details'] = details
+        if args.phase == 'C' and probe.pulse_written:
+            probe.expected_diffs['TRAN:PULS'] = (
+                'phase C set the pulser voltage; TRAN:PULS is never written back'
+            )
         diff = final_diff(probe)
         if any(not v.get('expected') for v in diff['changed'].values()) or diff['unreadable']:
             code = code or EXIT_FAILED_STEP
@@ -1186,12 +2076,28 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
             print(
                 f'closing the main connection failed: {type(exc).__name__}: {exc}', file=sys.stderr
             )
+        if probe.warnings:
+            probe.current = StepRecord('WARNINGS', 'measurement warnings of this run')
+            probe.records.append(probe.current)
+            probe.say('')
+            probe.say('WARNINGS')
+            for text in probe.warnings:
+                probe.say(f'WARNING: {text}')
         if 4 in steps_for(args.phase):
             probe.run_block('STEP 4', *STEPS[4])
             if probe.records[-1].status == 'failed':
                 code = code or EXIT_FAILED_STEP
         _write_probe_json(probe, code, diff)
     return code
+
+
+def _expected_restore_failure(p: Probe, failure: str) -> bool:
+    """Phases C and RST: the restore of a power-on `DATA:LENG` outside 1024 to 36864 is refused."""
+    if p.args.phase not in ('C', 'RST') or not failure.startswith('DATA:LENG:'):
+        return False
+    snapshot = _parse_volts(p.state.get('DATA:LENG'))  # any leading number
+    low, high = EXPECTED_LENG_RANGE
+    return snapshot is not None and not low <= snapshot <= high
 
 
 def _tear_down(plug: A1580Plug) -> list[str]:
@@ -1227,10 +2133,13 @@ def _write_probe_json(p: Probe, code: int, diff: dict[str, Any] | None) -> None:
         'fake': p.fake,
         'phase': p.args.phase,
         'max_pulse_v': p.args.max_pulse_v,
+        'pulse_v': p.args.pulse_v,
         'idn': p.idn_reply,
         'exit_code': code,
         'steps': {r.label: r.as_json() for r in p.records},
         'final_diff': diff,
+        'warnings': p.warnings,
+        'pulses': p.pulses,
         'commands_sent': list(p.resource.sent),
     }
     p.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1244,7 +2153,7 @@ def build_parser() -> argparse.ArgumentParser:
         description='First-hardware-session probe for the A1580 (see HARDWARE-SESSION.md).'
     )
     parser.add_argument('--host', default=os.environ.get('A1580_HOST'), help='default $A1580_HOST')
-    parser.add_argument('--phase', type=str.upper, choices=['A', 'B', 'AB'], default='A')
+    parser.add_argument('--phase', type=str.upper, choices=list(PHASES), default='A')
     parser.add_argument(
         '--dry-run', action='store_true', help='print the commands, connect to nothing'
     )
@@ -1257,7 +2166,39 @@ def build_parser() -> argparse.ArgumentParser:
         help='refuse to proceed if the device TRAN:PULS is above this (default 20); never written',
     )
     parser.add_argument('--packets', type=int, default=10, help='packets per acquisition (6, 7)')
+    parser.add_argument(
+        '--pulse-v',
+        type=float,
+        default=None,
+        help='phase C (required): pulser voltage, 5 to --max-pulse-v; written only if it differs',
+    )
+    parser.add_argument(
+        '--allow-rst', action='store_true', help='phase RST (required): allow the one *RST'
+    )
+    parser.add_argument('--tran-freq', default='50 KHZ', help='phase C TRAN:FREQ (default 50 KHZ)')
+    parser.add_argument('--sample-freq', default='1 MHZ', help='phase C FREQ (default 1 MHZ)')
+    parser.add_argument('--length', type=int, default=8192, help='phase C DATA:LENG (default 8192)')
+    parser.add_argument('--interval', default='100 MS', help='phase C TRIG:INT (default 100 MS)')
+    parser.add_argument('--gain', type=float, default=0.0, help='phase C GAIN in dB (default 0)')
     return parser
+
+
+def _usage_problem(args: argparse.Namespace) -> str | None:
+    """The phase C and RST usage rules; also checked for `--dry-run`. None if all is well."""
+    if args.phase == 'C':
+        if args.pulse_v is None:
+            return 'phase C needs --pulse-v (5 to --max-pulse-v)'
+        if not PULSE_V_MIN <= args.pulse_v <= args.max_pulse_v:
+            return (
+                f'--pulse-v {args.pulse_v:g} must be between {PULSE_V_MIN:g} and '
+                f'--max-pulse-v {args.max_pulse_v:g}'
+            )
+        for flag in ('tran_freq', 'sample_freq', 'interval'):
+            if not _SAFE_SETTING.fullmatch(getattr(args, flag)):
+                return f'--{flag.replace("_", "-")} may only hold letters, digits, blanks and . + -'
+    if args.phase == 'RST' and not args.allow_rst:
+        return 'phase RST sends *RST: pass --allow-rst'
+    return None
 
 
 def main(argv: Sequence[str] | None = None, *, fake: FakeA1580Resource | None = None) -> int:
@@ -1270,8 +2211,12 @@ def main(argv: Sequence[str] | None = None, *, fake: FakeA1580Resource | None = 
     if args.packets < 1:
         print('--packets must be >= 1', file=sys.stderr)
         return EXIT_USAGE
+    problem = _usage_problem(args)
+    if problem:
+        print(problem, file=sys.stderr)
+        return EXIT_USAGE
     if args.dry_run:
-        print_plan(args.phase)
+        print_plan(args.phase, args)
         return 0
     if not args.fake and not args.host:
         print('no host: pass --host or set A1580_HOST', file=sys.stderr)

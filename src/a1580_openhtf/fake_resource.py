@@ -97,7 +97,15 @@ _ENUM_VALUES: dict[str, tuple[str, ...]] = {
 _ENUM = frozenset(_ENUM_VALUES)
 _LIST = frozenset({'GAIN:TGC:LIN', 'GAIN:TGC:ARB'})
 _READ_ONLY = frozenset({'DATA:PORT'})
-_SIGNALS = ('burst', 'zeros', 'noise', 'none')
+_SIGNALS = ('burst', 'zeros', 'noise', 'none', 'transmission')
+# `signal='transmission'`: not measured, invented so that hw_probe phase C can run; replace after
+# the hardware run. Two transducers face to face: with `TRAN:ENAB` on the record holds the
+# noise of `signal='noise'` plus a damped sine burst at `TRAN:FREQ` that arrives this long after
+# the trigger plus `TRIG:DEL` (the burst moves LATER by the delay: the direction is a guess),
+# amplitude 2000 counts at 0 dB and 20 V, scaled by `GAIN` and `TRAN:PULS`; with the pulser off
+# the record is the noise alone.
+_TRANSMISSION_ARRIVAL_S = 200e-6
+_TRANSMISSION_AMPLITUDE = 2000.0
 _ERROR_QUEUE_DEPTH = 16  # measured 2026-10-05, fw 1.16: 16 entries, then `-350` as the 17th
 _QUEUE_OVERFLOW = '-350,"Queue overflow"'
 # measured for DATA:LENG out of range (2026-10-05, fw 1.16), assumed for out-of-range values
@@ -374,7 +382,13 @@ class FakeA1580Resource:
                 for p in parts:
                     float(p)  # raises ValueError for a non-number
                 return ','.join(parts)
-            return ', '.join(repr(float(p)) for p in parts)
+            numbers = [float(p) for p in parts]
+            stored = self._values[header]
+            # not measured, so that hw_probe's restore of a power-on `0,0` reads back as it was
+            # found: the same numbers as the stored value keep the stored text
+            if stored and [float(x) for x in stored.split(',')] == numbers:
+                return stored
+            return ', '.join(repr(x) for x in numbers)
         if header in _ENUM:
             number = _NUMBER_WITH_UNIT.match(arg)
             if number:
@@ -428,6 +442,23 @@ class FakeA1580Resource:
             rng = np.random.default_rng(number)
             noise = rng.normal(11.0, 3.6 / 2.0 ** (averaging / 2.0), length)
             samples = np.rint(noise).astype(np.int16)
+        elif self.signal == 'transmission':
+            # not measured, invented so that hw_probe phase C can run; replace after the
+            # hardware run (see `_TRANSMISSION_ARRIVAL_S`)
+            rng = np.random.default_rng(number)
+            wave = rng.normal(11.0, 3.6 / 2.0 ** (averaging / 2.0), length)
+            if self._values['TRAN:ENAB'] == '1':
+                fs = float(self._values['FREQ'])
+                freq = float(self._values['TRAN:FREQ'])
+                gain_db = float(self._values['GAIN'])
+                volts = float(self._values['TRAN:PULS'])
+                delay_s = float(self._values['TRIG:DEL']) * 1e-9
+                first = round((_TRANSMISSION_ARRIVAL_S + delay_s) * fs)
+                t = (np.arange(length) - first) / fs
+                envelope = np.where(t >= 0.0, np.exp(-np.maximum(t, 0.0) * freq / 5.0), 0.0)
+                amplitude = _TRANSMISSION_AMPLITUDE * 10.0 ** (gain_db / 20.0) * volts / 20.0
+                wave = wave + amplitude * envelope * np.sin(2.0 * np.pi * freq * t)
+            samples = np.rint(np.clip(wave, -32768, 32767)).astype(np.int16)
         else:
             fs = float(self._values['FREQ'])
             freq = float(self._values['TRAN:FREQ'])

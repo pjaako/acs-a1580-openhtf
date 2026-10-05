@@ -682,3 +682,81 @@ def test_packets_at_the_power_on_length_are_zero_from_sample_81906() -> None:
     fake.write('DATA:LENG 36864')
     (packet,) = _read(fake, 1)
     assert np.frombuffer(packet[HEADER_SIZE:], dtype='<i2')[-1000:].any()  # legal length: all real
+
+
+# ── signal='transmission' (not measured, invented for hw_probe phase C) ──────
+
+
+def _transmission_record(fake: FakeA1580Resource) -> np.ndarray:
+    fake.write('STAR AUTO')
+    sock = fake.data_socket_factory('fake', 2758)
+    length = int(fake.query('DATA:LENG?'))
+    packet = FrameReader(sock, length).read(1, 2.0)[0]
+    fake.write('STOP')
+    return np.frombuffer(packet, dtype='<i2', offset=HEADER_SIZE)
+
+
+def _transmission_fake(**settings: str) -> FakeA1580Resource:
+    fake = FakeA1580Resource(signal='transmission')
+    for header, value in {
+        'DATA:LENG': '8192',
+        'FREQ': '1 MHZ',
+        'TRAN:FREQ': '50 KHZ',
+        'TRIG:DEL': '0 NS',
+        **settings,
+    }.items():
+        fake.write(f'{header} {value}')
+    return fake
+
+
+def test_transmission_pulser_off_has_no_burst() -> None:
+    fake = _transmission_fake()
+    fake.write('TRAN:ENAB OFF')
+    record = _transmission_record(fake)
+    assert np.abs(record.astype(float) - 11.0).max() < 25
+
+
+def test_transmission_pulser_on_has_a_burst_at_the_arrival_time() -> None:
+    fake = _transmission_fake()
+    fake.write('TRAN:ENAB ON')
+    record = _transmission_record(fake)
+    dev = np.abs(record.astype(float) - 11.0)
+    assert dev.max() > 500
+    assert int(np.flatnonzero(dev > 100)[0]) == 201  # arrival 200 us at 1 MHz, sine starts at 0
+
+
+@pytest.mark.parametrize('delay', ['1000 US', '2000 US'])
+def test_transmission_burst_moves_later_with_trig_del(delay: str) -> None:
+    fake = _transmission_fake()
+    fake.write('TRAN:ENAB ON')
+    base = int(np.flatnonzero(np.abs(_transmission_record(fake).astype(float) - 11) > 100)[0])
+    fake.write(f'TRIG:DEL {delay}')
+    shifted = np.abs(_transmission_record(fake).astype(float) - 11)
+    assert int(np.flatnonzero(shifted > 100)[0]) - base == int(delay.split()[0])
+
+
+def test_transmission_amplitude_follows_pulser_voltage_and_gain() -> None:
+    fake = _transmission_fake()
+    fake.write('TRAN:ENAB ON')
+    full = np.abs(_transmission_record(fake).astype(float) - 11).max()
+    fake.write('TRAN:PULS 10 V')
+    half = np.abs(_transmission_record(fake).astype(float) - 11).max()
+    assert 0.4 < half / full < 0.6
+    fake.write('GAIN 6')
+    assert np.abs(_transmission_record(fake).astype(float) - 11).max() > 0.8 * full
+
+
+def test_transmission_averaging_lowers_the_noise_not_the_burst() -> None:
+    fake = _transmission_fake()
+    fake.write('TRAN:ENAB ON')
+    plain = _transmission_record(fake).astype(float)
+    fake.write('AVER:COUN 4')
+    averaged = _transmission_record(fake).astype(float)
+    assert averaged[:150].std() < 0.5 * plain[:150].std()
+    assert abs(np.abs(averaged - 11).max() / np.abs(plain - 11).max() - 1.0) < 0.1
+
+
+def test_default_signal_ignores_the_pulser() -> None:
+    off, on = FakeA1580Resource(), FakeA1580Resource()
+    on.write('TRAN:ENAB ON')
+    assert _transmission_record(off).tolist() == _transmission_record(on).tolist()

@@ -558,3 +558,1256 @@ def test_pulser_on_as_found_is_left_off_and_is_an_expected_change(
     _snapshot, probe_path = _json_files(tmp_path)
     report = json.loads(probe_path.read_text(encoding='utf-8'))
     assert report['final_diff']['changed']['TRAN:ENAB']['expected'] is True
+
+
+# ═══ phase C and phase RST (SPEC-phaseC.md): pulser-on experiments ═══════════
+#
+# The safety tests come first: they prove that the pulser always ends OFF and that the
+# guard refuses what only the one allowed function may send.
+
+import numpy as np  # noqa: E402
+
+PHASES = ['A', 'B', 'AB', 'C', 'RST']
+
+
+def _policy(phase: str, pulse_v: float | None = None) -> Any:
+    return hw_probe.GuardPolicy(phase=phase, pulse_v=pulse_v, max_pulse_v=20.0)
+
+
+def _c_fake(**kwargs: Any) -> FakeA1580Resource:
+    return FakeA1580Resource(signal='transmission', **kwargs)
+
+
+def _c_args(out: Path, *extra: str) -> list[str]:
+    return ['--fake', '--phase', 'C', '--pulse-v', '20', '--out', str(out), *extra]
+
+
+def _enab_writes(log: list[str]) -> list[str]:
+    return [c for c in log if c.startswith('TRAN:ENAB ')]
+
+
+# ── section 1: command line ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize('dry', [[], ['--dry-run']])
+def test_phase_c_without_pulse_v_is_a_usage_error(
+    dry: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(['--fake', '--phase', 'C', *dry]) == hw_probe.EXIT_USAGE
+    assert '--pulse-v' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('volts', ['25', '4.9', '0', '-20', 'nan', 'inf'])
+@pytest.mark.parametrize('dry', [[], ['--dry-run']])
+def test_pulse_v_outside_5_to_max_is_a_usage_error_before_connecting(
+    volts: str, dry: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _no_sockets(monkeypatch)
+    fake = _c_fake()
+    args = ['--fake', '--phase', 'C', '--pulse-v', volts, '--out', str(tmp_path), *dry]
+    assert hw_probe.main(args, fake=fake) == hw_probe.EXIT_USAGE
+    assert fake.log == []  # nothing was sent
+
+
+def test_pulse_v_can_be_raised_with_the_ceiling_and_bounds_are_inclusive(tmp_path: Path) -> None:
+    for volts, ceiling in (('5', '20'), ('20', '20'), ('30', '30')):
+        fake = _c_fake()
+        args = ['--fake', '--phase', 'C', '--pulse-v', volts, '--max-pulse-v', ceiling]
+        code = hw_probe.main([*args, '--dry-run'], fake=fake)
+        assert code == 0, (volts, ceiling)
+
+
+@pytest.mark.parametrize('dry', [[], ['--dry-run']])
+def test_phase_rst_without_allow_rst_is_a_usage_error(
+    dry: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(['--fake', '--phase', 'RST', *dry]) == hw_probe.EXIT_USAGE
+    assert '--allow-rst' in capsys.readouterr().err
+
+
+def test_phase_names_are_case_insensitive_and_defaults_are_the_bench_values() -> None:
+    args = hw_probe.build_parser().parse_args(['--phase', 'rst'])
+    assert args.phase == 'RST'
+    assert args.pulse_v is None
+    assert args.allow_rst is False
+    assert (args.tran_freq, args.sample_freq, args.length) == ('50 KHZ', '1 MHZ', 8192)
+    assert (args.interval, args.gain) == ('100 MS', 0)
+
+
+@pytest.mark.parametrize('flag', ['--tran-freq', '--sample-freq', '--interval'])
+def test_setting_text_that_could_smuggle_a_second_command_is_a_usage_error(flag: str) -> None:
+    for bad in ('50 KHZ;TRAN:ENAB ON', '50 KHZ\nTRAN:ENAB ON', '50 KHZ\r\n*RST'):
+        argv = ['--phase', 'C', '--pulse-v', '20', '--dry-run', f'{flag}={bad}']
+        assert hw_probe.main(argv) == hw_probe.EXIT_USAGE
+
+
+# ── section 2: the guard ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize('phase', PHASES)
+@pytest.mark.parametrize(
+    'cmd', ['TRAN:ENAB ON', 'TRAN:ENAB 1', 'tran:enab on', 'TRANsmitter:ENABle ON']
+)
+def test_guard_refuses_pulser_on_outside_the_gate_in_every_phase(phase: str, cmd: str) -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy(phase, 20.0))
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write(cmd)
+    assert fake.log == []
+
+
+@pytest.mark.parametrize('phase', ['A', 'B', 'AB', 'RST'])
+def test_guard_refuses_pulser_on_even_inside_the_gate_outside_phase_c(phase: str) -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy(phase))
+    with guarded.pulser_gate(), pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('TRAN:ENAB ON')
+    assert fake.log == []
+
+
+def test_guard_gate_opens_pulser_on_in_phase_c_only_while_it_is_open() -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy('C', 20.0))
+    with guarded.pulser_gate():
+        guarded.write('TRAN:ENAB ON')
+        with pytest.raises(hw_probe.ForbiddenCommand):
+            guarded.write('TRAN:PULS 25 V')  # the gate opens nothing else
+        with pytest.raises(hw_probe.ForbiddenCommand):
+            guarded.write('*RST')
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('TRAN:ENAB ON')  # closed again
+    with pytest.raises(hw_probe.ForbiddenCommand):  # closed again after an exception too
+        with guarded.pulser_gate():
+            raise hw_probe.ForbiddenCommand('inside')
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('TRAN:ENAB ON')
+    assert fake.log == ['TRAN:ENAB ON']
+
+
+@pytest.mark.parametrize('phase', PHASES)
+def test_guard_always_lets_the_pulser_off_through(phase: str) -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy(phase, 20.0))
+    for cmd in ('TRAN:ENAB OFF', 'TRAN:ENAB 0', 'TRAN:ENAB?'):
+        guarded.write(cmd) if not cmd.endswith('?') else guarded.query(cmd)
+    assert fake.log == ['TRAN:ENAB OFF', 'TRAN:ENAB 0', 'TRAN:ENAB?']
+
+
+@pytest.mark.parametrize(
+    'cmd',
+    [
+        'TRAN:PULS 25 V',  # above the ceiling
+        'TRAN:PULS 15 V',  # below, but not --pulse-v
+        'TRAN:PULS 20.5 V',
+        'TRAN:PULS MAX',
+        'TRAN:PULS',
+        'TRAN:PULS 20 MV',
+        'TRAN:PULS 20 V;TRAN:ENAB ON',
+        'TRAN:PULS 20 V\nTRAN:PULS 50 V',
+        'TRANsmitter:PULSe:LEVel 25 V',
+    ],
+)
+def test_guard_refuses_tran_puls_in_phase_c_unless_it_is_pulse_v(cmd: str) -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy('C', 20.0))
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write(cmd)
+    assert fake.log == []
+
+
+def test_guard_lets_exactly_pulse_v_through_in_phase_c() -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=hw_probe.GuardPolicy('C', 15.0, 20.0))
+    for cmd in ('TRAN:PULS 15 V', 'TRAN:PULS 15', 'TRANsmitter:PULSe:LEVel 15.0 V'):
+        guarded.write(cmd)
+    assert guarded.query('TRAN:PULS?') == '15'
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('TRAN:PULS 20 V')
+
+
+@pytest.mark.parametrize('phase', ['A', 'B', 'AB', 'RST'])
+def test_guard_refuses_every_tran_puls_write_outside_phase_c(phase: str) -> None:
+    guarded = hw_probe.GuardedResource(_c_fake(), policy=_policy(phase, 20.0))
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('TRAN:PULS 20 V')
+
+
+@pytest.mark.parametrize('phase', ['A', 'B', 'AB', 'C'])
+def test_guard_refuses_rst_except_in_phase_rst(phase: str) -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy(phase, 20.0))
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('*RST')
+    assert fake.log == []
+
+
+def test_guard_lets_rst_through_in_phase_rst_only() -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy('RST'))
+    guarded.write('*RST')
+    assert fake.log == ['*RST']
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('*RST;TRAN:ENAB ON')
+
+
+@pytest.mark.parametrize('phase', PHASES)
+def test_guard_refuses_config_everywhere(phase: str) -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy(phase, 20.0))
+    with guarded.pulser_gate():
+        for cmd in ('/config/dev.eth 1', '/CONFIG/dev.wlan', 'FREQ 1 MHZ /config'):
+            with pytest.raises(hw_probe.ForbiddenCommand):
+                guarded.write(cmd)
+        with pytest.raises(hw_probe.ForbiddenCommand):
+            guarded.query('/config/dev.eth?')
+    assert fake.log == []
+
+
+@pytest.mark.parametrize(
+    'cmd', ['FREQ 1 MHZ;TRAN:ENAB ON', 'FREQ 1 MHZ\r\nTRAN:ENAB ON', 'GAIN 0\n*RST']
+)
+def test_guard_refuses_chained_commands(cmd: str) -> None:
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=_policy('C', 20.0))
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write(cmd)
+    assert fake.log == []
+
+
+def test_guard_refuses_a_tab_separated_tran_puls() -> None:
+    guarded = hw_probe.GuardedResource(_c_fake(), policy=_policy('B'))
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('TRAN:PULS\t50 V')
+
+
+def test_guard_announces_pulser_commands_before_sending_them() -> None:
+    events: list[str] = []
+    fake = _c_fake()
+    guarded = hw_probe.GuardedResource(fake, policy=hw_probe.GuardPolicy('C', 15.0, 20.0))
+    guarded.set_announce(lambda cmd: events.append(f'announce {cmd}; log has {len(fake.log)}'))
+    guarded.write('TRAN:PULS 15 V')
+    with guarded.pulser_gate():
+        guarded.write('TRAN:ENAB ON')
+    guarded.write('TRAN:ENAB OFF')
+    guarded.write('FREQ 1 MHZ')
+    assert events == [
+        'announce TRAN:PULS 15 V; log has 0',
+        'announce TRAN:ENAB ON; log has 1',
+    ]
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('TRAN:PULS 25 V')
+    assert len(events) == 2  # a refused command is not announced
+
+
+@pytest.mark.parametrize(('phase', 'step'), [('A', 3), ('B', 6), ('AB', 6), ('RST', 13), ('C', 10)])
+def test_a_step_that_tries_pulser_on_outside_the_function_is_refused_and_nothing_is_sent(
+    phase: str,
+    step: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def rogue(p: Any) -> None:
+        p.plug.write('TRAN:ENAB ON')
+
+    if phase == 'C':  # steps 10b and 11 would legitimately pulse
+        monkeypatch.setitem(hw_probe.STEPS, '10b', ('noop', lambda p: None))
+        monkeypatch.setitem(hw_probe.STEPS, 11, ('noop', lambda p: None))
+    monkeypatch.setitem(hw_probe.STEPS, step, ('rogue', rogue))
+    extra = {'C': ['--pulse-v', '20'], 'RST': ['--allow-rst']}.get(phase, [])
+    fake = _c_fake()
+    code = hw_probe.main(['--fake', '--phase', phase, '--out', str(tmp_path), *extra], fake=fake)
+    out = capsys.readouterr().out
+    assert code != 0
+    assert f'STEP {step} FAILED' in out
+    assert 'TRAN:ENAB ON' not in fake.log
+    assert 'ON' not in [c.split(' ')[-1] for c in _enab_writes(fake.log)]
+    assert _enab_writes(fake.log)[-1].endswith('OFF')
+
+
+def test_a_step_that_writes_another_pulser_voltage_in_phase_c_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def rogue(p: Any) -> None:
+        p.plug.write('TRAN:PULS 25 V')
+
+    monkeypatch.setitem(hw_probe.STEPS, 11, ('rogue', rogue))
+    fake = _c_fake()
+    hw_probe.main(_c_args(tmp_path), fake=fake)
+    assert 'STEP 11 FAILED' in capsys.readouterr().out
+    assert 'TRAN:PULS 25 V' not in fake.log
+
+
+# ── section 3.2: pulsed_acquire always ends with the pulser off ──────────────
+
+
+def _sent_after(log: list[str], start: int) -> list[str]:
+    return log[start:]
+
+
+def test_pulsed_acquire_order_on_only_while_reading_then_off_stop_verify(tmp_path: Path) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    log = fake.log
+    first_on = log.index('TRAN:ENAB ON')
+    # the stream is open (STAR AUTO sent) before the pulser goes on
+    assert 'STAR AUTO' in log[:first_on]
+    assert log[first_on : first_on + 3] == ['TRAN:ENAB ON', 'SYSTem:ERRor?', 'TRAN:ENAB?']
+    off = log.index('TRAN:ENAB OFF', first_on)
+    assert log[off : off + 4] == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB?', 'SYSTem:ERRor?']
+    # nothing is written between the read-back of ON and the OFF
+    between = [c for c in log[first_on + 3 : off] if not c.endswith('?')]
+    assert between == []
+
+
+def test_phase_c_every_pulser_on_is_followed_by_off_and_the_last_enab_write_is_off(
+    tmp_path: Path,
+) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    writes = _enab_writes(fake.log)
+    assert writes.count('TRAN:ENAB ON') == 5  # steps 10, 10b and the three delays of 11
+    for i, cmd in enumerate(writes):
+        if cmd == 'TRAN:ENAB ON':
+            assert writes[i + 1] == 'TRAN:ENAB OFF'
+    assert writes[-1] == 'TRAN:ENAB OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
+    # between an ON and its OFF there is exactly one STOP at most
+    on = [i for i, c in enumerate(fake.log) if c == 'TRAN:ENAB ON']
+    for i in on:
+        nxt = fake.log.index('TRAN:ENAB OFF', i)
+        assert 'TRAN:ENAB ON' not in fake.log[i + 1 : nxt]
+
+
+class _RaisingReader(hw_probe.FrameReader):
+    def read(self, n: int, timeout_s: float) -> list[bytes]:
+        raise TimeoutError('injected: no packets')
+
+
+def test_an_exception_while_reading_packets_still_sends_off_and_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(hw_probe, 'FrameReader', _RaisingReader)
+    fake = _c_fake()
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    out = capsys.readouterr().out
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert 'STEP 10 FAILED' in out
+    on = [i for i, c in enumerate(fake.log) if c == 'TRAN:ENAB ON']
+    assert on, 'the pulser was switched on'
+    for i in on:
+        tail = fake.log[i:]
+        off = tail.index('TRAN:ENAB OFF')
+        assert (
+            'STOP'
+            in tail[off : tail.index('TRAN:ENAB ON', 1) if 'TRAN:ENAB ON' in tail[1:] else None]
+        )
+        assert tail.index('STOP') > off
+        assert 'TRAN:ENAB?' in tail[off:]
+    assert _enab_writes(fake.log)[-1] == 'TRAN:ENAB OFF'
+    assert fake.sockets[-1].closed
+    assert fake._values['TRAN:ENAB'] == '0'
+
+
+def test_an_exception_while_switching_on_still_sends_off_and_stop(tmp_path: Path) -> None:
+    class RejectsOn(FakeA1580Resource):
+        def query(self, cmd: str) -> str:
+            enab = [c for c in self.log if c.startswith('TRAN:ENAB ')]
+            if cmd == 'TRAN:ENAB?' and enab and enab[-1] == 'TRAN:ENAB ON':
+                self.log.append(cmd)
+                raise TimeoutError('injected: no answer')
+            return super().query(cmd)
+
+    fake = RejectsOn(signal='transmission')
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    assert code == hw_probe.EXIT_FAILED_STEP
+    writes = _enab_writes(fake.log)
+    for i, cmd in enumerate(writes):
+        if cmd == 'TRAN:ENAB ON':
+            assert writes[i + 1] == 'TRAN:ENAB OFF'
+    assert writes[-1] == 'TRAN:ENAB OFF'
+
+
+def test_a_pulser_that_does_not_come_on_is_not_read_from(tmp_path: Path) -> None:
+    class NeverOn(FakeA1580Resource):
+        def write(self, cmd: str) -> None:
+            if cmd == 'TRAN:ENAB ON':
+                self.log.append(cmd)  # swallowed: reads back 0
+                return
+            super().write(cmd)
+
+    fake = NeverOn(signal='transmission')
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert _enab_writes(fake.log)[-1] == 'TRAN:ENAB OFF'
+
+
+class _StuckOn(FakeA1580Resource):
+    """The pulser ignores the first `swallow` OFF writes after it was switched on."""
+
+    def __init__(self, swallow: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.swallow = swallow
+        self.switched_on = False
+
+    def write(self, cmd: str) -> None:
+        if cmd == 'TRAN:ENAB ON':
+            self.switched_on = True
+        elif cmd == 'TRAN:ENAB OFF' and self.switched_on and self.swallow > 0:
+            self.swallow -= 1
+            self.log.append(cmd)
+            return
+        super().write(cmd)
+
+
+def test_pulser_read_back_not_off_after_pulsed_acquire_aborts_with_exit_pulser(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _StuckOn(2, signal='transmission')  # the OFF of the finally and its one retry
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    captured = capsys.readouterr()
+    assert code == hw_probe.EXIT_PULSER
+    assert 'STEP 10 ABORTED' in captured.out
+    assert 'STEP 10b' not in captured.out  # the run stopped
+    assert 'RUN STOPPED' in captured.err
+    assert fake.log.count('TRAN:ENAB ON') == 1
+    assert 'FINAL DIFF' in captured.out  # tearDown and the diff still ran
+    assert _enab_writes(fake.log)[-1] == 'TRAN:ENAB OFF'  # tearDown's OFF
+    assert fake._values['TRAN:ENAB'] == '0'  # and it worked
+
+
+def test_pulser_that_needs_the_retry_is_switched_off_with_a_warning_and_the_run_goes_on(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _StuckOn(1, signal='transmission')
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    out = capsys.readouterr().out
+    assert 'retry' in out
+    assert 'STEP 10b:' in out
+
+
+def test_pulser_that_cannot_be_read_back_after_pulsed_acquire_aborts(tmp_path: Path) -> None:
+    class Mute(FakeA1580Resource):
+        def query(self, cmd: str) -> str:
+            if cmd == 'TRAN:ENAB?' and self.stop_count and self.switched_on:
+                self.log.append(cmd)
+                raise TimeoutError('injected')
+            return super().query(cmd)
+
+        switched_on = False
+
+        def write(self, cmd: str) -> None:
+            self.switched_on = self.switched_on or cmd == 'TRAN:ENAB ON'
+            super().write(cmd)
+
+    fake = Mute(signal='transmission')
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    assert code == hw_probe.EXIT_PULSER
+    assert _enab_writes(fake.log)[-1] == 'TRAN:ENAB OFF'
+
+
+def test_pulser_on_time_is_recorded(tmp_path: Path) -> None:
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+    report = _load_probe(tmp_path)
+    pulses = report['pulses']
+    assert len(pulses) == 5
+    assert all(0 < x['on_s'] < 5 for x in pulses)
+    assert all(x['verified_off'] is True for x in pulses)
+
+
+def _load_probe(out: Path) -> dict[str, Any]:
+    (path,) = out.glob('probe-*.json')
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+# ── section 3.1: preparation ─────────────────────────────────────────────────
+
+
+def test_no_tran_puls_write_when_the_device_already_has_the_voltage(tmp_path: Path) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    assert not [c for c in fake.log if c.startswith('TRAN:PULS ')]
+    assert 'TRAN:PULS?' in fake.log
+
+
+def test_exactly_one_tran_puls_write_when_pulse_v_differs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _c_fake()
+    argv = ['--fake', '--phase', 'C', '--pulse-v', '15', '--out', str(tmp_path)]
+    assert hw_probe.main(argv, fake=fake) == 0
+    out = capsys.readouterr().out
+    writes = [c for c in fake.log if c.startswith('TRAN:PULS ')]
+    assert writes == ['TRAN:PULS 15 V']
+    assert fake._values['TRAN:PULS'] == '15'
+    assert 'PULSER: about to send' in out
+    assert out.index('PULSER: about to send TRAN:PULS 15 V') < out.index(
+        'PULSER: about to send TRAN:ENAB ON'
+    )
+    # before the first pulse, after the pulser-off check
+    assert fake.log.index('TRAN:PULS 15 V') < fake.log.index('TRAN:ENAB ON')
+    # the changed voltage is not written back, and the diff says so without failing the run
+    assert 'CHANGED TRAN:PULS' in out
+    assert 'phase C set the pulser voltage' in out
+
+
+def test_every_pulser_on_is_announced_before_it_is_sent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+    out = capsys.readouterr().out
+    assert out.count('PULSER: about to send TRAN:ENAB ON') == 5
+
+
+def test_voltage_that_does_not_read_back_aborts_with_exit_ceiling(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _c_fake(reject={'TRAN:PULS': '-221,"Settings conflict"'})
+    argv = ['--fake', '--phase', 'C', '--pulse-v', '15', '--out', str(tmp_path)]
+    code = hw_probe.main(argv, fake=fake)
+    assert code == hw_probe.EXIT_CEILING
+    assert 'TRAN:ENAB ON' not in fake.log  # never pulsed
+
+
+def test_a_setting_that_is_refused_in_the_preparation_aborts_before_any_pulse(
+    tmp_path: Path,
+) -> None:
+    fake = _c_fake(reject={'TRAN:FREQ': '-224,"Illegal parameter value"'})
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert 'TRAN:ENAB ON' not in fake.log
+    assert fake.log[-1] != 'TRAN:ENAB ON'
+
+
+def test_device_pulser_above_the_ceiling_stops_phase_c_before_any_write(
+    tmp_path: Path,
+) -> None:
+    fake = _c_fake()
+    fake.write('TRAN:PULS 30 V')
+    fake.log.clear()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == hw_probe.EXIT_CEILING
+    assert 'TRAN:ENAB ON' not in fake.log
+    assert [c for c in fake.log if c.startswith('DATA:LENG ')] == []
+    assert fake._values['TRAN:PULS'] == '30'
+
+
+def test_phase_c_writes_the_settings_of_the_spec_and_records_read_backs(
+    tmp_path: Path,
+) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    for cmd in (
+        'DATA:LENG 8192',
+        'FREQ 1 MHZ',
+        'TRIG:MODE INT',
+        'TRIG:INT 100 MS',
+        'TRAN:TYPE DUAL',
+        'TRAN:FREQ 50 KHZ',
+        'TRAN:DUR 1',
+        'TRAN:IMP HIGH',
+        'GAIN 0',
+        'GAIN:TGC:MODE OFF',
+        'AVER:COUN 0',
+        'FILT:HPAS:IND 0',
+        'TRIG:DEL 0 NS',
+    ):
+        assert cmd in fake.log, cmd
+    report = _load_probe(tmp_path)
+    prep = report['steps']['PREPARATION']['data']
+    assert prep['readbacks']['TRIG:INT'] == '0.1'
+    assert prep['readbacks']['DATA:LENG'] == '8192'
+    assert prep['readbacks']['TRAN:FREQ'] == '50000'
+
+
+def test_settings_follow_the_command_line(tmp_path: Path) -> None:
+    fake = _c_fake()
+    extra = [
+        '--tran-freq', '2 MHZ', '--sample-freq', '2 MHZ', '--length', '4096',
+        '--interval', '50 MS', '--gain', '6',
+    ]  # fmt: skip
+    assert hw_probe.main(_c_args(tmp_path, *extra), fake=fake) == 0
+    for cmd in ('TRAN:FREQ 2 MHZ', 'FREQ 2 MHZ', 'DATA:LENG 4096', 'TRIG:INT 50 MS', 'GAIN 6'):
+        assert cmd in fake.log, cmd
+
+
+# ── section 3.3: step 10 analysis (pure functions) ───────────────────────────
+
+
+def _noise(shape: tuple[int, int], seed: int = 1) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return np.rint(rng.normal(11.0, 3.6, shape)).astype(np.int16)
+
+
+def _burst_records(n: int = 2048, k: int = 4, onset: int = 300) -> np.ndarray:
+    """k records: constant 11 plus a burst that peaks at `onset + 2`, gone by `onset + 60`."""
+    records = np.full((k, n), 11, dtype=np.int16)
+    shape = (500.0 * np.exp(-np.arange(60) / 8.0) * np.where(np.arange(60) == 2, 1.0, 0.5)).astype(
+        np.int16
+    )
+    records[:, onset : onset + 60] += shape
+    return records
+
+
+def _analyse(baseline: np.ndarray, pulsed: np.ndarray) -> dict[str, Any]:
+    return hw_probe.analyse_pulsed(baseline, pulsed, 1e6)
+
+
+def test_analysis_finds_onset_and_peak_index_and_converts_to_microseconds() -> None:
+    result = _analyse(_noise((5, 2048)), _burst_records())
+    assert result['threshold'] == max(10 * result['baseline_std'], 20)
+    assert 10.5 < result['baseline_mean'] < 11.5
+    for packet in result['packets']:
+        assert packet['onset_index'] == 300
+        assert packet['peak_index'] == 302
+        assert packet['onset_us'] == pytest.approx(300.0)
+        assert packet['peak'] == pytest.approx(packet['max'] - result['baseline_mean'])
+        assert packet['max'] > 300
+        assert packet['min'] == 11
+    assert result['onset_spread_samples'] == 0
+    assert result['peak_index_spread_samples'] == 0
+
+
+def test_analysis_spread_of_onset_and_peak_between_packets() -> None:
+    pulsed = np.concatenate([_burst_records(k=1, onset=300), _burst_records(k=1, onset=310)])
+    result = _analyse(_noise((5, 2048)), pulsed)
+    assert result['onset_spread_samples'] == 10
+    assert result['peak_index_spread_samples'] == 10
+
+
+def test_analysis_clean_record_has_no_warning() -> None:
+    result = _analyse(_noise((5, 2048)), _burst_records())
+    assert result['warnings'] == []
+
+
+def test_analysis_warns_about_saturation_by_value() -> None:
+    pulsed = _burst_records()
+    pulsed[1, 300] = 32767
+    pulsed[2, 310] = -32768
+    warnings = _analyse(_noise((5, 2048)), pulsed)['warnings']
+    assert len(warnings) == 1
+    assert 'saturation' in warnings[0]
+    assert '2 samples' in warnings[0]
+
+
+def test_analysis_warns_about_a_flat_top() -> None:
+    pulsed = _burst_records()
+    pulsed[0, 400:405] = 20000  # the largest value, repeated 5 times in a row
+    warnings = _analyse(_noise((5, 2048)), pulsed)['warnings']
+    assert len(warnings) == 1
+    assert 'saturation' in warnings[0]
+    assert 'flat' in warnings[0]
+    assert '5 samples' in warnings[0]
+
+
+def test_analysis_three_equal_maxima_are_not_a_flat_top() -> None:
+    pulsed = _burst_records()
+    pulsed[0, 400:403] = 20000
+    assert _analyse(_noise((5, 2048)), pulsed)['warnings'] == []
+
+
+def test_analysis_warns_about_no_signal() -> None:
+    pulsed = np.full((4, 2048), 11, dtype=np.int16)
+    warnings = _analyse(_noise((5, 2048)), pulsed)['warnings']
+    assert len(warnings) == 1
+    assert 'no signal' in warnings[0]
+
+
+def test_analysis_one_packet_with_a_signal_is_not_no_signal() -> None:
+    pulsed = _burst_records()
+    pulsed[1:] = 11
+    assert _analyse(_noise((5, 2048)), pulsed)['warnings'] == []
+
+
+def test_analysis_warns_about_a_signal_in_the_baseline() -> None:
+    baseline = _noise((5, 2048))
+    baseline[2, 500] = 400
+    warnings = _analyse(baseline, _burst_records())['warnings']
+    assert len(warnings) == 1
+    assert 'baseline' in warnings[0]
+    assert 'pulser off' in warnings[0]
+
+
+def test_analysis_warns_about_a_signal_at_the_end_of_the_record() -> None:
+    pulsed = _burst_records()
+    pulsed[3, -10:] = 300  # the last 5 % of 2048 samples is 102
+    warnings = _analyse(_noise((5, 2048)), pulsed)['warnings']
+    assert len(warnings) == 1
+    assert 'end of the record' in warnings[0]
+
+
+def test_analysis_a_signal_just_before_the_last_5_percent_is_not_flagged() -> None:
+    pulsed = _burst_records()
+    pulsed[3, 1900:1910] = 300
+    assert _analyse(_noise((5, 2048)), pulsed)['warnings'] == []
+
+
+def test_analysis_result_is_json_serialisable() -> None:
+    result = _analyse(_noise((5, 2048)), _burst_records())
+    json.dumps(result)
+
+
+def test_cross_lag_is_positive_when_the_signal_comes_later() -> None:
+    ref = np.zeros(1000)
+    ref[100:140] = np.sin(np.arange(40) * 0.7)
+    for lag in (0, 7, -7, 300):
+        other = np.roll(ref, lag)
+        assert hw_probe.cross_lag(ref, other) == lag
+
+
+# ── steps 10, 10b, 11 on the fake ────────────────────────────────────────────
+
+
+def test_phase_c_on_the_fake_finds_the_burst_and_exits_0(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = hw_probe.main(_c_args(tmp_path), fake=_c_fake())
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert 'FAILED' not in out
+    for label in ('STEP 10:', 'STEP 10b:', 'STEP 11:', 'PULSER-OFF CHECK', 'SAFETY CHECK'):
+        assert label in out
+    assert out.index('SAFETY CHECK') < out.index('PULSER-OFF CHECK') < out.index('STEP 10:')
+    report = _load_probe(tmp_path)
+    step10 = report['steps']['STEP 10']['data']
+    assert step10['analysis']['warnings'] == []
+    packets = step10['analysis']['packets']
+    assert len(packets) == 10
+    assert {p['onset_index'] for p in packets} == {201}  # the fake's arrival 200 us at 1 MHz
+    assert {p['onset_us'] for p in packets} == {201.0}
+    assert report['steps']['FINAL DIFF']['data']['changed'] == {}
+    assert report['exit_code'] == 0
+    assert report['warnings'] == []
+
+
+def test_step_10b_reports_averaging_with_a_real_signal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    data = _load_probe(tmp_path)['steps']['STEP 10b']['data']
+    assert data['peak_ratio'] == pytest.approx(1.0, abs=0.1)  # a mean
+    assert 0.15 < data['noise_ratio'] < 0.4  # 1/4 for 2^4 acquisitions
+    assert data['ascan_counts'] == [1]
+    assert 'AVER:COUN 4' in fake.log
+    assert (
+        fake.log[len(fake.log) - 1 - fake.log[::-1].index('AVER:COUN 0') :].count('AVER:COUN 0')
+        >= 1
+    )
+    assert fake._values['AVER:COUN'] == '0'
+    out = capsys.readouterr().out
+    assert '1.0 means a mean, 16 a sum' in out
+
+
+def test_step_10b_without_enough_pre_onset_samples_says_so(tmp_path: Path) -> None:
+    import a1580_openhtf.fake_resource as fr
+
+    old = fr._TRANSMISSION_ARRIVAL_S
+    fr._TRANSMISSION_ARRIVAL_S = 20e-6  # the burst arrives at once: nothing before the onset
+    try:
+        assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+    finally:
+        fr._TRANSMISSION_ARRIVAL_S = old
+    data = _load_probe(tmp_path)['steps']['STEP 10b']['data']
+    assert data['noise_ratio'] is None
+    assert data['noise_note'] == 'no pre-onset samples'
+
+
+def test_step_11_reports_the_shift_the_fake_applies(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    data = _load_probe(tmp_path)['steps']['STEP 11']['data']
+    delays = {d['delay']: d for d in data['delays']}
+    assert list(delays) == ['0 NS', '1000 US', '2000 US']
+    assert delays['0 NS']['shift_samples'] == 0
+    fs = 1e6
+    for text, ns in (('1000 US', 1_000_000), ('2000 US', 2_000_000)):
+        expected = ns * 1e-9 * fs  # what the fake does: the burst moves later by TRIG:DEL
+        entry = delays[text]
+        assert entry['shift_samples'] == expected
+        assert entry['shift_us'] == pytest.approx(expected / fs * 1e6)
+        assert entry['onset_index'] == 201 + expected
+        assert 'later by the delay' in entry['verdict']
+    out = capsys.readouterr().out
+    assert 'later by the delay' in out
+    # put back at the end of the step (the restore of the snapshot comes later)
+    assert fake.log.index('TRIG:DEL 0 NS', fake.log.index('TRIG:DEL 2000 US')) > 0
+
+
+def test_step_11_verdicts_for_earlier_other_and_left_the_window() -> None:
+    verdict = hw_probe.shift_verdict
+    assert 'later by the delay' in verdict(1000, 1000.0, True)
+    assert 'later by the delay' in verdict(1001, 1000.0, True)
+    assert 'earlier by the delay' in verdict(-999, 1000.0, True)
+    assert 'does not move' in verdict(1, 1000.0, True)
+    other = verdict(500, 1000.0, True)
+    assert 'something else' in other
+    assert 'later' in other
+    assert '500' in other
+    assert 'earlier' in verdict(-400, 1000.0, True)
+    assert 'left the window' in verdict(0, 1000.0, False)
+
+
+def test_step_11_without_the_signal_in_the_window_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hw_probe, 'STEP11_DELAYS', ('0 NS', '9000 US'))
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0  # window is 8.192 ms
+    data = _load_probe(tmp_path)['steps']['STEP 11']['data']
+    assert 'left the window' in data['delays'][1]['verdict']
+
+
+def test_a_warning_of_step_10_is_printed_stored_repeated_and_does_not_change_the_exit_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _c_fake()
+    fake._values['GAIN'] = '0'
+    # a pulser that does nothing: no signal in any pulsed packet
+    original = fake._packet
+
+    def quiet() -> bytes:
+        fake._values['TRAN:ENAB'] = '0'
+        return original()
+
+    fake._packet = quiet  # type: ignore[method-assign]
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert out.count('WARNING: no signal') == 2  # where it was found and in the block
+    assert 'WARNINGS' in out
+    assert out.index('FINAL DIFF') < out.index('\nWARNINGS')
+    report = _load_probe(tmp_path)
+    assert len(report['warnings']) == 1
+    assert 'no signal' in report['warnings'][0]
+    assert report['exit_code'] == 0
+
+
+def test_no_warnings_block_without_warnings(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+    assert 'WARNINGS' not in capsys.readouterr().out
+
+
+def test_saturation_in_the_fake_signal_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=_c_fake())  # 2000 * 100 clips
+    out = capsys.readouterr().out
+    assert code == 0
+    assert 'WARNING: saturation' in out
+
+
+def test_npz_files_are_written_to_out_with_int16_arrays(tmp_path: Path) -> None:
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+    names = sorted(p.name for p in tmp_path.glob('phaseC-*.npz'))
+    assert len(names) == 3
+    assert [n.rsplit('-', 1)[1] for n in names] == ['step10.npz', 'step10b.npz', 'step11.npz']
+    assert all(n.startswith('phaseC-100500-') for n in names)
+    with np.load(tmp_path / names[0], allow_pickle=False) as npz:
+        assert npz['baseline'].dtype == np.int16
+        assert npz['pulsed'].dtype == np.int16
+        assert npz['baseline'].shape == (5, 8192)
+        assert npz['pulsed'].shape == (10, 8192)
+        settings = json.loads(str(npz['settings']))
+        assert settings['FREQ'] == '1 MHZ'
+        assert settings['pulse_v'] == 20
+    with np.load(tmp_path / names[1], allow_pickle=False) as npz:
+        assert npz['pulsed'].dtype == np.int16
+        assert npz['pulsed'].shape == (5, 8192)
+    with np.load(tmp_path / names[2], allow_pickle=False) as npz:
+        keys = [k for k in npz.files if k != 'settings']
+        assert len(keys) == 3
+        assert all(npz[k].dtype == np.int16 and npz[k].shape == (5, 8192) for k in keys)
+
+
+# ── section 3.6: phase RST ───────────────────────────────────────────────────
+
+
+def _power_on_like() -> FakeA1580Resource:
+    """The measured power-on facts that matter here: pulser on, DUAL, DATA:LENG 114688.
+
+    (`power_on=True` also gives `TRIG:INT` 1 s and an empty `GAIN:TGC:ARB`, which the fake's
+    `*RST` then fills: a diff that is the fake's, not the tool's.)
+    """
+    fake = FakeA1580Resource(length=114688)
+    fake._values['TRAN:ENAB'] = '1'
+    fake._values['TRAN:TYPE'] = 'DUAL'
+    return fake
+
+
+def _rst_args(out: Path, *extra: str) -> list[str]:
+    return ['--fake', '--phase', 'RST', '--allow-rst', '--out', str(out), *extra]
+
+
+def test_phase_rst_sends_rst_once_switches_the_pulser_off_at_once_and_prints_the_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _power_on_like()
+    code = hw_probe.main(_rst_args(tmp_path), fake=fake)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert fake.log.count('*RST') == 1
+    i = fake.log.index('*RST')
+    assert fake.log[i + 1] == 'TRAN:ENAB?'
+    assert fake.log[i + 2] == 'TRAN:ENAB OFF'
+    assert 'TRAN:ENAB ON' not in fake.log
+    assert 'TRAN:PULS 20 V' not in fake.log
+    assert 'PULSER' not in out.split('STEP 13')[1].split('FINAL DIFF')[0].replace('PULSER-OFF', '')
+    # the table: three columns, one row per STATE_HEADERS entry plus DATA:PORT and SYST:ERR:COUN
+    assert 'after *RST' in out
+    assert 'snapshot (step 2)' in out
+    assert 'vendor DEFault' in out
+    for header in (*STATE_HEADERS, 'DATA:PORT', 'SYST:ERR:COUN'):
+        assert f'{header} ' in out
+    assert '= snapshot' in out
+    assert '= vendor default' in out
+    # restore done (power-on DATA:LENG is the known defect, so the diff on it is expected)
+    assert any(c.startswith('FREQ ') for c in fake.log[i + 3 :])
+    assert 'RESTORE FAILED (known firmware defect' in out
+
+
+def test_phase_rst_table_marks_rows_and_is_in_the_report(tmp_path: Path) -> None:
+    fake = _power_on_like()
+    assert hw_probe.main(_rst_args(tmp_path), fake=fake) == 0
+    rows = {r['header']: r for r in _load_probe(tmp_path)['steps']['STEP 13']['data']['table']}
+    assert set(rows) == {*STATE_HEADERS, 'DATA:PORT', 'SYST:ERR:COUN'}
+    # power-on TRAN:TYPE is DUAL, the vendor default SINGle: not the default, equal to the snapshot
+    assert rows['TRAN:TYPE']['after_rst'] == 'SINGle'
+    assert rows['TRAN:TYPE']['snapshot'] == 'DUAL'
+    assert rows['TRAN:TYPE']['default'] == 'SINGle'
+    assert rows['TRAN:TYPE']['mark'] == '= vendor default'
+    assert rows['TRAN:IMP']['mark'] == '= snapshot, = vendor default'
+    assert rows['DATA:LENG']['mark'] == '= vendor default'
+    assert rows['TRIG:INT']['after_rst'] == '0.01'
+    assert rows['DATA:PORT']['snapshot'] == '-'
+    assert rows['SYST:ERR:COUN']['default'] == '-'
+
+
+def test_phase_rst_row_that_matches_neither_is_marked_neither(tmp_path: Path) -> None:
+    class Odd(FakeA1580Resource):
+        def write(self, cmd: str) -> None:
+            super().write(cmd)
+            if cmd == '*RST':
+                self._values['GAIN'] = '33'
+
+    assert hw_probe.main(_rst_args(tmp_path), fake=Odd()) == 0
+    rows = {r['header']: r for r in _load_probe(tmp_path)['steps']['STEP 13']['data']['table']}
+    assert rows['GAIN']['mark'] == 'neither'
+
+
+def test_phase_rst_pulser_that_comes_on_with_rst_is_a_result_and_ends_off(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class OnAfterRst(FakeA1580Resource):
+        def write(self, cmd: str) -> None:
+            super().write(cmd)
+            if cmd == '*RST':
+                self._values['TRAN:ENAB'] = '1'
+
+    fake = OnAfterRst()
+    code = hw_probe.main(_rst_args(tmp_path), fake=fake)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert fake._values['TRAN:ENAB'] == '0'
+    assert _enab_writes(fake.log)[-1] == 'TRAN:ENAB OFF'
+    data = _load_probe(tmp_path)['steps']['STEP 13']['data']
+    assert data['enab_after_rst'] == '1'
+    assert 'pulser was ON right after *RST' in out
+
+
+def test_phase_rst_pulser_that_stays_on_after_rst_aborts_with_exit_pulser(
+    tmp_path: Path,
+) -> None:
+    class Stuck(FakeA1580Resource):
+        armed = False
+
+        def write(self, cmd: str) -> None:
+            if cmd == '*RST':
+                self.armed = True
+            if cmd == 'TRAN:ENAB OFF' and self.armed and not self.stop_count:
+                self.log.append(cmd)
+                self._values['TRAN:ENAB'] = '1'
+                return
+            super().write(cmd)
+            if cmd == '*RST':
+                self._values['TRAN:ENAB'] = '1'
+
+    fake = Stuck()
+    code = hw_probe.main(_rst_args(tmp_path), fake=fake)
+    assert code == hw_probe.EXIT_PULSER
+    assert _enab_writes(fake.log)[-1] == 'TRAN:ENAB OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
+
+
+def test_phase_rst_error_queue_after_rst_is_recorded(tmp_path: Path) -> None:
+    class Noisy(FakeA1580Resource):
+        def write(self, cmd: str) -> None:
+            super().write(cmd)
+            if cmd == '*RST':
+                self._queue_error('-200,"Execution error"')
+
+    assert hw_probe.main(_rst_args(tmp_path), fake=Noisy()) == 0
+    data = _load_probe(tmp_path)['steps']['STEP 13']['data']
+    assert data['errors_after_rst'] == ['-200,"Execution error"']
+
+
+def test_phase_rst_never_sends_a_pulser_on_or_a_voltage(tmp_path: Path) -> None:
+    fake = _power_on_like()
+    assert hw_probe.main(_rst_args(tmp_path), fake=fake) == 0
+    assert 'ON' not in [c.split(' ')[-1] for c in _enab_writes(fake.log)]
+    assert not [c for c in fake.log if c.startswith('TRAN:PULS ')]
+
+
+# ── section 3.7: teardown, expected restore failure, exit code ───────────────
+
+
+def test_power_on_data_leng_restore_failure_is_expected_and_the_exit_code_is_0(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _c_fake(power_on=True)
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    line = next(x for x in out.splitlines() if x.startswith('RESTORE FAILED'))
+    assert line.startswith(
+        'RESTORE FAILED (known firmware defect: power-on DATA:LENG is refused by the setter): '
+    )
+    assert 'DATA:LENG' in line
+    report = _load_probe(tmp_path)
+    details = report['steps']['TEARDOWN']['data']['restore_failure_details']
+    assert len(details) == 1
+    assert details[0]['expected'] is True
+    assert details[0]['failure'].startswith('DATA:LENG')
+    changed = report['final_diff']['changed']
+    assert changed['DATA:LENG']['expected'] is True
+    assert changed['DATA:LENG']['was'] == '114688'
+    assert changed['TRAN:ENAB']['expected'] is True
+    assert report['exit_code'] == 0
+
+
+def test_other_restore_failures_still_fail_phase_c(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Refuses(FakeA1580Resource):
+        def write(self, cmd: str) -> None:
+            if cmd.startswith('TRAN:DUR ') and self.stop_count:  # only the restore
+                self.log.append(cmd)
+                self._queue_error('-224,"Illegal parameter value"')
+                return
+            super().write(cmd)
+
+    fake = Refuses(signal='transmission')
+    fake._values['TRAN:DUR'] = (
+        '2'  # so that step 10's TRAN:DUR 1 changes it and the restore must undo it
+    )
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    out = capsys.readouterr().out
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert 'RESTORE FAILED: TRAN:DUR' in out
+    details = _load_probe(tmp_path)['steps']['TEARDOWN']['data']['restore_failure_details']
+    assert details[0]['expected'] is False
+
+
+def test_a_data_leng_restore_failure_with_a_legal_snapshot_value_is_not_expected(
+    tmp_path: Path,
+) -> None:
+    fake = _c_fake(reject={'DATA:LENG': '-224,"Illegal parameter value"'})
+    # the preparation already fails on DATA:LENG, so this only checks the classification
+    code = hw_probe.main(_c_args(tmp_path), fake=fake)
+    assert code == hw_probe.EXIT_FAILED_STEP
+
+
+def test_phases_b_and_ab_keep_marking_a_data_leng_restore_failure_as_a_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeA1580Resource(power_on=True)
+    code = hw_probe.main(['--fake', '--phase', 'B', '--out', str(tmp_path)], fake=fake)
+    out = capsys.readouterr().out
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert 'RESTORE FAILED: DATA:LENG' in out
+    assert 'known firmware defect' not in out
+
+
+# ── section 4: dry-run ───────────────────────────────────────────────────────
+
+
+def test_dry_run_phase_c_lists_the_pulser_commands_and_adjusts_never_sent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_sockets(monkeypatch)
+    assert hw_probe.main(['--dry-run', '--phase', 'C', '--pulse-v', '20']) == 0
+    out = capsys.readouterr().out
+    lines = [line.strip() for line in out.splitlines()]
+    assert out.splitlines()[0].startswith('DRY RUN, phase C')
+    for number in ('10', '10b', '11'):
+        assert f'STEP {number}:' in out
+    assert 'STEP 13:' not in out
+    assert out.count('TRAN:ENAB ON') == 5 + 1  # five pulses and the NEVER SENT line
+    on_lines = [x for x in lines if x.startswith('TRAN:ENAB ON')]
+    assert len(on_lines) == 5
+    for i, line in enumerate(lines):
+        if line.startswith('TRAN:ENAB ON'):
+            assert any(x.startswith('TRAN:ENAB OFF') for x in lines[i : i + 8])
+    assert any(
+        x.startswith('TRAN:PULS 20 V') and 'only if TRAN:PULS? differs from --pulse-v' in x
+        for x in lines
+    )
+    for cmd in (
+        'DATA:LENG 8192',
+        'FREQ 1 MHZ',
+        'TRIG:INT 100 MS',
+        'TRAN:FREQ 50 KHZ',
+        'AVER:COUN 4',
+        'TRIG:DEL 1000 US',
+        'TRIG:DEL 2000 US',
+    ):
+        assert cmd in lines
+    never = next(x for x in lines if x.startswith('NEVER SENT'))
+    assert 'TRAN:ENAB ON outside' in never
+    assert '*RST' in never
+    assert '/config' in never
+    assert out.index('STEP 10:') > out.index('PULSER-OFF CHECK')
+    assert out.index('TEARDOWN') > out.index('STEP 11:')
+    assert 'FINAL DIFF' in out
+
+
+def test_dry_run_phase_rst_lists_rst_once_and_adjusts_never_sent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_sockets(monkeypatch)
+    assert hw_probe.main(['--dry-run', '--phase', 'RST', '--allow-rst']) == 0
+    out = capsys.readouterr().out
+    lines = [line.strip() for line in out.splitlines()]
+    assert out.splitlines()[0].startswith('DRY RUN, phase RST')
+    assert 'STEP 13:' in out
+    assert len([x for x in lines if x.startswith('*RST')]) == 1
+    assert not [x for x in lines if x.startswith('TRAN:ENAB ON')]
+    never = next(x for x in lines if x.startswith('NEVER SENT'))
+    assert 'TRAN:ENAB ON' in never
+    assert '*RST is sent once' in never
+    assert 'STEP 10:' not in out
+    assert out.index('PULSER-OFF CHECK') < out.index('STEP 13:') < out.index('TEARDOWN')
+
+
+def test_dry_run_of_the_old_phases_keeps_the_old_never_sent_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for phase in ('A', 'B', 'AB'):
+        assert hw_probe.main(['--dry-run', '--phase', phase]) == 0
+        out = capsys.readouterr().out
+        assert 'NEVER SENT: TRAN:PULS writes, *RST, anything to /config/ (refused in code).' in out
+
+
+def _plan_commands(blocks: list[tuple[str, list[str]]], first: str, last: str) -> list[str]:
+    """Commands of the plan blocks from heading `first` to the one before `last`, no prose."""
+    names = [h for h, _c in blocks]
+    start = next(i for i, h in enumerate(names) if h.startswith(first))
+    stop = next(i for i, h in enumerate(names) if h.startswith(last))
+    commands = [c for _h, cs in blocks[start:stop] for c in cs]
+    commands = [c for c in commands if 'only if TRAN:PULS? differs' not in c]
+    commands = [c for c in commands if not c.startswith('read ')]
+    return [c.split('   (')[0] for c in commands]
+
+
+def test_dry_run_phase_c_matches_what_the_fake_run_sends(tmp_path: Path) -> None:
+    args = hw_probe.build_parser().parse_args(['--phase', 'C', '--pulse-v', '20'])
+    planned = _plan_commands(hw_probe.plan('C', args), 'PREPARATION', 'TEARDOWN')
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    start = fake.log.index('DATA:LENG 8192') - 1  # the error-queue drain before the setup
+    last_stop = max(i for i, c in enumerate(fake.log) if c == 'STOP')
+    sent = fake.log[start : last_stop - 1]  # up to tearDown's first OFF
+    assert planned == sent
+
+
+def test_dry_run_phase_c_with_a_different_voltage_matches_too(tmp_path: Path) -> None:
+    args = hw_probe.build_parser().parse_args(['--phase', 'C', '--pulse-v', '15'])
+    planned = [
+        c
+        for c in hw_probe.plan('C', args)[
+            next(
+                i
+                for i, (h, _c) in enumerate(hw_probe.plan('C', args))
+                if h.startswith('PREPARATION')
+            )
+        ][1]
+    ]
+    fake = _c_fake()
+    argv = ['--fake', '--phase', 'C', '--pulse-v', '15', '--out', str(tmp_path)]
+    assert hw_probe.main(argv, fake=fake) == 0
+    start = fake.log.index('DATA:LENG 8192') - 1
+    cut = start + len([c for c in planned])
+    assert [c.split('   (')[0] for c in planned] == fake.log[
+        start:cut
+    ]  # conditional lines included
+
+
+def test_dry_run_phase_rst_matches_what_the_fake_run_sends(tmp_path: Path) -> None:
+    args = hw_probe.build_parser().parse_args(['--phase', 'RST', '--allow-rst'])
+    planned = _plan_commands(hw_probe.plan('RST', args), 'STEP 13', 'TEARDOWN')
+    fake = _power_on_like()
+    assert hw_probe.main(_rst_args(tmp_path), fake=fake) == 0
+    start = fake.log.index('*RST')
+    last_stop = max(i for i, c in enumerate(fake.log) if c == 'STOP')
+    assert planned == fake.log[start : last_stop - 1]
+
+
+@pytest.mark.parametrize('phase', ['C', 'RST'])
+def test_dry_run_teardown_of_phases_c_and_rst_matches_what_the_fake_run_sends(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], phase: str
+) -> None:
+    extra = ['--pulse-v', '20'] if phase == 'C' else ['--allow-rst']
+    assert hw_probe.main(['--dry-run', '--phase', phase, *extra]) == 0
+    planned = _teardown_block(capsys.readouterr().out)
+    fake = _c_fake()
+    assert (
+        hw_probe.main(['--fake', '--phase', phase, '--out', str(tmp_path), *extra], fake=fake) == 0
+    )
+    sent = fake.log[max(i for i, c in enumerate(fake.log) if c == 'STOP') - 1 :]
+    skipped = planned.index('AVER:DEL:CONS <snapshot value>')
+    planned = planned[:skipped] + planned[skipped + 2 :]
+    assert [c.split(' ')[0] for c in planned] == [c.split(' ')[0] for c in sent]
+
+
+@pytest.mark.parametrize('phase', ['C', 'RST'])
+def test_commands_sent_by_phases_c_and_rst_are_all_in_the_plan(tmp_path: Path, phase: str) -> None:
+    extra = ['--pulse-v', '15'] if phase == 'C' else ['--allow-rst']
+    args = hw_probe.build_parser().parse_args(['--phase', phase, *extra])
+    fake = _c_fake()
+    assert (
+        hw_probe.main(['--fake', '--phase', phase, '--out', str(tmp_path), *extra], fake=fake) == 0
+    )
+    planned = {
+        _header_key(c)
+        for _h, cs in hw_probe.plan(phase, args)
+        for c in cs
+        if not c.startswith('raw socket')
+    }
+    assert {_header_key(c) for c in fake.log} <= planned
+
+
+# ── existing phases are untouched ────────────────────────────────────────────
+
+
+def test_existing_phases_never_send_a_pulser_on_or_a_voltage(tmp_path: Path) -> None:
+    for phase in ('A', 'B', 'AB'):
+        fake = FakeA1580Resource()
+        assert (
+            hw_probe.main(['--fake', '--phase', phase, '--out', str(tmp_path / phase)], fake=fake)
+            == 0
+        )
+        assert 'ON' not in [c.split(' ')[-1] for c in _enab_writes(fake.log)]
+        assert not [c for c in fake.log if c.startswith('TRAN:PULS ') or c.startswith('*RST')]
+
+
+def test_phase_ab_with_the_fake_flag_alone_still_works(tmp_path: Path) -> None:
+    assert hw_probe.main(['--fake', '--phase', 'AB', '--out', str(tmp_path)]) == 0
+
+
+def test_phase_c_with_the_fake_flag_alone_uses_the_transmission_fake(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(_c_args(tmp_path)) == 0
+    assert 'WARNING: no signal' not in capsys.readouterr().out

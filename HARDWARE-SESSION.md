@@ -57,11 +57,15 @@ Phase C, pulser on at the agreed voltage, transducer as confirmed:
 10. `TRAN:PULS 20 V`, `TRAN:FREQ` at the transducer's frequency, `TRAN:ENAB ON`,
     acquire 10 packets. Where is the main bang in time? That fixes time zero and what
     `TRIG:DEL` shifts (unknown "time base").
+    Run as `tools/hw_probe.py --phase C --pulse-v 20` (steps 10 and 10b of the tool).
 11. `TRIG:DEL 0 NS` vs `TRIG:DEL 5 US`: does the echo move by 5 us?
+    Step 11 of the same invocation (`--phase C`) measures it for `TRIG:DEL` 0 NS, 1000 US and 2000 US.
 12. Count-to-volt scaling (unknown 2): with a known signal source if available, otherwise
     skip and record "not measured".
+    Deferred on 2026-10-05 (signal generator available later).
 13. `*RST`: query all `STATE_HEADERS` again and diff against the documented defaults
     (unknown 14). Then restore the saved setup and verify by read-back.
+    Run as `tools/hw_probe.py --phase RST --allow-rst`.
 
 Phase D, cleanup:
 14. Restore the saved setup, `TRAN:ENAB OFF`, `STOP`, close. Verify by read-back that the
