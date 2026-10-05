@@ -12,7 +12,8 @@ whatever is not listed there still comes from the vendor material (see PROTOCOL.
 count-to-volt (experiment 12, deferred).**
 
 **Safety: after power-on this firmware has the pulser ENABLED at 20 V (`TRAN:ENAB?` -> `1`) until `TRAN:ENAB OFF` is
-sent; settings are volatile and a power cycle brings that state back (measured 2026-10-05, fw 1.16). Switch the
+sent, so the first `STAR AUTO` fires it. Whether it already emits pulses before any `STAR AUTO` is not measured, so
+treat the OUT connector as live. Settings are volatile and a power cycle brings that state back (measured 2026-10-05, fw 1.16). Switch the
 pulser off before connecting anything to the OUT connector. The plug's `tearDown` and `tools/hw_probe.py` do this,
 the device itself does not. After power-on set `DATA:LENG` to a value from 1024 to 36864 before acquiring: the
 power-on value 114688 gives partly invalid packets (entry 13 below).**
@@ -149,6 +150,10 @@ The example and `vendor_example.yaml` use 20 V, not the vendor example's 100 V.
 The A-scans are not available over SCPI. They stream on a second TCP connection to the port that `DATA:PORT?`
 returns. The plug opens that connection first, then sends `STAR AUTO`; `STOP` ends the stream. The plug has no
 single-shot mode: `acquire(n)` starts the stream, keeps `n` packets and stops.
+
+**One SCPI client at a time.** As soon as a second connection to port 5025 is accepted, the device closes the first
+one (measured 2026-10-05, fw 1.16). Any second client (another script, a monitoring tool) closes the running one. The
+data port is not affected.
 
 A packet is a 28-byte header (struct `'<4s3IH2B6B2B'`, magic `FtH1`) followed by `DATA:LENG` little-endian
 int16 samples, so it is `28 + 2 * DATA:LENG` bytes. TCP does not keep packet boundaries, so `stream.FrameReader`
@@ -289,9 +294,11 @@ for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); tha
     measured 2026-10-05, fw 1.16
     measured 2026-10-05, fw 1.16
 
-Also seen once: the main SCPI connection died right after a second connection to port 5025 had been opened, queried
-and closed (the next query on the first one timed out, later writes failed with a broken pipe; a new connection
-worked at once). One client at a time, and the tool runs its second-connection experiment last on its own connection.
+Second SCPI connection (4 trials, 4 of 4): connection A to port 5025 is open and answers queries; as soon as a second
+connection B to port 5025 is accepted, the device closes A (the client's next `recv` returns 0 bytes, later sends fail
+with a broken pipe; with pyvisa this showed up as a timeout). No traffic on B is needed; closing B does not bring A
+back; B works normally; a new connection afterwards works at once; no error is queued. The data port (2758) does not
+have this effect on the SCPI connection. The tool runs its second-connection experiment last on its own connection.
 measured 2026-10-05, fw 1.16
 
 Vendor statements contradicted by the device (A and B numbers are entries of the owner's local ticket list, see above):
@@ -317,15 +324,16 @@ Vendor statements contradicted by the device (A and B numbers are entries of the
   `length_hi` are undocumented: a 24-bit "samples + 16" (entry 12, B3).
 - Error queue depth and overflow are undocumented: 16 entries, then `-350,"Queue overflow"` (A13).
 - Not a contradiction but undocumented: an input buffer of a few hundred bytes (between 160 and about 320; commands
-  that do not fit are discarded with `-363`, A1), a second connection to port 5025 kills the first (A2), packets still
+  that do not fit are discarded with `-363`, A1), a second connection to port 5025 closes the first (A2), packets still
   arrive after `STOP` and the socket stays open (B4), a setting can be changed while streaming (B5), a data connection
   does not disturb the SCPI one (B6).
 
 Not measured: whether `*RST` stops a running acquisition or clears the error queue; count-to-volt
 scaling (experiment 12, deferred); whether `TRIG:DEL` is in nanoseconds (only seen not to move the signal); how the
 16 acquisitions of an averaged packet are spaced (an averaged packet took about 3 trigger intervals); whether
-`MEM:CLEar` removes the stale bytes after a change of `DATA:LENG`; which of opening or closing a
-second connection kills the first; the exact input-buffer size; the wrap of `packet_number` (the header field is one
+`MEM:CLEar` removes the stale bytes after a change of `DATA:LENG`; whether the pulser emits pulses while `TRAN:ENAB`
+is 1 but no `STAR AUTO` has been sent (after power-on; measured only: with `TRAN:ENAB ON`, `STAR AUTO` produced a
+received signal, with `TRAN:ENAB OFF` it did not); the exact input-buffer size; the wrap of `packet_number` (the header field is one
 byte) and whether `ctp[0]` goes on past 255; whether the automatic `AVER:DEL:CONS` offset of 70.75 us depends on
 `FREQ`; whether errors queue again after the queue was read once while it was full; settling times; everything with another
 transducer pair, voltage or sample rate: phase C used one pair of 50 kHz transducers, 20 V, `FREQ 1 MHZ`.
@@ -362,7 +370,7 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
   at the first sample and nothing more is claimed.
 - **`*RST` defaults.** Settled on fw 1.16 (measured 2026-10-05): `*RST` resets nothing, neither to the `DEFault`
   column nor to the power-on state (entry 18). The plug never sends `*RST` on its own and `apply_capture` does not
-  reset by default. To get the power-on state, power-cycle the device, and remember that the pulser is then on.
+  reset by default. To get the power-on state, power-cycle the device, and remember that the pulser is then enabled.
   Whether `*RST` stops a running acquisition or clears the error queue is not tested.
 - **Reply formats.** Settled on 2026-10-05, fw 1.16: booleans come back as `0`/`1`, enumerations as the mixed-case
   notation (`MASTer`, `INTernal`), times as shortest decimals (`2e-06`); see the section above. `values_match`

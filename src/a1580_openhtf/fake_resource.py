@@ -238,9 +238,12 @@ class FakeA1580Resource:
         # up to ten 16-byte lines (160 bytes) were all processed, so the limit is an input
         # buffer size between 160 and about 320 bytes, not pacing. The fake cannot see
         # bursts; it models only a single line longer than 256 bytes (the 256 is a guess).
-        # measured 2026-10-05, fw 1.16: opening, querying and closing a second connection
-        # to port 5025 killed the first one (seen once, open or close not isolated). The
-        # fake has one resource and no client count: not modelled yet.
+        # measured 2026-10-05, fw 1.16 (4 trials, 4 of 4): as soon as a second connection to
+        # port 5025 is accepted the device closes the first (next recv returns 0 bytes, later
+        # sends fail with a broken pipe); no traffic on the second one is needed, closing it
+        # does not bring the first back, no error is queued, a new connection works at once.
+        # The data port does not have this effect. The fake has one resource and no client
+        # count: not modelled yet.
         self.log.append(cmd)
         if len(cmd.encode(self.encoding, errors='replace')) > _MAX_LINE:
             self._queue_error('-363,"Input buffer overrun"')
