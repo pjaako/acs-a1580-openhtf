@@ -8,9 +8,16 @@ import struct
 import numpy as np
 import pytest
 
-from a1580_openhtf.fake_resource import DEFAULTS, FakeA1580Resource
+from a1580_openhtf.fake_resource import DEFAULTS, POWER_ON, FakeA1580Resource
 from a1580_openhtf.plug import STATE_HEADERS, normalize_header
-from a1580_openhtf.stream import HEADER_SIZE, FrameReader, packet_size, parse_header
+from a1580_openhtf.stream import (
+    HEADER_SIZE,
+    FrameReader,
+    build_packet,
+    packet_size,
+    parse_header,
+    split_packets,
+)
 
 ERR = 'SYSTem:ERRor?'
 
@@ -38,7 +45,7 @@ def test_vendor_reply_formats() -> None:
     assert fake.query('*IDN?') == 'ACS-Solutions GmbH,A1580-HF,100500,1.16 (861f022a)'
     assert fake.query('FREQ?') == '100000000'
     assert fake.query('DATA:PORT?') == '2758'
-    assert fake.query('TRIG:INT?') == '10.0E-3'
+    assert fake.query('TRIG:INT?') == '0.01'
     assert fake.query('TRIG:DEL?') == '15000'
     assert fake.query('*OPC?') == '1'
     assert fake.query('*TST?') == '0'
@@ -51,11 +58,11 @@ def test_vendor_reply_formats() -> None:
         ('FREQ 50 MHZ', 'FREQ?', '50000000'),
         ('SOURce:FREQuency 2500 KHz', 'FREQ?', '2500000'),
         ('TRAN:FREQ 2500 KHz', 'TRAN:FREQ?', '2500000'),
-        ('TRIG:INT 100000 US', 'TRIG:INT?', '100.0E-3'),
-        ('TRIG:INT 2 MS', 'TRIG:INT?', '2.0E-3'),
+        ('TRIG:INT 100000 US', 'TRIG:INT?', '0.1'),
+        ('TRIG:INT 2 MS', 'TRIG:INT?', '0.002'),
         ('TRIG:DEL 15 US', 'TRIG:DEL?', '15000'),
         ('TRIG:DEL 0 NS', 'TRIG:DEL?', '0'),
-        ('AVERage:DELay:RANDom 2000 NS', 'AVER:DEL:RAND?', '2.0E-6'),
+        ('AVERage:DELay:RANDom 2000 NS', 'AVER:DEL:RAND?', '2e-06'),
         ('TRAN:PULS 100 V', 'TRAN:PULS?', '100'),
         ('TRANsmitter:PULSe:LEVel 35 V', 'TRAN:PULS?', '35'),
         ('GAIN 10', 'GAIN?', '10'),
@@ -211,11 +218,11 @@ def test_constant_delay_while_auto_is_221() -> None:
     assert fake.query('AVER:DEL:CONS:AUTO?') == '1'
     fake.write('AVER:DEL:CONS 50 US')
     assert _drain(fake) == ['-221,"Settings conflict"']
-    assert fake.query('AVER:DEL:CONS?') == '10.0E-6'  # old value kept
+    assert fake.query('AVER:DEL:CONS?') == '1e-05'  # old value kept
     fake.write('AVER:DEL:CONS:AUTO OFF')
     fake.write('AVER:DEL:CONS 50 US')
     assert _drain(fake) == []
-    assert fake.query('AVER:DEL:CONS?') == '50.0E-6'
+    assert fake.query('AVER:DEL:CONS?') == '5e-05'
 
 
 def test_reject_queues_the_error_and_keeps_the_value() -> None:
@@ -270,6 +277,8 @@ def test_socket_is_silent_until_start_and_after_stop() -> None:
     assert len(sock.recv(65536)) == packet_size(1024)
     fake.write('STOP')
     assert not fake.started and fake.stop_count == 1
+    for _ in range(2):  # the two packets in flight (measured 2026-10-05, fw 1.16)
+        assert len(sock.recv(65536)) == packet_size(1024)
     with pytest.raises(socket.timeout):
         sock.recv(100)
 
@@ -308,13 +317,13 @@ def test_generator_burst_shape_gain_and_header() -> None:
     assert not raw0[: start + 1].any()  # silent before the burst
     assert raw0[start + 1 : start + 40].any()
     assert abs(int(raw0[start + 5 :].min())) < 2000  # 0 dB: amplitude 1000 counts
-    assert parse_header(p0).ascan_count == 0
+    assert parse_header(p0).ascan_count == 1
     fake.write('GAIN 20')
     fake.write('AVER:COUN 3')
     (p1,) = _read(fake, 1)
     raw1 = np.frombuffer(p1, dtype='<i2', offset=HEADER_SIZE)
     assert int(np.abs(raw1).max()) > 5 * int(np.abs(raw0).max())  # 20 dB is a factor 10
-    assert parse_header(p1).ascan_count == 3
+    assert parse_header(p1).ascan_count == 1  # measured: AVER:COUN does not show in the header
 
 
 def test_generator_is_deterministic_and_clips() -> None:
@@ -347,9 +356,7 @@ def test_packet_numbers_increment_and_wrap_at_256() -> None:
     fake.write('STAR AUTO')
     packets = _read(fake, 300)
     numbers = [parse_header(p).packet_number for p in packets]
-    assert numbers[:3] == [0, 1, 2]
-    assert numbers[255:258] == [255, 0, 1]
-    assert numbers == [i % 256 for i in range(300)]
+    assert numbers == [(2 + i) % 256 for i in range(300)]  # first one is 2: measured once
 
 
 @pytest.mark.parametrize('chunk', [1, 7, 25])
@@ -362,7 +369,8 @@ def test_chunk_limits_recv(chunk: int) -> None:
     assert sizes[0] == chunk
     # whole packets still come out in order through the reader
     packets = FrameReader(fake.data_socket_factory('h', 1), 16).read(3, 5.0)
-    assert [parse_header(p).packet_number for p in packets] == [0, 1, 2]
+    first = parse_header(packets[0]).packet_number  # the counter belongs to the resource
+    assert [parse_header(p).packet_number for p in packets] == [first, first + 1, first + 2]
 
 
 def test_garbage_prefix_comes_once_before_the_first_packet() -> None:
@@ -384,6 +392,167 @@ def test_packet_layout_is_the_documented_one() -> None:
     (packet,) = _read(fake, 1)
     assert packet[:4] == b'FtH1'
     assert len(packet) == struct.calcsize('<4s3IH2B6B2B') + 8
+
+
+# ── measured 2026-10-05, fw 1.16 (phase A and B) ─────────────────────────────
+
+
+def test_error_queue_holds_16_then_queue_overflow_and_drops_the_rest() -> None:
+    fake = FakeA1580Resource()
+    counts = []
+    for i in range(40):
+        fake.write(f'ZZZ:X{i:02d}')
+        counts.append(fake.query('SYST:ERR:COUN?'))
+    assert counts == [str(min(i, 17)) for i in range(1, 41)]
+    errors = _drain(fake)
+    assert len(errors) == 17
+    assert errors[0] == '-113,"Undefined header;ZZZ:X00"'
+    assert errors[15] == '-113,"Undefined header;ZZZ:X15"'
+    assert errors[16] == '-350,"Queue overflow"'
+    assert fake.query('SYST:ERR:COUN?') == '0'
+
+
+def test_cls_clears_a_full_queue() -> None:
+    fake = FakeA1580Resource()
+    for _ in range(20):
+        fake.write('ZZZ:X')
+    fake.write('*CLS')
+    assert fake.query('SYST:ERR:COUN?') == '0'
+    fake.write('ZZZ:X')
+    assert fake.query('SYST:ERR:COUN?') == '1'
+
+
+@pytest.mark.parametrize(
+    'cmd', ['DATA:LENG 114688', 'FREQ banana', 'MODE BANANA', 'TRAN:ENAB MAYBE']
+)
+def test_an_illegal_parameter_is_224_and_keeps_the_old_value(cmd: str) -> None:
+    fake = FakeA1580Resource()
+    header = cmd.split()[0]
+    before = fake.query(f'{header}?')
+    fake.write(cmd)
+    assert _drain(fake) == ['-224,"Illegal parameter value"']
+    assert fake.query(f'{header}?') == before
+
+
+def test_data_leng_1024_is_accepted_after_power_on_but_its_own_value_is_refused() -> None:
+    fake = FakeA1580Resource(power_on=True)
+    assert fake.query('DATA:LENG?') == '114688'
+    fake.write('DATA:LENG 1024')
+    assert _drain(fake) == []
+    fake.write('DATA:LENG 114688')
+    assert _drain(fake) == ['-224,"Illegal parameter value"']
+    assert fake.query('DATA:LENG?') == '1024'
+
+
+def test_power_on_state_has_the_pulser_on_and_rst_goes_to_the_vendor_defaults() -> None:
+    fake = FakeA1580Resource(power_on=True)
+    for header in ('TRAN:ENAB', 'TRAN:TYPE', 'TRIG:INT', 'AVER:DEL:CONS', 'GAIN:TGC:LIN'):
+        assert fake.query(f'{header}?') == POWER_ON[header]
+    assert (fake.query('TRAN:ENAB?'), fake.query('TRAN:TYPE?')) == ('1', 'DUAL')
+    assert (fake.query('TRIG:INT?'), fake.query('AVER:DEL:CONS?')) == ('1', '0.99992925')
+    fake.write('*RST')
+    assert (fake.query('TRAN:ENAB?'), fake.query('DATA:LENG?')) == ('0', '1024')
+    assert FakeA1580Resource().query('TRAN:ENAB?') == '0'  # opt-in: the default fake is as before
+
+
+@pytest.mark.parametrize(
+    ('cmd', 'query', 'reply'),
+    [
+        ('TRIG:INT 1000000 US', 'TRIG:INT?', '1'),
+        ('TRIG:INT 10 MS', 'TRIG:INT?', '0.01'),  # extrapolated format, not measured
+        ('TRIG:INT 10 US', 'TRIG:INT?', '1e-05'),
+        ('AVER:DEL:RAND 2000 NS', 'AVER:DEL:RAND?', '2e-06'),
+        ('TRIG:INT 2 S', 'TRIG:INT?', '2'),
+    ],
+)
+def test_seconds_replies_are_the_shortest_decimal(cmd: str, query: str, reply: str) -> None:
+    fake = FakeA1580Resource()
+    fake.write(cmd)
+    assert fake.query(query) == reply
+
+
+def test_a_line_over_256_bytes_is_an_input_buffer_overrun_and_discarded() -> None:
+    fake = FakeA1580Resource()
+    fake.write('GAIN:TGC:ARB ' + ','.join(['1'] * 130))
+    assert fake.query('GAIN:TGC:ARB?') == DEFAULTS['GAIN:TGC:ARB']
+    assert _drain(fake) == ['-363,"Input buffer overrun"']
+    fake.write('GAIN 3')  # the link stays usable
+    assert fake.query('GAIN?') == '3'
+
+
+def _noise_std(fake: FakeA1580Resource) -> float:
+    fake.write('STAR AUTO')
+    stds = [np.frombuffer(p, dtype='<i2', offset=HEADER_SIZE).std() for p in _read(fake, 10)]
+    return float(np.mean(stds))
+
+
+def test_averaging_is_a_mean_over_2_to_the_n_and_the_header_does_not_show_it() -> None:
+    fake = FakeA1580Resource(signal='noise', length=4096)
+    base = _noise_std(fake)
+    (p,) = _read(fake, 1)
+    raw = np.frombuffer(p, dtype='<i2', offset=HEADER_SIZE)
+    assert 8 < raw.mean() < 14  # offset about +11 counts
+    assert 3.0 < base < 4.2  # std about 3.6 counts
+    fake.write('AVER:COUN 4')
+    assert 0.2 < _noise_std(fake) / base < 0.32  # 1/sqrt(16) = 0.25 (measured 0.26)
+    assert {parse_header(p).ascan_count for p in _read(fake, 3)} == {1}
+
+
+def test_header_length_fields_and_telemetry_as_measured() -> None:
+    fake = FakeA1580Resource(length=1024)
+    fake.write('STAR AUTO')
+    (packet,) = _read(fake, 1)
+    header = parse_header(packet)
+    assert len(packet) == 2076
+    assert (header.length_lo, header.length_hi) == (1040, 0)
+    assert (header.telemetry_a, header.telemetry_b, header.telemetry_c) == (120, 86, 52)
+    assert (header.buffer_fill, header.is_full, header.ascan_count) == (0, 0, 1)
+
+
+def test_a_real_packet_header_parses_and_frames_whatever_length_lo_says() -> None:
+    # the exact header values of a packet measured on the device (2076 bytes)
+    packet = build_packet(
+        [11] * 1024,
+        packet_number=2,
+        length_lo=1040,
+        length_hi=0,
+        telemetry_a=120,
+        telemetry_b=86,
+        telemetry_c=52,
+        ascan_count=1,
+    )
+    assert len(packet) == 2076
+    assert parse_header(packet).length_lo == 1040
+    buffer = bytearray(packet + packet[:100])
+    assert split_packets(buffer, 1024) == [packet]  # framing uses DATA:LENG, not length_lo
+
+
+def test_stop_delivers_the_two_packets_in_flight_then_idles_without_closing() -> None:
+    fake = FakeA1580Resource(length=16)
+    sock = fake.data_socket_factory('h', 1)
+    fake.write('STAR AUTO')
+    sock.recv(65536)
+    fake.write('STOP')
+    assert len(sock.recv(65536)) == packet_size(16)
+    assert len(sock.recv(65536)) == packet_size(16)
+    for _ in range(3):
+        with pytest.raises(socket.timeout):
+            sock.recv(65536)
+    assert not sock.closed
+    fake.write('STAR AUTO')  # and the stream can be started again
+    assert len(sock.recv(65536)) == packet_size(16)
+
+
+def test_a_socket_connected_after_star_auto_receives_data_and_numbers_do_not_restart() -> None:
+    fake = FakeA1580Resource(length=16)
+    fake.write('STAR AUTO')
+    first = FrameReader(fake.data_socket_factory('h', 1), 16).read(3, 1.0)
+    fake.write('STOP')
+    fake.write('STAR AUTO')
+    second = FrameReader(fake.data_socket_factory('h', 1), 16).read(3, 1.0)
+    numbers = [parse_header(p).packet_number for p in first + second]
+    assert numbers[0] == 2  # measured once after power-on: nothing may rely on the value
+    assert numbers == list(range(numbers[0], numbers[0] + 6))
 
 
 # ── unknown nodes, visa errors, flush ────────────────────────────────────────

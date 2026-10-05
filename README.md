@@ -4,9 +4,15 @@ OpenHTF plug for the ACS A1580 ultrasonic pulser-receiver. Ethernet only: SCPI o
 A-scan stream on a second TCP port. Built on PyVISA + pyvisa-py for SCPI and a plain socket for the stream.
 Sibling of [rigol-dho-openhtf](https://github.com/pjaako/rigol-dho-openhtf): same concept, different instrument.
 
-**Status: pre-hardware. Nothing below has been verified on a real A1580 yet; every fact comes from the vendor's
-a1580_examples repository (see PROTOCOL.md). This section will be rewritten with dated measurements after the
-first hardware session.**
+**Status: hardware phases A and B are done (2026-10-05, firmware 1.16 (861f022a), one A1580-HF): read-only queries,
+the error queue, and acquisition with the pulser off and nothing connected. The results are in "Measured on the
+device" below; whatever is not listed there still comes from the vendor material (see PROTOCOL.md). Phase C
+(pulser on, a signal connected) is pending.**
+
+**Safety: after power-on this firmware has the pulser ENABLED at 20 V (`TRAN:ENAB?` -> `1`) until `TRAN:ENAB OFF` is
+sent; settings are volatile and a power cycle brings that state back (measured 2026-10-05, fw 1.16). Switch the
+pulser off before connecting anything to the OUT connector. The plug's `tearDown` and `tools/hw_probe.py` do this,
+the device itself does not.**
 
 ```python
 import openhtf as htf
@@ -150,9 +156,12 @@ exact packets. Changing `DATA:LENG` or `FREQ` while the stream runs is not suppo
 
 ## Measured on the device (2026-10-05, firmware 1.16 (861f022a))
 
-Phase A of `HARDWARE-SESSION.md` (read-only queries, pulser not touched by the tool), on one A1580-HF. Lines were
+Phases A and B of `HARDWARE-SESSION.md` (A: read-only queries, pulser not touched by the tool; B: acquisition), on one
+A1580-HF. Lines were
 sent to TCP 5025 with `\r\n`; replies are shown without the trailing `\r\n`. The serial number is written
-`<serial>`. VENDOR-ISSUES.md holds the same facts as tickets for the vendor (entries A1 to A12).
+`<serial>`. Phase B (entries 6 to 9 and later) ran with the pulser off, nothing connected to IN/OUT, `DATA:LENG 1024`,
+`FREQ 100 MHZ`, `TRIG:MODE INT`, `TRIG:INT 10 MS`, data port 2758. The project owner keeps the same facts as tickets
+for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); that file is not part of the repository.
 
 1. **Identity.** `*IDN?` -> `ACS-Solutions GmbH,A1580-HF,<serial>,1.16 (861f022a)` (the firmware field contains a
    space and brackets), `SYST:VERS?` -> `1999.0`, `SYST:ERR:COUN?` -> `0`. measured 2026-10-05, fw 1.16
@@ -170,18 +179,50 @@ sent to TCP 5025 with `\r\n`; replies are shown without the trailing `\r\n`. The
 4. **Terminator.** A query ended with a bare `\n` is answered; the reply still ends `\r\n`. measured 2026-10-05,
    fw 1.16
 5. **Error queue.** `ZZZ:NOPE 1` then `SYST:ERR?` twice -> `-113,"Undefined header;ZZZ:NOPE 1"`, then `0,"No error"`
-   (the whole line as sent, no `Command: ` prefix, no space after the comma of the empty reply). 25 lines
-   `ZZZ:NOPE01` to `ZZZ:NOPE25` written back to back without a read, then `SYST:ERR:COUN?`: the query was never
-   answered (5 s timeout); the queue then held exactly two entries, `-113,"Undefined header;ZZZ:NOPE01"` and
-   `-363,"Input buffer overrun"`, and the connection stayed usable. So the device does not keep up with writes that
-   are not read back one by one. measured 2026-10-05, fw 1.16
+   (the whole line as sent, no `Command: ` prefix, no space after the comma of the empty reply). Depth: 40 undefined
+   headers sent one at a time with `SYST:ERR:COUN?` after each: the count went 1 to 16, then 17 and stayed 17;
+   draining gave 16 entries `-113,"Undefined header;<line>"` (the first 16 sent) and, as 17th and last, `-350,"Queue
+   overflow"`; later errors are dropped. Input buffer: 25 lines `ZZZ:NOPE01` to `ZZZ:NOPE25` written back to back
+   without a read (about 320 bytes), then `SYST:ERR:COUN?`: the first line was processed, the queue got
+   `-363,"Input buffer overrun"`, the rest was discarded and the query was never answered (5 s timeout); the connection
+   stayed usable. Bursts of 2, 3, 5 and 10 undefined 16-byte lines written with no gap and no read were all processed
+   and the following `SYST:ERR:COUN?` answered, so this is an input-buffer size limit somewhere between 160 and about
+   320 bytes, not a pacing problem. measured 2026-10-05, fw 1.16
+6. **Acquisition, `AVER:COUN 0`** (pulser off, `DATA:LENG 1024`, `FREQ 100 MHZ`, `TRIG:MODE INT`, `TRIG:INT 10 MS`).
+   10 packets, interval 10.0 ms. Each packet 2076 bytes (28 + 2 * 1024), arrived as one `recv` chunk.
+   `packet_number` increments by 1; the first packet after `STAR AUTO` had number 2 and the numbering went on across
+   `STOP`/`STAR AUTO` (2 to 11, then 12 to 21 in the next acquisition). Header: `length_lo` 1040, `length_hi` 0 (not
+   1024), `ascan_count` 1, `buffer_fill` 0, `is_full` 0, telemetry bytes 120, 86, 52. Samples between -2 and 25
+   counts, standard deviation 3.59 counts, so a DC offset of about +11 counts on an open input. measured 2026-10-05,
+   fw 1.16
+7. **Acquisition, `AVER:COUN 4`.** Same header values, `ascan_count` still 1, interval still 10.0 ms; samples 7 to 14,
+   standard deviation 0.94 counts. Ratio 0.26, close to 1/4: a mean over 2^4 = 16 acquisitions (the count is an
+   exponent), assuming uncorrelated noise. measured 2026-10-05, fw 1.16
+8. **`STOP` and the data socket.** 8a: `STOP` with the data socket open: two more packets within 20 ms, then idle; the
+   device does not close the socket; error queue empty. 8b: a data socket connected after `STAR AUTO` receives
+   packets (the first after 20 ms). Both orders work. measured 2026-10-05, fw 1.16
+9. **Change while streaming.** `GAIN 6` during `STAR AUTO`: no error, `GAIN?` -> `6`, the stream goes on with the same
+   packet size. The data connection does not disturb the SCPI connection (five data connections in one SCPI
+   session), unlike a second connection to port 5025. measured 2026-10-05, fw 1.16
+10. **Power cycle.** All settings came back to the values first found, `TRAN:ENAB?` -> `1` although `0` had been set
+    before the power cycle. Power-on state: pulser on at 20 V, `TRAN:TYPE DUAL`, `TRIG:INT` 1 s, `DATA:LENG` 114688.
+    Settings are volatile. measured 2026-10-05, fw 1.16
+11. **Restore.** The device accepted these writes without error and read them back equal: `FREQ 100 MHZ`, `MODE
+    MASTer`, `TRAN:TYPE DUAL`, `TRAN:REV 0`, `TRAN:FREQ 5000 KHZ`, `TRAN:DUR 1`, `TRAN:GAP 5 NS`, `TRAN:DAMP 0`,
+    `TRAN:DAMP:GAP 10 NS`, `TRAN:IMP HIGH`, `TRIG:MODE INTernal`, `TRIG:INT 1000000 US` (reads back `1`), `TRIG:DEL
+    15000 NS`, `GAIN 0`, `GAIN:PRE:COMB 0`, `GAIN:PRE:SPLIT 0`, `GAIN:TGC:LIN 0,0`, `GAIN:TGC:MODE OFF`, `AVER:COUN 0`,
+    `AVER:DEL:CONS:AUTO 1`, `AVER:DEL:RAND 2000 NS` (reads back `2e-06`), `FILT:HPAS:IND 0`. So the plug's unit tables
+    are confirmed for these headers. The one failure: `DATA:LENG 114688` (the power-on value) ->
+    `-224,"Illegal parameter value"`, the value stays 1024. The real upper limit is not measured. A plug restore of
+    a snapshot taken after power-on therefore fails for `DATA:LENG` (`set_state` reports it and goes on).
+    measured 2026-10-05, fw 1.16
 
 Also seen once: the main SCPI connection died right after a second connection to port 5025 had been opened, queried
 and closed (the next query on the first one timed out, later writes failed with a broken pipe; a new connection
 worked at once). One client at a time, and the tool runs its second-connection experiment last on its own connection.
 measured 2026-10-05, fw 1.16
 
-Vendor statements contradicted by the device (numbers refer to VENDOR-ISSUES.md):
+Vendor statements contradicted by the device (A and B numbers are entries of the owner's local ticket list, see above):
 
 - Replies to booleans are `ON`/`OFF` in the manual: they are `0`/`1` (A4).
 - Enumeration replies are the short, upper-case or echoed form in the manual examples (`MASTER`, `INT`): they are
@@ -190,17 +231,26 @@ Vendor statements contradicted by the device (numbers refer to VENDOR-ISSUES.md)
 - Error text carries `Command: ` in the manual: it does not; the empty reply has no space (A6).
 - `DATA:PORT?` replies `5025` in the manual: `2758` (A7).
 - `DATA:LENG` range 1024 to 36864: the device held 114688 (A8).
-- Settings as found differ from the `DEFault` column: pulser on, `DUAL`, `TRIG:INT` 1 s (A9); open question whether
-  these are power-on values.
+- Settings as found differ from the `DEFault` column: pulser on, `DUAL`, `TRIG:INT` 1 s (A9). They are power-on values:
+  a power cycle brings them back.
 - Automatic `AVER:DEL:CONS` appears to depend on `TRIG:INT` (A10).
 - TGC replies before anything was set are `0,0` and an empty line, not the manual's examples (A11).
 - `SYST:VERS?` has no documented reply: `1999.0`; the firmware field of `*IDN?` is `1.16 (861f022a)` (A12).
-- Not a contradiction but undocumented: commands written back to back overrun an input buffer (A1) and a second
-  connection to port 5025 kills the first (A2).
+- `AVER:COUN` is "acquisitions per averaged vector": the count is an exponent (2^N, a mean), and the header field
+  `ascan_count` stays 1 (B2).
+- `DATA:LENG` power-on value 114688 is refused by its own setter with `-224` (B1); the length fields `length_lo`/
+  `length_hi` are undocumented: 1040 and 0 at 1024 samples (B3).
+- Error queue depth and overflow are undocumented: 16 entries, then `-350,"Queue overflow"` (A13).
+- Not a contradiction but undocumented: an input buffer of a few hundred bytes (between 160 and about 320; commands
+  that do not fit are discarded with `-363`, A1), a second connection to port 5025 kills the first (A2), packets still
+  arrive after `STOP` and the socket stays open (B4), a setting can be changed while streaming (B5), a data connection
+  does not disturb the SCPI one (B6).
 
-Not measured in this phase: the depth of the error queue (the 25-line experiment hit the input-buffer overrun
-instead, so it is still unknown); `DATA:PORT?` after `*RST` (`*RST` was not sent); and which of opening or closing a
-second connection kills the first.
+Not measured: the upper limit of `DATA:LENG` (1024 accepted, 114688 refused); `DATA:PORT?` and everything else after
+`*RST` (`*RST` was not sent); which of opening or closing a second connection kills the first; the exact input-buffer
+size; the length fields at other `DATA:LENG` values; the wrap of `packet_number` (the header field is one byte);
+whether errors queue again after the queue was read once while it was full; everything with the pulser on or a signal
+connected (phase C): count-to-volt scaling, time zero, settling times.
 
 ## Things the vendor material does not tell you
 
@@ -210,13 +260,18 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
 - **Data port.** `SCPI_COMMANDS.md` shows `DATA:PORT?` replying 5025, the vendor script starts with 2758. The
   device answered `2758` (measured 2026-10-05, fw 1.16). The plug still queries it on every acquisition and never
   hard-codes it. Whether the value changes after `*RST` is to be measured.
-- **Single-shot acquisition.** Only `STAR AUTO` is documented, although the text mentions single acquisitions.
-  Packets already in flight when `STOP` is sent may be lost or may arrive late. To be measured.
-- **Averaging.** Whether `AVER:COUN` is N or 2^N averages, and what the header field `ascan_count` counts, is
-  not stated. The plug sends and reads back the number and interprets nothing. To be measured.
-- **Header fields.** `ctp` (timing array or XYZ coordinates, the docs say both), `length_lo`/`length_hi`,
-  `telemetry_a/b/c`, `is_full`, `buffer_fill` and the wrap of `packet_number` have no stated meaning. The plug
-  stores them as received. To be measured.
+- **Single-shot acquisition.** Only `STAR AUTO` is documented, although the text mentions single acquisitions. To be
+  measured. `STOP` itself: two packets already in flight arrive after it (within 20 ms), then the socket is idle and
+  stays open (measured 2026-10-05, fw 1.16); a reader that stops at `STOP` leaves them unread.
+- **Averaging.** `AVER:COUN N` averages 2^N acquisitions as a mean (noise std 3.59 counts at 0, 0.94 at 4), and the
+  header field `ascan_count` stays 1 for every N (measured 2026-10-05, fw 1.16). The plug sends and reads back the
+  number and interprets nothing; `ascan_count` does not tell how much was averaged.
+- **Header fields.** Seen on 2026-10-05 (fw 1.16) at `DATA:LENG 1024` with the pulser off: `length_lo` 1040 (the
+  sample count plus 16, one data point), `length_hi` 0, telemetry bytes 120, 86, 52, `is_full` 0, `buffer_fill` 0,
+  `ascan_count` 1, `packet_number` +1 per packet and continuing across `STOP`/`STAR AUTO`. Nothing in the plug or in
+  `stream.py` depends on the length fields: framing uses `DATA:LENG`. Still unknown: `ctp` (timing array or XYZ
+  coordinates, the docs say both), what the telemetry bytes and the 16 mean, and the wrap of `packet_number`. The
+  plug stores them as received.
 - **Count-to-volt scaling.** ADC bit depth, full scale and whether gain and TGC act before the ADC are unknown.
   Hence no volts array. To be measured.
 - **Time zero.** Whether sample 0 is the trigger, the pulse start or the end of `TRIG:DEL`, and whether
@@ -230,8 +285,9 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
   accepts the long, short, case and `ON`/`1` variants. Still to be measured: which unit a bare number gets in a
   command (the plug writes units explicitly) and the formats of the headers not yet written (for example
   `GAIN:TGC:LIN` after a write).
-- **Clamping.** The vendor documents silent clamping nowhere, so every value is read back after writing.
-  Out-of-range behaviour (error, clamp or replace) is to be measured.
+- **Clamping.** The vendor documents silent clamping nowhere, so every value is read back after writing. An
+  out-of-range value gave `-224,"Illegal parameter value"` and the old value stayed (measured for `DATA:LENG 114688`
+  only, 2026-10-05, fw 1.16); the other headers are unmeasured.
 - **Settling times** after a change of gain, pulser voltage or impedance, and changes of settings while
   streaming. The plug does not wait or retry. To be measured.
 
@@ -244,21 +300,29 @@ fake's data socket too. `examples/example_test.py --fake` does exactly that.
 What it models, from the vendor documents: the SCPI header set with long and short forms, unit conversion to
 the documented reply formats, the error queue with `-113` (undefined header) and `-221` (settings conflict on
 `AVER:DEL:CONS` while auto is on), `*IDN?` with firmware `1.16 (861f022a)`, `*RST` to its default table, and a
-data socket that sends `28 + 2 * DATA:LENG` byte packets only between `STAR AUTO` and `STOP`.
+data socket that sends `28 + 2 * DATA:LENG` byte packets between `STAR AUTO` and `STOP`. Measured 2026-10-05
+(fw 1.16) and folded in: the error queue of 16 entries plus `-350`, `-224` for a refused value (`DATA:LENG` above
+36864 and bad words or numbers), `-363` for one line over 256 bytes (the real input buffer limit is between 160 and
+about 320 bytes and the fake cannot see bursts), seconds replies as shortest decimals (`1`, `2e-06`), header length
+fields and telemetry bytes, `ascan_count` 1, a packet counter that starts at 2 and never restarts, two packets still
+delivered after `STOP`, and optionally the power-on state.
 
 What it invents: the signal (a damped sine burst at `TRAN:FREQ`, starting at 10 % of the record, amplitude
 scaled by `GAIN`), the defaults marked `UNKNOWN default` in the source, and every error code other than -113
-and -221 (for example the -102 it queues for a value that does not parse). A fake only knows what we told it;
+and -221, -224, -350, -363 (-224 is measured for `DATA:LENG` only), the `0.01` format of 10 ms and `1e-05` of 10 us
+(extrapolated from three replies) and the `noise` signal's offset and spread (measured at `AVER:COUN` 0 and 4 only).
+A fake only knows what we told it;
 nothing is done until it has run on the instrument, and every finding from hardware goes back into it.
 
 Constructor options:
 
 | Option | Effect |
 |---|---|
-| `length=1024` | initial `DATA:LENG` |
+| `length=1024` | initial `DATA:LENG` (1024 unless `power_on`, then 114688) |
+| `power_on=True` | start from the measured power-on state (pulser on, `DUAL`, `TRIG:INT` 1 s, `DATA:LENG` 114688, which its own setter refuses); `*RST` still goes to the vendor defaults. Off by default: the suite assumes the vendor defaults |
 | `chunk=k` | the data socket returns at most `k` bytes per `recv`, to exercise reassembly |
 | `garbage_prefix=b'..'` | bytes sent once before the first packet, to exercise resync |
-| `signal='burst'` | `'burst'` (default), `'zeros'` (all samples 0) or `'none'` (never sends a packet: timeouts) |
+| `signal='burst'` | `'burst'` (default), `'zeros'` (all samples 0), `'noise'` (an open input: offset +11 counts, std 3.6 counts divided by 2^(`AVER:COUN`/2)) or `'none'` (never sends a packet: timeouts) |
 | `reject={'TRAN:PULS': '-221,"Settings conflict"'}` | a write to that header queues the given error and does not store the value |
 | `idn=` | the `*IDN?` reply |
 
@@ -273,7 +337,7 @@ hardware-free stand-in · `capture.schema.json` generated JSON Schema · `captur
 (`vendor_example.yaml`, 20 V) · `examples/example_test.py` minimal OpenHTF test, see `examples/README.md` ·
 `tests/` pytest suite (including `tests/data/broken.yaml`) · `.vscode/settings.json` YAML schema mapping ·
 `.github/workflows/ci.yml` ruff, mypy and pytest · `PROTOCOL.md` digest of the vendor material, every claim cited,
-`UNKNOWN` and `CONFLICT n` kept · `VENDOR-ISSUES.md` where the device differs from the vendor material, one entry per observation, for the vendor · `SPEC.md`/`SPEC-capture.md` contracts for coder agents · `STATUS.md` current
+`UNKNOWN` and `CONFLICT n` kept · `SPEC.md`/`SPEC-capture.md` contracts for coder agents · `STATUS.md` current
 state and open questions · `AGENTS.md`/`CLAUDE.md` rules for agents · `pyproject.toml`, `uv.lock`, `LICENSE`.
 
 `192.168.200.18` is the address used in all vendor examples. Do not commit any other real address or serial number.

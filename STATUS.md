@@ -1,6 +1,6 @@
 # STATUS.md
 
-Last updated: 2026-10-05 (after hardware phase A) by the project owner agent.
+Last updated: 2026-10-05 (after hardware phases A and B) by the project owner agent.
 
 ## Decisions taken (with the human owner)
 
@@ -32,29 +32,40 @@ Last updated: 2026-10-05 (after hardware phase A) by the project owner agent.
 - [x] Hardware phase A (read-only), 2026-10-05, fw 1.16: README "Measured on the device", fake
       updated (booleans `0`/`1`, enumeration notation strings, error text, `SYST:VERS?`), 656 tests.
       The probe tool no longer restores after phase A and runs the second-connection experiment last.
-      `VENDOR-ISSUES.md` lists every difference from the vendor material (A1 to A12).
-- [ ] Hardware phase B (pulser off, acquisition), then phase C (pulser on; the probe tool has no
-      phase C yet, a SPEC for it comes first).
+      The differences from the vendor material are kept by the owner as a local ticket list
+      (not in the repository); README lists them in short.
+- [x] Hardware phase B (pulser off, acquisition, nothing connected), 2026-10-05, fw 1.16, plus the
+      extra experiments 5b (error queue) and B2 (`DATA:LENG` limits, header length field) and a
+      power cycle. README entries 5 to 11; fake: queue depth 16 + `-350`, `-224` for illegal values,
+      averaging as a mean over 2^N, `length_lo` = samples + 16, two packets after `STOP`, seconds
+      replies as shortest decimals, `power_on=True` state; 676 tests.
+- [ ] Results of B2 into README and the fake comments (measured at four lengths, `ctp[0]` is a
+      packet counter, `DATA:LENG` range is the documented one, `TRIG:INT 10 MS` reads `0.01`).
+- [ ] Phase C (pulser on, transducer connected). The probe tool has no phase C yet; SPEC first.
 - [ ] SPEC-golden (golden A-scan comparison), not written yet.
 
-## Open questions after phase A
+## Open questions after phases A and B
 
-From `PROTOCOL.md` "Unknowns to verify on hardware"; the ones that block design choices are still
-single-shot acquisition, the meaning of `AVER:COUN` and the header `ascan_count`, and count-to-volt
-scaling. Settled: `DATA:PORT?` is `2758` (not after `*RST`), a bare `\n` terminator works, reply
-forms of booleans and enumerations. New or sharpened by phase A:
+Still open from `PROTOCOL.md` "Unknowns to verify on hardware": single-shot acquisition,
+count-to-volt scaling, time zero and what `TRIG:DEL` shifts, `*RST` defaults, settling times,
+per-connection state, REST/WebSocket. Settled so far: data port 2758, terminators, reply forms,
+error-queue depth (16 + `-350`), `AVER:COUN` is an exponent and the result a mean, `ascan_count`
+stays 1, `STOP` leaves two packets in flight and the socket open, both connect orders work, a
+`GAIN` change while streaming is accepted, `DATA:LENG` range 1024 to 36864 with `-224` outside.
 
-- Input-buffer overrun: 25 lines written back to back lost 24 of them (`-363`). How many lines
-  survive without a read in between is not measured. It matters for `tearDown`, which sends
-  `TRAN:ENAB OFF`, `STOP`, `TRAN:ENAB OFF` without reading. Error-queue depth is still unknown for
-  the same reason.
-- A second connection to port 5025 killed the first (seen once). Open or close? Does the data
-  socket count?
-- `DATA:LENG` was 114688 as found, above the documented 36864: real range unknown; will the
-  restore after phase B be accepted?
-- Are the as-found settings (pulser on, `DUAL`, `TRIG:INT` 1 s) power-on values?
-- Number format of time replies after a write (only `1`, `0.99992925`, `2e-06` seen so far); the
-  fake still answers in the vendor's `10.0E-3` style.
+New questions:
+
+- The device powers on with `DATA:LENG` 114688, which its own setter refuses. A snapshot taken
+  after power-on therefore cannot be restored completely. Decision needed for the plug: skip a
+  value the device refuses, or keep reporting the failure (current behaviour: failure reported,
+  everything else restored). What the device streams at 114688 is being measured (B2 part 3).
+- The device powers on with the pulser enabled at 20 V. The plug switches it off at `tearDown`
+  only; should construction switch it off too? Owner decision.
+- A second connection to port 5025 killed the first (seen once). Open or close? The data port does
+  not have this effect.
+- Input buffer: a burst above 160 to 320 bytes is discarded with `-363` and a query in it is never
+  answered. The longest line the plug can produce (a long `GAIN:TGC:ARB` list) is not checked.
+- `ctp[0]` equals the packet counter in `TRIG:MODE INT`; does it go on past 255?
 - Automatic `AVER:DEL:CONS` seems to follow `TRIG:INT` (interval minus 70.75 us).
 
 ## Resuming as the owner agent on the local machine

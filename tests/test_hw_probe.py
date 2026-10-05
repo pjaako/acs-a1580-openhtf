@@ -184,8 +184,14 @@ def test_fake_phase_ab_runs_all_steps(
     assert {'min', 'max', 'std', 'ascan_count', 'buffer_fill', 'is_full'} <= set(
         step6['packets'][0]
     )
-    assert report['steps']['STEP 7']['data']['ascan_counts'] == [4]
-    assert report['steps']['STEP 5']['data']['depth'] == 25
+    assert report['steps']['STEP 7']['data']['ascan_counts'] == [1]  # measured: stays 1
+    step5 = report['steps']['STEP 5']['data']
+    assert step5['counts'] == [str(min(i, 17)) for i in range(1, 26)]  # 16, then -350 as 17th
+    assert step5['depth'] == 17
+    assert step5['last_is_overflow'] is True
+    assert step6['readbacks']['TRIG:INT'] == '0.01'  # the exact read-back reply of each setting
+    assert report['steps']['STEP 7']['data']['readbacks'] == {'AVER:COUN': '4'}
+    assert report['steps']['TEARDOWN']['data']['restore_failures'] == []
     assert report['steps']['STEP 9']['data']['verdict'].startswith('accepted')
     assert '8a' in report['steps']['STEP 8']['data']
     assert 'idle' in report['steps']['STEP 8']['data']['8a']['verdict']
@@ -200,7 +206,7 @@ def test_replies_are_printed_verbatim_between_backticks(
     out = capsys.readouterr().out
     assert '`ACS-Solutions GmbH,A1580-HF,100500,1.16 (861f022a)`' in out
     assert 'TRIG:INT?' in out
-    assert '`10.0E-3`' in out
+    assert '`0.01`' in out
     assert '`2758`' in out
 
 
@@ -389,6 +395,20 @@ def test_device_that_rejects_a_setting_fails_the_step_not_the_run(
     assert 'STEP 6 FAILED' in out
     assert 'STEP 8:' in out
     assert fake.log.count('STOP') >= 1
+
+
+def test_restore_failures_are_in_the_teardown_record_and_printed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeA1580Resource(reject={'TRAN:DUR': '-224,"Illegal parameter value"'})
+    hw_probe.main(['--fake', '--phase', 'B', '--out', str(tmp_path)], fake=fake)
+    out = capsys.readouterr().out
+    _snapshot, probe_path = _json_files(tmp_path)
+    report = json.loads(probe_path.read_text(encoding='utf-8'))
+    failures = report['steps']['TEARDOWN']['data']['restore_failures']
+    assert len(failures) == 1
+    assert failures[0].startswith('TRAN:DUR')
+    assert f'RESTORE FAILED: {failures[0]}' in out
 
 
 def test_unanswered_header_is_recorded_and_not_restored(

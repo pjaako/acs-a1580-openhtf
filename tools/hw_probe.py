@@ -116,6 +116,7 @@ class GuardedResource:
         object.__setattr__(self, '_inner', inner)
         object.__setattr__(self, '_closer', closer)
         object.__setattr__(self, 'sent', [])
+        object.__setattr__(self, 'replies', {})  # last reply per query string, exactly as received
 
     def __setattr__(self, name: str, value: Any) -> None:
         setattr(self._inner, name, value)
@@ -131,7 +132,9 @@ class GuardedResource:
     def query(self, cmd: str) -> Any:
         check_allowed(cmd, is_write=False)
         self.sent.append(cmd)
-        return self._inner.query(cmd)
+        reply = self._inner.query(cmd)
+        self.replies[cmd] = reply
+        return reply
 
     def close(self) -> None:
         """Deliberately a no-op, see the class docstring."""
@@ -494,7 +497,9 @@ def step_4(p: Probe) -> None:
 def step_5(p: Probe) -> None:
     """Experiment 5: error queue.
 
-    One undefined header, `SYST:ERR?` twice; depth with 25 bad headers.
+    One undefined header, `SYST:ERR?` twice; depth with 25 bad headers, each one followed by
+    `SYST:ERR:COUN?` so that the device's input buffer (a few hundred bytes, measured
+    2026-10-05, fw 1.16) is never overrun by a burst of writes.
 
     The queue is drained first. These are the only deliberate writes of Phase A.
     """
@@ -507,22 +512,32 @@ def step_5(p: Probe) -> None:
     second = p.plug.query(ERR_QUERY)
     p.say(f'after one undefined header: first {ERR_QUERY} -> {bt(first)}')
     p.say(f'                           second {ERR_QUERY} -> {bt(second)}')
+    counts: list[str | None] = []
+    count_error: str | None = None
     for i in range(1, BAD_COUNT + 1):
         p.plug.write(f'{BAD_HEADER}{i:02d}')
-    count_reply, count_error, _dt = p.try_query('SYST:ERR:COUN?')
-    shown = bt(count_reply) if count_error is None else 'NO ANSWER: ' + str(count_error)
-    p.say(f'after {BAD_COUNT} bad headers: SYST:ERR:COUN? -> {shown}')
+        reply, count_error, _dt = p.try_query('SYST:ERR:COUN?')
+        counts.append(reply)
+        if count_error is not None:
+            p.say(f'SYST:ERR:COUN? after bad header {i}: NO ANSWER: {count_error}')
+            break
+    count_reply = counts[-1] if counts else None
+    p.say(f'SYST:ERR:COUN? after each bad header: {counts}')
     entries, hit = p.drain_errors(ERR_READ_LIMIT)
+    overflow = bool(entries) and entries[-1].split(',', 1)[0].strip() == '-350'
     p.say(f'drained {len(entries)} entries{" (read limit hit, depth is larger)" if hit else ""}')
     if entries:
         p.say(f'  first {bt(entries[0])}')
         p.say(f'  last  {bt(entries[-1])}')
+    p.say(f'depth {len(entries)}; last is -350 (queue overflow): {"yes" if overflow else "no"}')
     p.current.data.update(
         before=before,
         first=first,
         second=second,
         count_reply=count_reply,
+        counts=counts,
         depth=len(entries),
+        last_is_overflow=overflow,
         depth_limit_hit=hit,
         first_entry=entries[0] if entries else None,
         last_entry=entries[-1] if entries else None,
@@ -560,6 +575,9 @@ def _acquire_block(p: Probe, key: str, settings: dict[str, object]) -> dict[str,
     p.say(f'apply_setup {settings}')
     p.plug.apply_setup(settings)
     p.say(f'settings read back OK; AVER:COUN as found {bt(p.answered.get("AVER:COUN", "?"))}')
+    readbacks = {key: p.resource.replies.get(f'{key}?') for key in settings}
+    for key, value in settings.items():
+        p.say(f'{key} {value} -> {key}? -> {bt(readbacks[key])}')
     first_socket = len(p.sockets)
     t0 = time.monotonic()
     scans = p.plug.acquire(n, timeout_s=ACQ_TIMEOUT_S)
@@ -611,6 +629,7 @@ def _acquire_block(p: Probe, key: str, settings: dict[str, object]) -> dict[str,
         'recv_chunk_sizes_first': sizes[:20],
         'std_mean': float(np.mean([e['std'] for e in packets])),
         'ascan_counts': sorted({e['ascan_count'] for e in packets}),
+        'readbacks': readbacks,
         'packets': packets,
     }
     rate = summary['packet_rate_hz']
@@ -911,8 +930,11 @@ def plan(phase: str) -> list[tuple[str, list[str]]]:
             f'{BAD_HEADER} 1',
             ERR_QUERY,
             ERR_QUERY,
-            *[f'{BAD_HEADER}{i:02d}' for i in range(1, BAD_COUNT + 1)],
-            'SYST:ERR:COUN?',
+            *[
+                line
+                for i in range(1, BAD_COUNT + 1)
+                for line in (f'{BAD_HEADER}{i:02d}', 'SYST:ERR:COUN?')
+            ],
             ERR_QUERY + f'   (drain, at most {ERR_READ_LIMIT} reads)',
         ],
         6: _setup_commands(STEP6_SETTINGS) + _ACQUIRE,
@@ -1151,7 +1173,10 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
             probe.say('TEARDOWN: STOP, restore the snapshot, close (plug.tearDown)')
         else:
             probe.say('TEARDOWN: no restore: phase A is read-only; pulser OFF, STOP, close')
-        plug.tearDown()
+        failures = _tear_down(plug)
+        probe.current.data['restore_failures'] = failures
+        for failure in failures:
+            probe.say(f'RESTORE FAILED: {failure}')
         diff = final_diff(probe)
         if any(not v.get('expected') for v in diff['changed'].values()) or diff['unreadable']:
             code = code or EXIT_FAILED_STEP
@@ -1167,6 +1192,32 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
                 code = code or EXIT_FAILED_STEP
         _write_probe_json(probe, code, diff)
     return code
+
+
+def _tear_down(plug: A1580Plug) -> list[str]:
+    """`plug.tearDown()`; the restore failures it only logs, one string per failed header.
+
+    `tearDown` swallows the `RuntimeError` of `set_state`, whose text lists every failure
+    joined by `; `. A wrapper on the instance sees it first and passes it on unchanged, so
+    the plug is not touched. A failure that is not that list comes back as one string.
+    """
+    failures: list[str] = []
+    original = plug.set_state
+
+    def watching(state: dict[str, str]) -> None:
+        try:
+            original(state)
+        except RuntimeError as exc:
+            text = str(exc).removeprefix('set_state failed: ')
+            failures.extend(text.split('; '))
+            raise
+
+    plug.set_state = watching  # type: ignore[method-assign]
+    try:
+        plug.tearDown()
+    finally:
+        plug.set_state = original  # type: ignore[method-assign]
+    return failures
 
 
 def _write_probe_json(p: Probe, code: int, diff: dict[str, Any] | None) -> None:

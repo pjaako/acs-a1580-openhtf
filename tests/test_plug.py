@@ -507,7 +507,7 @@ def test_set_state_writes_constant_delay_when_auto_is_off(auto: str) -> None:
     fake.log.clear()
     plug.set_state(state)
     assert 'AVER:DEL:CONS 50000 NS' in fake.log
-    assert plug.query('AVER:DEL:CONS?') == '50.0E-6'
+    assert plug.query('AVER:DEL:CONS?') == '5e-05'
 
 
 def test_set_state_ignores_errors_queued_before_it() -> None:
@@ -653,7 +653,8 @@ def test_acquire_three() -> None:
         assert s.trigger_delay_ns == 15000
         assert s.t[1] == 1 / s.fs_hz
         assert s.t.dtype == np.float64
-    assert [s.header.packet_number for s in scans] == [0, 1, 2]
+    first = scans[0].header.packet_number  # the counter does not restart, so only steps count
+    assert [s.header.packet_number for s in scans] == [first, first + 1, first + 2]
     assert not fake.started
     assert fake.sockets[0].closed
     assert plug._data_sock is None
@@ -667,7 +668,8 @@ def test_acquire_survives_chunking_and_garbage(kwargs: dict[str, Any]) -> None:
     reference = _plug()
     scans = plug.acquire(3)
     expected = reference.acquire(3)
-    assert [s.header.packet_number for s in scans] == [0, 1, 2]
+    first = scans[0].header.packet_number
+    assert [s.header.packet_number for s in scans] == [first, first + 1, first + 2]
     for got, want in zip(scans, expected, strict=True):
         np.testing.assert_array_equal(got.raw, want.raw)
 
@@ -679,7 +681,7 @@ def test_acquire_uses_the_current_settings() -> None:
     assert len(scan.raw) == 3000
     assert scan.fs_hz == 5e7
     assert scan.trigger_delay_ns == 2000
-    assert scan.header.ascan_count == 2
+    assert scan.header.ascan_count == 1  # measured: the header does not show AVER:COUN
     assert scan.t[-1] == pytest.approx(2999 / 5e7)
 
 
@@ -798,7 +800,8 @@ def test_stream_delivers_and_stops() -> None:
     assert fake.sockets[0].closed
     assert plug._data_sock is None and plug._stream is None
     assert fake.log[-2:] == ['STOP', ERR]
-    assert [s.header.packet_number for s in got[:3]] == [0, 1, 2]
+    first = got[0].header.packet_number
+    assert [s.header.packet_number for s in got[:3]] == [first, first + 1, first + 2]
     assert plug.stop_stream() == 0  # nothing running any more
     assert len(plug.acquire(1)) == 1  # and the plug is usable again
 
