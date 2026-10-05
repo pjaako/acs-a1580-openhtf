@@ -142,7 +142,11 @@ _AUTO_CONSTANT_DELAY_OFFSET_S = 70.75e-6
 # in the first 65522 samples, at a different start in every packet; not modelled.
 _ZERO_TAIL_START = 81906
 _ILLEGAL_PARAMETER = '-224,"Illegal parameter value"'
-_MAX_LINE = 256  # see `write`
+# measured 2026-10-05, fw 1.16: the input buffer is 256 bytes; a line of up to 255 bytes
+# including CRLF is parsed (tried 100..255), one of 256 bytes or more is discarded with -363
+# (tried 256..600). The text of a queued error entry is cut off at 262 characters.
+_MAX_LINE_WITH_CRLF = 255
+_MAX_ERROR_TEXT = 262
 
 
 def _plain(value: float) -> str:
@@ -235,9 +239,8 @@ class FakeA1580Resource:
         # measured 2026-10-05, fw 1.16: 25 lines (about 320 bytes) written back to back
         # without a read left one processed `-113` and one `-363,"Input buffer overrun"` in
         # the queue, the rest was discarded and the next query was never answered. Bursts of
-        # up to ten 16-byte lines (160 bytes) were all processed, so the limit is an input
-        # buffer size between 160 and about 320 bytes, not pacing. The fake cannot see
-        # bursts; it models only a single line longer than 256 bytes (the 256 is a guess).
+        # up to ten 16-byte lines (160 bytes) were all processed; the fake cannot see bursts.
+        # A single line is exact (see `_MAX_LINE_WITH_CRLF`): the write terminator counts.
         # measured 2026-10-05, fw 1.16 (4 trials, 4 of 4): as soon as a second connection to
         # port 5025 is accepted the device closes the first (next recv returns 0 bytes, later
         # sends fail with a broken pipe); no traffic on the second one is needed, closing it
@@ -245,7 +248,7 @@ class FakeA1580Resource:
         # The data port does not have this effect. The fake has one resource and no client
         # count: not modelled yet.
         self.log.append(cmd)
-        if len(cmd.encode(self.encoding, errors='replace')) > _MAX_LINE:
+        if len(cmd.encode(self.encoding, errors='replace')) + 2 > _MAX_LINE_WITH_CRLF:
             self._queue_error('-363,"Input buffer overrun"')
             return
         text = cmd.strip()
@@ -354,7 +357,7 @@ class FakeA1580Resource:
         then 17 and stayed; draining gave the first 16 and `-350,"Queue overflow"` last.
         """
         if len(self._errors) < _ERROR_QUEUE_DEPTH:
-            self._errors.append(entry)
+            self._errors.append(entry[:_MAX_ERROR_TEXT])
         elif self._errors[-1] != _QUEUE_OVERFLOW:
             self._errors.append(_QUEUE_OVERFLOW)
 

@@ -1025,3 +1025,21 @@ def test_cli_schema_write_round_trip(tmp_path: Path) -> None:
     written = tmp_path / 'capture.schema.json'
     assert json.loads(written.read_text(encoding='utf-8')) == capture_schema()
     assert written.read_text(encoding='utf-8') == SCHEMA_JSON.read_text(encoding='utf-8')
+
+
+def test_an_over_long_tgc_arbitrary_line_is_a_problem_naming_length_and_limit() -> None:
+    from a1580_openhtf.plug import MAX_LINE_BYTES
+
+    assert capture_module._MAX_LINE_BYTES == MAX_LINE_BYTES
+
+    def text(points: int) -> str:
+        rows = ''.join(f'      - {{time: {10 + i} us, gain: 5 dB}}\n' for i in range(points))
+        return 'receiver:\n  tgc:\n    arbitrary:\n' + rows
+
+    ok = parse_capture(text(30))  # 'GAIN:TGC:ARB ' + 30 points of 'tt,5' is well under the limit
+    assert ok.to_scpi()['GAIN:TGC:ARB'].count(',') == 59
+    with pytest.raises(CaptureError) as exc:
+        parse_capture(text(60))
+    (problem,) = exc.value.problems
+    assert 'receiver.tgc.arbitrary' in problem
+    assert 'bytes including CRLF' in problem and 'limit is 255' in problem

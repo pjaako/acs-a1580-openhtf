@@ -21,6 +21,7 @@ from a1580_openhtf import A1580Plug, AScan, AScanHeader
 from a1580_openhtf.fake_resource import FakeA1580Resource
 from a1580_openhtf.plug import (
     CONF,
+    MAX_LINE_BYTES,
     STATE_HEADERS,
     Identity,
     normalize_header,
@@ -524,6 +525,63 @@ def test_set_state_raises_when_a_write_is_rejected() -> None:
     _fake(plug)._reject['TRAN:PULS'] = '-222,"Data out of range"'
     with pytest.raises(RuntimeError, match='TRAN:PULS'):
         plug.set_state(state)
+
+
+def _arb_line(total_with_crlf: int) -> str:
+    head = 'GAIN:TGC:ARB '
+    return head + '1' * (total_with_crlf - 2 - len(head))
+
+
+def test_a_253_character_line_is_sent() -> None:
+    plug = _plug()
+    plug.write(_arb_line(MAX_LINE_BYTES))
+    assert len(_fake(plug).log[-1]) == 253
+    assert plug.check_errors() == []
+
+
+def test_a_254_character_line_raises_and_nothing_reaches_the_resource() -> None:
+    plug = _plug()
+    sent = len(_fake(plug).log)
+    with pytest.raises(ValueError, match=r'GAIN:TGC:ARB.*256 bytes.*limit is 255'):
+        plug.write(_arb_line(MAX_LINE_BYTES + 1))
+    with pytest.raises(ValueError, match='GAIN:TGC:ARB'):
+        plug.query(_arb_line(MAX_LINE_BYTES + 1))
+    with pytest.raises(ValueError, match='GAIN:TGC:ARB'):
+        plug.write_checked(_arb_line(MAX_LINE_BYTES + 1))
+    assert len(_fake(plug).log) == sent
+
+
+def test_apply_setup_reports_an_over_long_line_as_a_failure_of_its_key() -> None:
+    plug = _plug()
+    sent = len(_fake(plug).log)
+    long_list = ','.join(f'{i},1' for i in range(1, 100))
+    with pytest.raises(RuntimeError, match=r'GAIN:TGC:ARB.*ValueError.*limit is 255') as exc:
+        plug.apply_setup({'GAIN': 12, 'GAIN:TGC:ARB': long_list, 'FREQ': '50 MHZ'})
+    assert 'GAIN:' not in str(exc.value).replace('GAIN:TGC:ARB', '')
+    assert plug.query('GAIN?') == '12'  # the others were still applied
+    assert plug.query('FREQ?') == '50000000'
+    assert not any(line.startswith('GAIN:TGC:ARB') for line in _fake(plug).log[sent:])
+    assert plug.check_errors() == []
+
+
+def test_set_state_with_an_over_long_value_goes_on_and_ends_with_the_pulser_off() -> None:
+    plug = _plug()
+    state = plug.get_state()
+    state['GAIN:TGC:ARB'] = ','.join(f'{i},1' for i in range(1, 100))
+    state['GAIN'] = '7'
+    with pytest.raises(RuntimeError, match=r'GAIN:TGC:ARB.*limit is 255'):
+        plug.set_state(state)
+    assert plug.query('GAIN?') == '7'
+    assert plug.query('TRAN:ENAB?') == '0'
+
+
+def test_teardown_does_not_raise_on_an_over_long_restore_value() -> None:
+    fake = FakeA1580Resource()
+    plug = A1580Plug(resource=fake, restore_state=True)
+    plug._initial_state['GAIN:TGC:ARB'] = '1,' * 200
+    plug.tearDown()
+    assert fake.closed
+    assert fake._values['TRAN:ENAB'] == '0'
 
 
 def test_restore_state_true_snapshots_and_restores() -> None:

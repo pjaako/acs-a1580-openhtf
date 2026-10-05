@@ -428,6 +428,10 @@ _MAX_ERROR_READS = 20
 _STREAM_SLICE_S = 0.1  # the stream thread reads in slices so that stop_stream is prompt
 _PULSER_OFF = 'TRAN:ENAB OFF'
 _MIN_ACQUIRE_TIMEOUT_S = 5.0
+# The input buffer is 256 bytes: a line of up to 255 bytes including CRLF is parsed, a longer
+# one is discarded with -363 "Input buffer overrun" (measured 2026-10-05, fw 1.16: 255 ok,
+# 256 and more discarded).
+MAX_LINE_BYTES = 255
 
 
 def _reply_float(command: str, reply: str) -> float:
@@ -555,11 +559,25 @@ class A1580Plug(BasePlug):
 
     # ── low level ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _check_line_length(cmd: str) -> None:
+        """Raise ValueError, before anything is sent, if `cmd` plus CRLF exceeds the limit."""
+        size = len(cmd.encode('iso-8859-1', errors='replace')) + 2
+        if size > MAX_LINE_BYTES:
+            header = cmd.split(None, 1)[0] if cmd.strip() else ''
+            raise ValueError(
+                f'{header}: line is {size} bytes including CRLF, the limit is {MAX_LINE_BYTES}; '
+                'the A1580 discards lines over 255 bytes including CRLF with -363; '
+                'measured 2026-10-05, fw 1.16'
+            )
+
     def write(self, cmd: str) -> None:
+        self._check_line_length(cmd)
         with self._scpi_lock:
             self._resource.write(cmd)
 
     def query(self, cmd: str) -> str:
+        self._check_line_length(cmd)
         with self._scpi_lock:
             return str(self._resource.query(cmd)).strip()
 
@@ -651,7 +669,8 @@ class A1580Plug(BasePlug):
             try:
                 failure = self._apply_one(key, sent)
             except Exception as exc:  # noqa: BLE001 - one bad setting must not stop the others
-                self._discard_late_reply()
+                if not isinstance(exc, ValueError):  # a ValueError means nothing was sent
+                    self._discard_late_reply()
                 failure = f'{key}: sent={sent!r} raised {type(exc).__name__}: {exc}'
             if failure is not None:
                 failures.append(failure)
@@ -774,7 +793,7 @@ class A1580Plug(BasePlug):
                 transport_errors = 0
             except Exception as exc:  # noqa: BLE001 - restore the rest, report at the end
                 failures.append(f'{header}: {exc}')
-                if isinstance(exc, RuntimeError):  # a device error, not a transport error
+                if isinstance(exc, (RuntimeError, ValueError)):  # not a transport error
                     transport_errors = 0
                 else:
                     transport_errors += 1

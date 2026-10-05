@@ -52,6 +52,10 @@ Last updated: 2026-10-05 (end of the first hardware session) by the project owne
 - [x] Experiment 13 (`*RST`), two runs, 2026-10-05, fw 1.16: `*RST` changes no setting (six
       detuned settings stayed detuned). README entry 18; the fake's `*RST` no longer resets;
       `hw_probe.py --phase RST` detunes first by default; 868 tests.
+- [x] Input buffer measured exactly (a line over 255 bytes including CRLF is discarded with
+      `-363`); the plug refuses to send such a line (`MAX_LINE_BYTES`), the capture model reports
+      an over-long `GAIN:TGC:ARB` line; 876 tests. Checked on the fake only; the limit itself was
+      measured on the device with a raw socket.
 - [x] Second SCPI connection, repeated 4 times: the device closes the first connection as soon as
       a second one to port 5025 is accepted.
 - [ ] Experiment 12 (count-to-volt): deferred, a signal generator is available later.
@@ -69,24 +73,21 @@ error-queue depth (16 + `-350`), `AVER:COUN` is an exponent and the result a mea
 stays 1, `STOP` leaves two packets in flight and the socket open, both connect orders work, a
 `GAIN` change while streaming is accepted, `DATA:LENG` range 1024 to 36864 with `-224` outside.
 
-New questions:
+Owner decisions of 2026-10-05 (final):
 
-- The device powers on with `DATA:LENG` 114688, which its own setter refuses. A snapshot taken
-  after power-on therefore cannot be restored completely. Decision needed for the plug: skip a
-  value the device refuses, or keep reporting the failure (current behaviour: failure reported,
-  everything else restored). At 114688 the device streams partly invalid packets (README entry 13).
-- The device powers on with the pulser enabled at 20 V. The plug switches it off at `tearDown`
-  only; should construction switch it off too? Owner decision.
-- One SCPI client only: a second connection to port 5025 makes the device close the first at
-  once (4 of 4). The data port does not have this effect. The fake does not model it.
-- Input buffer: a burst above 160 to 320 bytes is discarded with `-363` and a query in it is never
-  answered. The longest line the plug can produce (a long `GAIN:TGC:ARB` list) is not checked.
+- The plug does not switch the pulser off at construction, does not hide the refused power-on
+  `DATA:LENG` in the restore, and does not send `MEM:CLEar` before `STAR AUTO` (no measured
+  need: stale bytes were not reproduced with legal lengths). The first two are firmware defects
+  and are reported to the vendor; README section "Firmware defects the plug does not work around".
+- The tickets for the vendor are kept by the owner outside the repository.
+
+Still open:
+
+- One SCPI client only (a second connection closes the first); the fake does not model it.
+- Burst overrun (many short lines without a read) is not modelled in the fake.
 - `ctp[0]` equals the packet counter in `TRIG:MODE INT`; does it go on past 255?
-- Automatic `AVER:DEL:CONS` follows `TRIG:INT` (interval minus 70.75 us); an averaged packet at
-  `AVER:COUN 4` took about 3 trigger intervals, not 16: how the acquisitions are spaced is open.
-- Stale bytes of the old length at the start of the first stream after a `DATA:LENG` change.
-  Does `MEM:CLEar` remove them (`hw_probe.py --mem-clear`)? Should the plug send it before
-  `STAR AUTO`, as the vendor example does? Owner decision after the measurement.
+- An averaged packet at `AVER:COUN 4` took about 3 trigger intervals, not 16.
+- Next feature candidate: SPEC-golden (golden A-scan comparison), not written yet.
 
 ## Resuming as the owner agent on the local machine
 

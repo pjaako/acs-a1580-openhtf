@@ -73,6 +73,7 @@ The plug stays thin: it has no per-setting setters. Settings are data: a dict of
 | `start_stream(callback, *, timeout_s=5.0)` / `stop_stream()` | Same start as `acquire`, then a daemon thread calls `callback(ascan)` for every A-scan. `timeout_s` is how long the stream may stay silent. `stop_stream()` sends `STOP`, joins the thread, closes the socket and returns the number delivered. It re-raises a callback exception, a stall or lost connection, a failed `STOP` or queued device errors, in that order. |
 | `get_state()` / `set_state(state)` | `get_state()` queries every header in `STATE_HEADERS` (27 headers) and returns `{header: reply}`. `set_state()` writes a snapshot back with `write_checked`: `TRAN:ENAB OFF` first, the other headers in `STATE_HEADERS` order, the snapshot's `TRAN:ENAB` last. `AVER:DEL:CONS` is skipped unless `AVER:DEL:CONS:AUTO` is off, because the vendor says the device rejects it otherwise (-221). Replies are written back with unit suffixes (`REPLY_UNITS` gives the reply unit of each header). |
 | `check_errors()` | Drains `SYST:ERR?` (at most 20 reads) and returns the entries whose number is not 0. Called at construction, after every `apply_setup` write and at the end of every acquisition. |
+| `write(cmd)`, `query(cmd)` | Every line the plug sends goes through these two. A line that is longer than 255 bytes with its CRLF raises `ValueError` (header, length, limit) before anything is sent, because the device discards such a line with `-363` (entry 5). `apply_setup` and `set_state` report it as a failure of that key and go on with the others; `capture check` reports an over-long `GAIN:TGC:ARB` line before anything is sent. |
 | `write_checked(cmd)` | `write()` then `check_errors()`; raises `RuntimeError` naming the command if the queue had entries. |
 | `reset()` | `*RST`, then drains errors. The plug never sends `*RST` on its own. |
 | `tearDown()` | Never raises. Stops a running stream, sends `STOP`, then restores the snapshot (`restore_state` on) or writes `TRAN:ENAB OFF` (`restore_state` off). Closes the data socket, the SCPI resource and the resource manager. |
@@ -194,8 +195,12 @@ for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); tha
    without a read (about 320 bytes), then `SYST:ERR:COUN?`: the first line was processed, the queue got
    `-363,"Input buffer overrun"`, the rest was discarded and the query was never answered (5 s timeout); the connection
    stayed usable. Bursts of 2, 3, 5 and 10 undefined 16-byte lines written with no gap and no read were all processed
-   and the following `SYST:ERR:COUN?` answered, so this is an input-buffer size limit somewhere between 160 and about
-   320 bytes, not a pacing problem. measured 2026-10-05, fw 1.16
+   and the following `SYST:ERR:COUN?` answered, so this is an input-buffer size limit, not a pacing problem.
+   Single line, exact: one line of L bytes in total (terminator `\r\n` included) followed by `SYST:ERR?`: for L = 100,
+   150, 200, 250, 254 and 255 the line was parsed (`-113,"Undefined header;..."` for the undefined test header); for
+   L = 256, 257, 258, 260, 300, 400 and 600 the queue got `-363,"Input buffer overrun"` and the line was discarded. So the
+   buffer is 256 bytes and the longest accepted line is 253 characters plus `\r\n` (255 bytes). The text of a `-113` entry
+   is cut off at 262 characters. A query sent 0.3 s after an overrun was answered normally. measured 2026-10-05, fw 1.16
 6. **Acquisition, `AVER:COUN 0`** (pulser off, `DATA:LENG 1024`, `FREQ 100 MHZ`, `TRIG:MODE INT`, `TRIG:INT 10 MS`).
    10 packets, interval 10.0 ms. Each packet 2076 bytes (28 + 2 * 1024), arrived as one `recv` chunk.
    `packet_number` increments by 1; the first packet after `STAR AUTO` had number 2 and the numbering went on across
@@ -274,12 +279,13 @@ for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); tha
     does not move the signal inside the record: burst and record are delayed together after the trigger. The
     read-backs were `0`, `1000000` and `2000000`. Whether the nanosecond unit is right cannot be seen this way (not
     measured). One bench setup. measured 2026-10-05, fw 1.16
-17. **Stale bytes after a change of `DATA:LENG`.** The first acquisition after `DATA:LENG` was changed from the
-    power-on 114688 to 8192: the plug's `FrameReader` reported `dropped_bytes=98332` (= 6 * 16384 + 28) and 5 resyncs
-    before 5 good packets, so stale bytes of the old length are at the start of the next stream. The vendor example
-    sends `MEM:CLEar` before `STAR AUTO`; neither the plug nor the probe tool does. Whether `MEM:CLEar` prevents it is
-    not measured (`tools/hw_probe.py --mem-clear` sends it in phase C for that). The restore after phase C put
-    everything back except the known power-on `DATA:LENG 114688` (`-224`). Seen once, after one change.
+17. **Stale bytes after a change of `DATA:LENG`.** Seen once: the first acquisition after `DATA:LENG` was changed from
+    the power-on 114688 to 8192: the plug's `FrameReader` reported `dropped_bytes=98332` (= 6 * 16384 + 28) and 5 resyncs
+    before 5 good packets. Not reproduced with legal lengths: a stream at `DATA:LENG 36864`, `STOP`, the data socket
+    closed at once, `DATA:LENG 8192`, a new stream was framed from byte 0 in three trials, one of them with `MEM:CLEar`
+    before `STAR AUTO`. The stale bytes followed a stream at the power-on length 114688. What `MEM:CLEar` is needed for is
+    unknown; the plug does not send it (no measured need). The restore after phase C put everything back except the
+    known power-on `DATA:LENG 114688` (`-224`). measured 2026-10-05, fw 1.16
 18. **`*RST`.** Sent once by `tools/hw_probe.py --phase RST`, pulser off. First run: the connection stayed usable,
     the error queue was empty, `TRAN:ENAB?` right after -> `0`, `DATA:PORT?` -> `2758`, and all 27 state headers equal
     to the snapshot, including `DATA:LENG` 8192 (neither the vendor default 1024 nor the power-on 114688). That run
@@ -323,20 +329,28 @@ Vendor statements contradicted by the device (A and B numbers are entries of the
 - `DATA:LENG` power-on value 114688 is refused by its own setter with `-224` (B1); the length fields `length_lo`/
   `length_hi` are undocumented: a 24-bit "samples + 16" (entry 12, B3).
 - Error queue depth and overflow are undocumented: 16 entries, then `-350,"Queue overflow"` (A13).
-- Not a contradiction but undocumented: an input buffer of a few hundred bytes (between 160 and about 320; commands
-  that do not fit are discarded with `-363`, A1), a second connection to port 5025 closes the first (A2), packets still
+- Not a contradiction but undocumented: an input buffer of 256 bytes (a line over 255 bytes including CRLF is
+  discarded with `-363`, A1), a second connection to port 5025 closes the first (A2), packets still
   arrive after `STOP` and the socket stays open (B4), a setting can be changed while streaming (B5), a data connection
   does not disturb the SCPI one (B6).
 
 Not measured: whether `*RST` stops a running acquisition or clears the error queue; count-to-volt
 scaling (experiment 12, deferred); whether `TRIG:DEL` is in nanoseconds (only seen not to move the signal); how the
-16 acquisitions of an averaged packet are spaced (an averaged packet took about 3 trigger intervals); whether
-`MEM:CLEar` removes the stale bytes after a change of `DATA:LENG`; whether the pulser emits pulses while `TRAN:ENAB`
+16 acquisitions of an averaged packet are spaced (an averaged packet took about 3 trigger intervals); whether the pulser emits pulses while `TRAN:ENAB`
 is 1 but no `STAR AUTO` has been sent (after power-on; measured only: with `TRAN:ENAB ON`, `STAR AUTO` produced a
-received signal, with `TRAN:ENAB OFF` it did not); the exact input-buffer size; the wrap of `packet_number` (the header field is one
+received signal, with `TRAN:ENAB OFF` it did not); what `MEM:CLEar` does (it is not needed after a change of
+`DATA:LENG` to a legal length, entry 17); the wrap of `packet_number` (the header field is one
 byte) and whether `ctp[0]` goes on past 255; whether the automatic `AVER:DEL:CONS` offset of 70.75 us depends on
 `FREQ`; whether errors queue again after the queue was read once while it was full; settling times; everything with another
 transducer pair, voltage or sample rate: phase C used one pair of 50 kHz transducers, 20 V, `FREQ 1 MHZ`.
+
+## Firmware defects the plug does not work around
+
+Three behaviours of fw 1.16 are firmware defects, reported to the vendor; the plug does not hide them. The pulser is
+enabled after power-on, and the plug does not switch it off at construction (only `tearDown` and `set_state` do). The
+power-on `DATA:LENG` (114688) is refused by the setter itself (`-224`) and packets at that length are partly invalid, so
+a restore keeps reporting it. `*RST` resets no setting. A user must therefore send `TRAN:ENAB OFF` and a legal
+`DATA:LENG` first, and power-cycle the device to get back to the power-on state.
 
 ## Things the vendor material does not tell you
 
@@ -383,11 +397,10 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
   other headers are unmeasured.
 - **Settling times** after a change of gain, pulser voltage or impedance, and changes of settings while
   streaming. The plug does not wait or retry. To be measured.
-- **Stale bytes after a change of `DATA:LENG`.** The first acquisition after the length was changed (from 114688 to
-  8192) started with 98332 stale bytes and 5 resyncs before good packets (measured 2026-10-05, fw 1.16, seen once).
-  `FrameReader` resynchronises over them, so the packets are right, but expect dropped bytes in the first
-  acquisition after a change. Whether `MEM:CLEar` before `STAR AUTO` (as the vendor example does) prevents it is
-  not measured.
+- **Stale bytes after a change of `DATA:LENG`.** Seen once, after a stream at the power-on length 114688 (98332 stale
+  bytes and 5 resyncs before good packets, measured 2026-10-05, fw 1.16); not reproduced with legal lengths (three
+  trials, entry 17). `FrameReader` resynchronises over stale bytes, so the packets are right. What `MEM:CLEar` is
+  needed for is unknown; the plug does not send it before `STAR AUTO`.
 
 ## Testing without hardware
 
@@ -400,8 +413,8 @@ the documented reply formats, the error queue with `-113` (undefined header) and
 `AVER:DEL:CONS` while auto is on), `*IDN?` with firmware `1.16 (861f022a)`, `*RST` that changes no setting (measured), and a
 data socket that sends `28 + 2 * DATA:LENG` byte packets between `STAR AUTO` and `STOP`. Measured 2026-10-05
 (fw 1.16) and folded in: the error queue of 16 entries plus `-350`, `-224` for a refused value (`DATA:LENG` outside
-1024 to 36864 and bad words or numbers), `-363` for one line over 256 bytes (the real input buffer limit is between 160 and
-about 320 bytes and the fake cannot see bursts), seconds replies as shortest decimals (`1`, `2e-06`), header length
+1024 to 36864 and bad words or numbers), `-363` for one line over 255 bytes including CRLF and error entries cut at 262
+characters (the fake cannot see bursts of short lines), seconds replies as shortest decimals (`1`, `2e-06`), header length
 fields (a 24-bit samples + 16) and telemetry bytes, `ctp[0]` = the packet counter, `ascan_count` 1, a packet counter
 that starts at 2 and never restarts, two packets still delivered after `STOP`, `DATA:LENG MIN/MAX/DEF`, the automatic
 `AVER:DEL:CONS` (`TRIG:INT / 2^AVER:COUN` minus 70.75 us), and optionally the power-on state, whose packets at `DATA:LENG` 114688

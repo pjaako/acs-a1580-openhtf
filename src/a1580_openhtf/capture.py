@@ -283,6 +283,16 @@ class TgcLinear:
         _check_init(self)
 
 
+# Same value as `plug.MAX_LINE_BYTES` (a test keeps them equal; the plug is not imported here):
+# the device discards a line over 255 bytes including CRLF (measured 2026-10-05, fw 1.16).
+_MAX_LINE_BYTES = 255
+_TGC_ARB_HEADER = 'GAIN:TGC:ARB'
+
+
+def _tgc_arb_text(points: tuple[TgcPoint, ...]) -> str:
+    return ','.join(f'{_fmt_num(p.time)},{_fmt_num(p.gain)}' for p in points)
+
+
 def _first_unordered(points: tuple[TgcPoint, ...]) -> int | None:
     """Index of the first point whose time is not later than the one before it."""
     for i in range(1, len(points)):
@@ -314,6 +324,18 @@ class Tgc:
             found.append(('mode', "mode 'linear' needs a 'linear' curve (offset and slope)"))
         if mode == 'arbitrary' and values.get('arbitrary') is None:
             found.append(('mode', "mode 'arbitrary' needs an 'arbitrary' list of points"))
+        points = values.get('arbitrary')
+        if isinstance(points, tuple):
+            size = len(f'{_TGC_ARB_HEADER} {_tgc_arb_text(points)}') + 2
+            if size > _MAX_LINE_BYTES:
+                found.append(
+                    (
+                        'arbitrary',
+                        f'the {_TGC_ARB_HEADER} line would be {size} bytes including CRLF, '
+                        f'the limit is {_MAX_LINE_BYTES} (the device discards longer lines); '
+                        'use fewer points',
+                    )
+                )
         return found
 
     def __post_init__(self) -> None:
@@ -324,9 +346,7 @@ class Tgc:
         if self.linear is not None:
             out['GAIN:TGC:LIN'] = f'{float(self.linear.offset)!r}, {float(self.linear.slope)!r}'
         if self.arbitrary is not None:
-            out['GAIN:TGC:ARB'] = ','.join(
-                f'{_fmt_num(p.time)},{_fmt_num(p.gain)}' for p in self.arbitrary
-            )
+            out[_TGC_ARB_HEADER] = _tgc_arb_text(self.arbitrary)
         if self.mode is not None:
             out['GAIN:TGC:MODE'] = _TGC_SCPI[self.mode]
         return out

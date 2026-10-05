@@ -498,13 +498,34 @@ def test_seconds_replies_are_the_shortest_decimal(cmd: str, query: str, reply: s
     assert fake.query(query) == reply
 
 
-def test_a_line_over_256_bytes_is_an_input_buffer_overrun_and_discarded() -> None:
+def _line(total_with_crlf: int) -> str:
+    """A `GAIN:TGC:ARB` line that is `total_with_crlf` bytes long including CRLF."""
+    head = 'GAIN:TGC:ARB '
+    return head + '1' * (total_with_crlf - 2 - len(head))
+
+
+def test_a_line_over_255_bytes_with_crlf_is_an_input_buffer_overrun_and_discarded() -> None:
     fake = FakeA1580Resource()
-    fake.write('GAIN:TGC:ARB ' + ','.join(['1'] * 130))
+    fake.write(_line(256))
     assert fake.query('GAIN:TGC:ARB?') == DEFAULTS['GAIN:TGC:ARB']
     assert _drain(fake) == ['-363,"Input buffer overrun"']
     fake.write('GAIN 3')  # the link stays usable
     assert fake.query('GAIN?') == '3'
+
+
+def test_a_line_of_255_bytes_with_crlf_is_parsed() -> None:
+    fake = FakeA1580Resource()
+    fake.write(_line(255))
+    assert _drain(fake) == []
+    assert fake.query('GAIN:TGC:ARB?') == _line(255)[len('GAIN:TGC:ARB ') :]
+
+
+def test_an_error_entry_is_cut_off_at_262_characters() -> None:
+    fake = FakeA1580Resource()
+    fake.write('ZZZ:X ' + '1' * 240)
+    (entry,) = _drain(fake)
+    assert len(entry) == 262
+    assert entry.startswith('-113,"Undefined header;ZZZ:X 111')
 
 
 def _noise_std(fake: FakeA1580Resource) -> float:
