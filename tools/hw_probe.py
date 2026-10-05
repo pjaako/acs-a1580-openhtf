@@ -397,11 +397,11 @@ def step_2(p: Probe) -> None:
     path.write_text(json.dumps(snapshot, indent=2) + '\n', encoding='utf-8')
     p.say(f'answered {len(p.answered)} of {len(STATE_HEADERS)} headers; snapshot saved to {path}')
     if unanswered:
-        p.say(f'WARNING: no answer from {", ".join(unanswered)}; not restored at the end')
+        p.say(f'WARNING: no answer from {", ".join(unanswered)}; the tool never writes them back')
     if p.answered.get('TRAN:ENAB', 'OFF').strip().upper() not in ('OFF', '0'):
         p.say(
             f'WARNING: the pulser was ON as found (TRAN:ENAB {bt(p.answered["TRAN:ENAB"])}); '
-            'the final restore switches it back on'
+            'the tool will leave it OFF, so the final diff will show TRAN:ENAB changed'
         )
     p.current.data.update(
         snapshot_path=str(path), unanswered=unanswered, state=p.state, timing_s=p.timing_s
@@ -451,8 +451,9 @@ def _previous_port(p: Probe) -> str | None:
 def step_4(p: Probe) -> None:
     r"""Experiment 4: does a bare `\n` terminator work (unknown 13)?
 
-    One harmless query (`*IDN?`) over a second raw socket to port 5025, `\n` only. With
-    `--fake` this step prints `SKIPPED (fake)`: the fake has no TCP port and the real
+    One harmless query (`*IDN?`) over a raw socket to port 5025, `\n` only. It runs last,
+    after the main connection is closed (`run`), so it is the only connection to the device.
+    With `--fake` this step prints `SKIPPED (fake)`: the fake has no TCP port and the real
     question is about the device's parser.
     """
     if p.fake:
@@ -863,7 +864,7 @@ STEPS: dict[int, tuple[str, StepFn]] = {
     1: ('*IDN?, SYST:VERS?, SYST:ERR:COUN?', step_1),
     2: ('query every STATE_HEADERS entry, save the snapshot', step_2),
     3: ('DATA:PORT? stability', step_3),
-    4: ('bare newline terminator on a second raw socket', step_4),
+    4: ('bare newline terminator on a raw socket', step_4),
     5: ('error queue behaviour and depth', step_5),
     6: ('acquisition at 1024 / 100 MHz / internal 10 ms', step_6),
     7: ('acquisition with AVER:COUN 4', step_7),
@@ -874,7 +875,7 @@ STEPS: dict[int, tuple[str, StepFn]] = {
 
 def steps_for(phase: str) -> list[int]:
     """Step numbers of a phase. Phase B includes 1 and 2: the snapshot comes first."""
-    a = [1, 2, 3, 4, 5]
+    a = [1, 2, 3, 4, 5]  # step 4 is listed here but `run` and `plan` put it last
     b = [1, 2, 6, 7, 8, 9]
     return {'A': a, 'B': b, 'AB': a + [6, 7, 8, 9]}[phase]
 
@@ -938,6 +939,8 @@ def plan(phase: str) -> list[tuple[str, list[str]]]:
         ],
     }
     for number in chosen:
+        if number == 4:
+            continue
         if number == 6:
             blocks.append(
                 (
@@ -975,6 +978,14 @@ def plan(phase: str) -> list[tuple[str, list[str]]]:
                 'TEARDOWN (plug.tearDown, no restore: phase A is read-only) then FINAL DIFF '
                 '(protocol step 14)',
                 ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF', ERR_QUERY, *final_queries],
+            )
+        )
+    if 4 in chosen:
+        blocks.append(
+            (
+                f'STEP 4: {STEPS[4][0]} (runs last, on its own connection, after the main '
+                'connection is closed)',
+                commands[4],
             )
         )
     return blocks
@@ -1020,30 +1031,51 @@ def ceiling_check(p: Probe) -> None:
     p.say('pulser voltage within the ceiling')
 
 
+def _pulser_off(value: str) -> bool:
+    return value.strip().upper() in ('OFF', '0')
+
+
 def final_diff(p: Probe) -> dict[str, Any]:
-    """Protocol step 14: query `STATE_HEADERS` again (fresh read) and diff against the snapshot."""
-    p.current = StepRecord('FINAL DIFF', 'state after restore against the snapshot of step 2')
+    """Protocol step 14: query `STATE_HEADERS` again (fresh read) and diff against the snapshot.
+
+    A header that cannot be re-read is `unreadable`, not `changed`. `TRAN:ENAB` going from on
+    to off is `expected`: the tool always leaves the pulser off.
+    """
+    p.current = StepRecord('FINAL DIFF', 'state after tearDown against the snapshot of step 2')
     p.records.append(p.current)
     p.say('')
     p.say('FINAL DIFF (protocol step 14): state after tearDown against the snapshot of step 2')
     if not p.state:
         p.say('no snapshot was taken, nothing to compare')
-        return {'compared': 0, 'changed': {}}
-    changed: dict[str, dict[str, str]] = {}
+        return {'compared': 0, 'changed': {}, 'unreadable': {}}
+    changed: dict[str, dict[str, Any]] = {}
+    unreadable: dict[str, str] = {}
     for header in STATE_HEADERS:
+        was = p.state.get(header, '<not in snapshot>')
         try:
             now = str(p.resource.query(f'{header}?')).strip()
         except Exception as exc:  # noqa: BLE001 - a header that never answered still must not stop the diff
             now = f'<ERROR {type(exc).__name__}: {exc}>'
-        was = p.state.get(header, '<not in snapshot>')
+            if now != was:
+                if not unreadable:
+                    p.say(f'UNREADABLE {header}: {type(exc).__name__}: {exc}')
+                unreadable[header] = now
+                continue
         if now != was:
-            changed[header] = {'was': was, 'now': now}
-            p.say(f'CHANGED {header}: was {bt(was)} now {bt(now)}')
+            expected = header == 'TRAN:ENAB' and _pulser_off(now) and not _pulser_off(was)
+            changed[header] = {'was': was, 'now': now, **({'expected': True} if expected else {})}
+            note = ' (expected: the tool always leaves the pulser off)' if expected else ''
+            p.say(f'CHANGED {header}: was {bt(was)} now {bt(now)}{note}')
+    if unreadable:
+        p.say(
+            f'final diff NOT POSSIBLE: {len(unreadable)} of {len(STATE_HEADERS)} headers '
+            'could not be read (connection lost)'
+        )
     if changed:
         p.say(f'{len(changed)} of {len(STATE_HEADERS)} headers differ from the snapshot')
-    else:
+    elif not unreadable:
         p.say(f'no differences: all {len(STATE_HEADERS)} headers equal the snapshot')
-    result = {'compared': len(STATE_HEADERS), 'changed': changed}
+    result = {'compared': len(STATE_HEADERS), 'changed': changed, 'unreadable': unreadable}
     p.current.data.update(result)
     return result
 
@@ -1092,6 +1124,8 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
         steps = steps_for(args.phase)
         plug._restore_state = any(n >= 6 for n in steps)
         for number in steps:
+            if number == 4:
+                continue  # runs last, on its own connection, after the main one is closed
             if number == 6:
                 probe.run_block('PULSER-OFF CHECK', 'TRAN:ENAB OFF and read-back', pulser_off_check)
             title, func = STEPS[number]
@@ -1117,7 +1151,18 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
             probe.say('TEARDOWN: no restore: phase A is read-only; pulser OFF, STOP, close')
         plug.tearDown()
         diff = final_diff(probe)
-        resource.shutdown()
+        if any(not v.get('expected') for v in diff['changed'].values()) or diff['unreadable']:
+            code = code or EXIT_FAILED_STEP
+        try:
+            resource.shutdown()  # the main connection is really closed from here on
+        except Exception as exc:  # noqa: BLE001 - the report must still be written
+            print(
+                f'closing the main connection failed: {type(exc).__name__}: {exc}', file=sys.stderr
+            )
+        if 4 in steps_for(args.phase):
+            probe.run_block('STEP 4', *STEPS[4])
+            if probe.records[-1].status == 'failed':
+                code = code or EXIT_FAILED_STEP
         _write_probe_json(probe, code, diff)
     return code
 

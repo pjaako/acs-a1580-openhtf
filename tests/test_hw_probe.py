@@ -428,3 +428,97 @@ def test_previous_port_is_compared_across_sessions(
     assert hw_probe.main(['--fake', '--out', str(tmp_path)], fake=fake) == 0
     out = capsys.readouterr().out
     assert 'earlier probe saw `9999`, now `2758`: CHANGED' in out
+
+
+# ── step 4 last, honest final diff, pulser left off ──────────────────────────
+
+
+@pytest.mark.parametrize('phase', ['A', 'AB'])
+def test_dry_run_step_4_comes_after_the_teardown_block(
+    capsys: pytest.CaptureFixture[str], phase: str
+) -> None:
+    assert hw_probe.main(['--dry-run', '--phase', phase]) == 0
+    out = capsys.readouterr().out
+    assert out.index('TEARDOWN') < out.index('FINAL DIFF') < out.index('STEP 4:')
+    assert out.index('STEP 5:') < out.index('TEARDOWN')
+    heading = next(line for line in out.splitlines() if line.startswith('STEP 4:'))
+    assert 'own connection' in heading
+    assert 'after the main connection is closed' in heading
+
+
+def test_fake_phase_a_step_4_is_the_last_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_sockets(monkeypatch)
+    assert hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)]) == 0
+    _snapshot, probe_path = _json_files(tmp_path)
+    steps = list(json.loads(probe_path.read_text(encoding='utf-8'))['steps'])
+    assert steps[-1] == 'STEP 4'
+    assert steps.index('STEP 5') < steps.index('TEARDOWN') < steps.index('FINAL DIFF')
+    assert steps.index('FINAL DIFF') < steps.index('STEP 4')
+
+
+def test_step_4_runs_after_the_main_connection_is_closed_and_a_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    real_shutdown = hw_probe.GuardedResource.shutdown
+
+    def shutdown(self: hw_probe.GuardedResource) -> None:
+        events.append('shutdown')
+        real_shutdown(self)
+
+    def step_4(p: Any) -> None:
+        events.append('step 4')
+        raise OSError('boom')
+
+    monkeypatch.setattr(hw_probe.GuardedResource, 'shutdown', shutdown)
+    monkeypatch.setitem(hw_probe.STEPS, 4, ('bare newline', step_4))
+    code = hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)])
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert events == ['shutdown', 'step 4']
+    _snapshot, probe_path = _json_files(tmp_path)  # the report is still written
+    report = json.loads(probe_path.read_text(encoding='utf-8'))
+    assert report['steps']['STEP 4']['status'] == 'failed'
+    assert report['exit_code'] == hw_probe.EXIT_FAILED_STEP
+
+
+def test_final_diff_with_a_dead_link_counts_unreadable_headers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Dead(FakeA1580Resource):
+        def query(self, cmd: str) -> str:
+            if self.stop_count:  # tearDown sent STOP: the link is gone
+                raise BrokenPipeError('gone')
+            return super().query(cmd)
+
+    code = hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)], fake=Dead())
+    out = capsys.readouterr().out
+    assert code == hw_probe.EXIT_FAILED_STEP
+    assert 'CHANGED' not in out
+    assert out.count('UNREADABLE') == 1
+    n = len(STATE_HEADERS)
+    assert f'final diff NOT POSSIBLE: {n} of {n} headers could not be read' in out
+    _snapshot, probe_path = _json_files(tmp_path)
+    report = json.loads(probe_path.read_text(encoding='utf-8'))
+    assert len(report['final_diff']['unreadable']) == n
+    assert report['final_diff']['changed'] == {}
+    assert 'STEP 4' in report['steps']
+
+
+def test_pulser_on_as_found_is_left_off_and_is_an_expected_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeA1580Resource()
+    fake._values['TRAN:ENAB'] = 'ON'
+    assert hw_probe.main(['--fake', '--phase', 'A', '--out', str(tmp_path)], fake=fake) == 0
+    out = capsys.readouterr().out
+    assert 'switches it back on' not in out
+    assert 'the tool will leave it OFF' in out
+    changed = [line for line in out.splitlines() if line.startswith('CHANGED')]
+    assert len(changed) == 1
+    assert changed[0].startswith('CHANGED TRAN:ENAB')
+    assert '(expected: the tool always leaves the pulser off)' in changed[0]
+    _snapshot, probe_path = _json_files(tmp_path)
+    report = json.loads(probe_path.read_text(encoding='utf-8'))
+    assert report['final_diff']['changed']['TRAN:ENAB']['expected'] is True

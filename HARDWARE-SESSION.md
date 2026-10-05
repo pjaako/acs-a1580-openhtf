@@ -36,7 +36,9 @@ Phase A, read-only, no pulser:
    (case of enums, `0/1` vs `ON/OFF`, exponent notation), and which time out.
 3. `DATA:PORT?` (unknown 1). Does the reply change between sessions or after `*RST`?
 4. Does a bare `\n` terminator work (unknown 13)? Try one harmless query over a second
-   raw socket with `\n` only.
+   raw socket with `\n` only. The tool runs it last, on its own connection, because on 2026-10-05
+   (fw 1.16) the main connection died right after a second connection to port 5025 was
+   opened and closed.
 5. Error queue: send one undefined header, read `SYST:ERR?` twice. Depth: send 25 bad
    headers, count entries.
 
