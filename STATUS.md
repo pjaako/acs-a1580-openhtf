@@ -89,22 +89,46 @@ Still open:
 - An averaged packet at `AVER:COUN 4` took about 3 trigger intervals, not 16.
 - Next feature candidate: SPEC-golden (golden A-scan comparison), not written yet.
 
-## Resuming as the owner agent on the local machine
+## Resuming (cold start, any machine)
 
-The work so far was done in a cloud session with no device access. The next session runs
-on the machine next to the A1580, with the human owner at the terminal. The local agent
-takes the project-owner role described in `AGENTS.md`: it talks to the device itself,
-following `HARDWARE-SESSION.md` step by step, and delegates code changes (fake, tests,
-README edits) to coder subagents that never touch the device.
+You are the project-owner agent described in `AGENTS.md`: you talk to the device yourself,
+following `HARDWARE-SESSION.md`; every code change goes to a coder agent that never touches
+the device; you review, run the gates yourself, commit with the co-author line. Ask the human
+owner whether you may push from the machine you are on (on the lab machine he pushes himself).
 
-Checklist for that session, in order:
-1. `git fetch && git checkout claude/friendly-brown-vhwy3d && git pull`.
-2. Python 3.12+ (`uv python install 3.13` if needed), `uv sync --extra dev`, then run the
-   gates from `CLAUDE.md`; expect 586 tests passing before anything else.
-3. Ask the human for the three preconditions in `HARDWARE-SESSION.md` and record the
-   answers in the session log. Do not assume any of them.
-4. `tools/hw_probe.py --phase A --dry-run`, show the plan, get a go, run phase A, then
-   phase B. Phase C (pulser on) only after an explicit go with the voltage named.
-5. After each phase: README section "Measured on the device" (date, firmware), fake
-   updated for every discrepancy with a test, `STATUS.md` unknowns resolved or sharpened,
-   commit with the co-author line, push.
+1. Read `AGENTS.md`, this file, `HARDWARE-SESSION.md`, then README sections "Measured on the
+   device" and "Firmware defects the plug does not work around". `PROTOCOL.md` is the vendor
+   digest and is never edited; README wins where they differ.
+2. `uv sync --extra dev`, then the gates from `CLAUDE.md`. Expect 876 tests passing, ruff and
+   mypy clean, and `tools/hw_probe.py --phase AB --fake`, `--phase C --pulse-v 20 --gain 40 --fake`,
+   `--phase RST --allow-rst --fake` all exiting 0.
+3. Before any contact with the device ask the human the preconditions of `HARDWARE-SESSION.md`
+   again (address and reachability, what is connected and the voltage ceiling, exclusive use).
+   The device is only reachable from a machine on its network.
+
+What to know before touching the device (firmware 1.16):
+
+- After power-on the pulser is enabled at 20 V and `DATA:LENG` is 114688 (illegal, partly invalid
+  packets). First commands: `TRAN:ENAB OFF`, read back, then a legal `DATA:LENG`.
+- One SCPI client: a second connection to port 5025 closes the first. Never run two tools at once.
+- A line over 255 bytes including CRLF, or a burst of that size without reads, is discarded.
+- `*RST` resets nothing; only a power cycle returns the power-on state.
+- `tools/hw_probe.py` is the way to run experiments (`--dry-run` first, show the plan, wait for the
+  human's go; `TRAN:PULS`, `TRAN:ENAB ON` and `*RST` are gated and need his explicit go each time).
+  One-off experiments were done with short raw-socket scripts: one connection, state saved first,
+  restore in a `finally`, log kept.
+
+Next steps, in the order the owner last agreed:
+
+1. Experiment 12, count-to-volt scaling: needs a signal generator on `IN` with known amplitude
+   and frequency, pulser off. The probe tool has no phase for it: write a SPEC first (settings,
+   amplitude steps, saturation check, raw int16 records saved, gain steps), then a coder, then the
+   run. Result: README entry, a `v` conversion only if the scaling proves stable.
+2. SPEC-golden (golden A-scan comparison): the next feature, not written yet.
+3. Smaller open measurements, when convenient: `ctp[0]` past 255, whether the pulser emits before
+   `STAR AUTO`, spacing of averaged acquisitions, whether `*RST` stops a stream or clears the error
+   queue, the unit of `TRIG:DEL`, single-shot acquisition, settling times.
+
+Not in this repository (kept by the owner on the lab machine, they contain the serial number or
+are his to publish): the session log of 2026-10-05, the raw records and probe reports under
+`setups/`, and the tickets for the vendor. Every fact from them that matters is in README.

@@ -61,6 +61,12 @@ different instrument. Read this file, then `STATUS.md`, then the SPEC you were g
   Tools read the address from the environment variable `A1580_HOST`.
 - Set OpenHTF config keys after importing the plug module (`CONF.load(...)` before the
   key is declared is lost).
+- Lessons of the first hardware session (2026-10-05):
+  an explanation of a measured signal is a hypothesis until a control run decides it (the
+  "feed-through" wavelet vanished when the transducers were pulled apart: it was acoustic);
+  a reset or restore test must first move settings away from the values it is expected to
+  return to, otherwise it proves nothing; one SCPI client at a time, a second connection kills
+  the running session; when a tool's output is piped, take the exit code from `PIPESTATUS`.
 - Commits are made by the owner and end with the line
   `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 
