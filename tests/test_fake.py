@@ -35,7 +35,7 @@ def test_defaults_cover_every_state_header_and_are_normalised() -> None:
 
 def test_vendor_reply_formats() -> None:
     fake = FakeA1580Resource()
-    assert fake.query('*IDN?') == 'ACS-Solutions GmbH,A1580-HF,100500,1.6.b41'
+    assert fake.query('*IDN?') == 'ACS-Solutions GmbH,A1580-HF,100500,1.16 (861f022a)'
     assert fake.query('FREQ?') == '100000000'
     assert fake.query('DATA:PORT?') == '2758'
     assert fake.query('TRIG:INT?') == '10.0E-3'
@@ -59,15 +59,15 @@ def test_vendor_reply_formats() -> None:
         ('TRAN:PULS 100 V', 'TRAN:PULS?', '100'),
         ('TRANsmitter:PULSe:LEVel 35 V', 'TRAN:PULS?', '35'),
         ('GAIN 10', 'GAIN?', '10'),
-        ('TRAN:ENAB 1', 'TRAN:ENAB?', 'ON'),
-        ('TRAN:REVerse OFF', 'TRAN:REV?', 'OFF'),
+        ('TRAN:ENAB 1', 'TRAN:ENAB?', '1'),
+        ('TRAN:REVerse OFF', 'TRAN:REV?', '0'),
         ('TRAN:DAMP:ENAB ON', 'TRAN:DAMP?', '1'),
         ('GAIN:PRE:COMB 0', 'GAIN:PRE:COMB?', '0'),
-        ('TRIG:MODE INTERNAL', 'TRIG:MODE?', 'INT'),
-        ('MODE MASTer', 'MODE?', 'MASTER'),
-        ('MODE SLAVe', 'MODE?', 'SLAVE'),
+        ('TRIG:MODE INTERNAL', 'TRIG:MODE?', 'INTernal'),
+        ('MODE MASTer', 'MODE?', 'MASTer'),
+        ('MODE SLAVe', 'MODE?', 'SLAVe'),
         ('TRAN:TYPE DUAL', 'TRAN:TYPE?', 'DUAL'),
-        ('GAIN:TGC:MODE LINear', 'GAIN:TGC:MODE?', 'LIN'),
+        ('GAIN:TGC:MODE LINear', 'GAIN:TGC:MODE?', 'LINear'),
         ('TRAN:IMP 200', 'TRAN:IMP?', '200'),
         ('TRAN:IMP HIGH', 'TRAN:IMP?', 'HIGH'),
         ('GAIN:TGC:LIN 20, 0.1', 'GAIN:TGC:LIN?', '20.0, 0.1'),
@@ -82,6 +82,75 @@ def test_write_converts_to_the_reply_format(cmd: str, query: str, reply: str) ->
     assert fake.query(query) == reply
 
 
+def test_device_reply_forms_measured_2026_10_05_fw_1_16() -> None:
+    fake = FakeA1580Resource()
+    assert fake.query('SYST:VERS?') == '1999.0'
+    assert fake.query('SYSTem:VERSion?') == '1999.0'
+    assert fake.query('MODE?') == 'MASTer'
+    assert fake.query('TRIG:MODE?') == 'INTernal'
+    assert fake.query('TRAN:TYPE?') == 'SINGle'  # as found on the device: DUAL
+    assert fake.query('TRAN:IMP?') == 'HIGH'
+    assert fake.query('GAIN:TGC:MODE?') == 'OFF'
+    for header in ('TRAN:ENAB', 'TRAN:REV', 'TRAN:DAMP', 'GAIN:PRE:COMB', 'GAIN:PRE:SPLIT'):
+        assert fake.query(f'{header}?') in ('0', '1'), header
+    assert fake.query('AVER:DEL:CONS:AUTO?') == '1'
+    fake.write('SYST:VERS 1')
+    assert _drain(fake) == ['-113,"Undefined header;SYST:VERS 1"']
+
+
+@pytest.mark.parametrize('sent', ['ON', 'on', '1'])
+@pytest.mark.parametrize(
+    'header',
+    ['TRAN:ENAB', 'TRAN:REV', 'TRAN:DAMP', 'GAIN:PRE:COMB', 'GAIN:PRE:SPLIT', 'AVER:DEL:CONS:AUTO'],
+)
+def test_booleans_accept_on_off_and_answer_zero_one(header: str, sent: str) -> None:
+    fake = FakeA1580Resource()
+    fake.write(f'{header} {sent}')
+    assert fake.query(f'{header}?') == '1'
+    fake.write(f'{header} {"OFF" if sent != "1" else "0"}')
+    assert fake.query(f'{header}?') == '0'
+    assert _drain(fake) == []
+
+
+@pytest.mark.parametrize(
+    ('header', 'sent', 'reply'),
+    [
+        ('MODE', 'MASTER', 'MASTer'),
+        ('MODE', 'master', 'MASTer'),
+        ('MODE', 'MAST', 'MASTer'),
+        ('MODE', 'MASTer', 'MASTer'),
+        ('MODE', 'slave', 'SLAVe'),
+        ('TRIG:MODE', 'INT', 'INTernal'),
+        ('TRIG:MODE', 'INTERNAL', 'INTernal'),
+        ('TRIG:MODE', 'internal', 'INTernal'),
+        ('TRIG:MODE', 'ctp', 'CTP'),
+        ('TRIG:MODE', 'ENCODER', 'ENCoder'),
+        ('TRIG:MODE', 'ttl', 'TTL'),
+        ('TRAN:TYPE', 'SING', 'SINGle'),
+        ('TRAN:TYPE', 'dual', 'DUAL'),
+        ('GAIN:TGC:MODE', 'LINEAR', 'LINear'),
+        ('GAIN:TGC:MODE', 'arb', 'ARBitrary'),
+        ('GAIN:TGC:MODE', 'off', 'OFF'),
+        ('TRAN:IMP', 'high', 'HIGH'),
+        ('TRAN:IMP', '1000', '1000'),
+    ],
+)
+def test_enumerations_answer_in_the_fixed_notation_not_an_echo(
+    header: str, sent: str, reply: str
+) -> None:
+    fake = FakeA1580Resource()
+    fake.write(f'{header} {sent}')
+    assert _drain(fake) == []
+    assert fake.query(f'{header}?') == reply
+
+
+def test_an_unknown_enumeration_word_is_an_error() -> None:
+    fake = FakeA1580Resource()
+    fake.write('MODE BANANA')
+    assert len(_drain(fake)) == 1
+    assert fake.query('MODE?') == 'MASTer'
+
+
 def test_log_is_verbatim() -> None:
     fake = FakeA1580Resource()
     fake.write('FREQ 50 MHZ')
@@ -92,7 +161,7 @@ def test_log_is_verbatim() -> None:
 def test_unknown_header_queues_113_and_query_raises() -> None:
     fake = FakeA1580Resource()
     fake.write('FOO:BAR 1')
-    assert fake.query(ERR) == '-113,"Undefined header;Command: FOO:BAR 1"'
+    assert fake.query(ERR) == '-113,"Undefined header;FOO:BAR 1"'
     assert fake.query(ERR) == '0,"No error"'
     with pytest.raises(TimeoutError):
         fake.query('FOO:BAR?')
@@ -139,7 +208,7 @@ def test_rst_restores_defaults_and_keeps_the_error_queue() -> None:
 
 def test_constant_delay_while_auto_is_221() -> None:
     fake = FakeA1580Resource()
-    assert fake.query('AVER:DEL:CONS:AUTO?') == 'ON'
+    assert fake.query('AVER:DEL:CONS:AUTO?') == '1'
     fake.write('AVER:DEL:CONS 50 US')
     assert _drain(fake) == ['-221,"Settings conflict"']
     assert fake.query('AVER:DEL:CONS?') == '10.0E-6'  # old value kept
@@ -342,7 +411,7 @@ def test_visa_errors_raise_visaioerror_for_unanswered_queries() -> None:
     pyvisa = pytest.importorskip('pyvisa')
     fake = FakeA1580Resource(visa_errors=True)
     with pytest.raises(pyvisa.errors.VisaIOError) as exc:
-        fake.query('SYST:VERS?')  # a known node the fake has no value for
+        fake.query('FILT:HPAS?')  # a known node the fake has no value for
     assert exc.value.error_code == pyvisa.constants.StatusCode.error_timeout
     assert not isinstance(exc.value, OSError)
     with pytest.raises(pyvisa.errors.VisaIOError):
@@ -354,7 +423,7 @@ def test_visa_errors_raise_visaioerror_for_unanswered_queries() -> None:
 def test_without_visa_errors_the_timeout_is_a_timeout_error() -> None:
     fake = FakeA1580Resource()
     with pytest.raises(TimeoutError):
-        fake.query('SYST:VERS?')
+        fake.query('FILT:HPAS?')
 
 
 def test_the_data_socket_keeps_raising_timeout_error_with_visa_errors() -> None:

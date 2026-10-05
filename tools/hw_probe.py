@@ -213,6 +213,8 @@ def bt(text: object) -> str:
 
 
 def _shape(reply: str) -> str:
+    if not reply:
+        return 'empty'
     if re.fullmatch(r'[+-]?\d+', reply):
         return 'integer'
     if re.fullmatch(r'[+-]?(\d+\.?\d*|\.\d+)[eE][+-]?\d+', reply):

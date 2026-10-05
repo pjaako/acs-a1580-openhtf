@@ -148,13 +148,68 @@ exact packets. Changing `DATA:LENG` or `FREQ` while the stream runs is not suppo
 "Acquisition and data stream" for the layout table, the resync algorithm and the weakness of the vendor's own
 `recv`-per-packet reader.
 
+## Measured on the device (2026-10-05, firmware 1.16 (861f022a))
+
+Phase A of `HARDWARE-SESSION.md` (read-only queries, pulser not touched by the tool), on one A1580-HF. Lines were
+sent to TCP 5025 with `\r\n`; replies are shown without the trailing `\r\n`. The serial number is written
+`<serial>`. VENDOR-ISSUES.md holds the same facts as tickets for the vendor (entries A1 to A12).
+
+1. **Identity.** `*IDN?` -> `ACS-Solutions GmbH,A1580-HF,<serial>,1.16 (861f022a)` (the firmware field contains a
+   space and brackets), `SYST:VERS?` -> `1999.0`, `SYST:ERR:COUN?` -> `0`. measured 2026-10-05, fw 1.16
+2. **Every `STATE_HEADERS` entry, plus `DATA:PORT?`, answered.** Replies as found (not defaults; the pulser was on):
+   `FREQ?` -> `100000000`, `DATA:LENG?` -> `114688`, `MODE?` -> `MASTer`, `TRAN:TYPE?` -> `DUAL`, `TRAN:REV?` -> `0`,
+   `TRAN:PULS?` -> `20`, `TRAN:FREQ?` -> `5000000`, `TRAN:DUR?` -> `1`, `TRAN:GAP?` -> `5`, `TRAN:DAMP?` -> `0`,
+   `TRAN:DAMP:GAP?` -> `10`, `TRAN:IMP?` -> `HIGH`, `TRAN:ENAB?` -> `1` (and `0` after `TRAN:ENAB OFF`),
+   `TRIG:MODE?` -> `INTernal`, `TRIG:INT?` -> `1`, `TRIG:DEL?` -> `15000`, `GAIN?` -> `0`, `GAIN:PRE:COMB?` -> `0`,
+   `GAIN:PRE:SPLIT?` -> `0`, `GAIN:TGC:LIN?` -> `0,0`, `GAIN:TGC:ARB?` -> an empty line, `GAIN:TGC:MODE?` -> `OFF`,
+   `AVER:COUN?` -> `0`, `AVER:DEL:CONS:AUTO?` -> `1`, `AVER:DEL:CONS?` -> `0.99992925`, `AVER:DEL:RAND?` -> `2e-06`,
+   `FILT:HPAS:IND?` -> `0`. Booleans are `0`/`1`; enumerations are the vendor's mixed-case notation string, whatever
+   form the client wrote (`MASTer`, `INTernal`); times are the shortest decimal with a lower-case `e` and no `.0`.
+   measured 2026-10-05, fw 1.16
+3. **`DATA:PORT?`** -> `2758`, the same in three sessions that day. measured 2026-10-05, fw 1.16
+4. **Terminator.** A query ended with a bare `\n` is answered; the reply still ends `\r\n`. measured 2026-10-05,
+   fw 1.16
+5. **Error queue.** `ZZZ:NOPE 1` then `SYST:ERR?` twice -> `-113,"Undefined header;ZZZ:NOPE 1"`, then `0,"No error"`
+   (the whole line as sent, no `Command: ` prefix, no space after the comma of the empty reply). 25 lines
+   `ZZZ:NOPE01` to `ZZZ:NOPE25` written back to back without a read, then `SYST:ERR:COUN?`: the query was never
+   answered (5 s timeout); the queue then held exactly two entries, `-113,"Undefined header;ZZZ:NOPE01"` and
+   `-363,"Input buffer overrun"`, and the connection stayed usable. So the device does not keep up with writes that
+   are not read back one by one. measured 2026-10-05, fw 1.16
+
+Also seen once: the main SCPI connection died right after a second connection to port 5025 had been opened, queried
+and closed (the next query on the first one timed out, later writes failed with a broken pipe; a new connection
+worked at once). One client at a time, and the tool runs its second-connection experiment last on its own connection.
+measured 2026-10-05, fw 1.16
+
+Vendor statements contradicted by the device (numbers refer to VENDOR-ISSUES.md):
+
+- Replies to booleans are `ON`/`OFF` in the manual: they are `0`/`1` (A4).
+- Enumeration replies are the short, upper-case or echoed form in the manual examples (`MASTER`, `INT`): they are
+  the mixed-case notation strings `MASTer`, `INTernal` (A3).
+- Time replies look like `100.0E-3` in the manual: they are shortest-decimal numbers such as `2e-06` (A5).
+- Error text carries `Command: ` in the manual: it does not; the empty reply has no space (A6).
+- `DATA:PORT?` replies `5025` in the manual: `2758` (A7).
+- `DATA:LENG` range 1024 to 36864: the device held 114688 (A8).
+- Settings as found differ from the `DEFault` column: pulser on, `DUAL`, `TRIG:INT` 1 s (A9); open question whether
+  these are power-on values.
+- Automatic `AVER:DEL:CONS` appears to depend on `TRIG:INT` (A10).
+- TGC replies before anything was set are `0,0` and an empty line, not the manual's examples (A11).
+- `SYST:VERS?` has no documented reply: `1999.0`; the firmware field of `*IDN?` is `1.16 (861f022a)` (A12).
+- Not a contradiction but undocumented: commands written back to back overrun an input buffer (A1) and a second
+  connection to port 5025 kills the first (A2).
+
+Not measured in this phase: the depth of the error queue (the 25-line experiment hit the input-buffer overrun
+instead, so it is still unknown); `DATA:PORT?` after `*RST` (`*RST` was not sent); and which of opening or closing a
+second connection kills the first.
+
 ## Things the vendor material does not tell you
 
 The vendor documents are partly inconsistent and silent on these. The plug does the safest thing for each. All
 are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
 
 - **Data port.** `SCPI_COMMANDS.md` shows `DATA:PORT?` replying 5025, the vendor script starts with 2758. The
-  plug queries it on every acquisition and never hard-codes it. The real value is to be measured.
+  device answered `2758` (measured 2026-10-05, fw 1.16). The plug still queries it on every acquisition and never
+  hard-codes it. Whether the value changes after `*RST` is to be measured.
 - **Single-shot acquisition.** Only `STAR AUTO` is documented, although the text mentions single acquisitions.
   Packets already in flight when `STOP` is sent may be lost or may arrive late. To be measured.
 - **Averaging.** Whether `AVER:COUN` is N or 2^N averages, and what the header field `ascan_count` counts, is
@@ -170,9 +225,11 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
 - **`*RST` defaults.** Not documented beyond the `DEFault` column, and it is unknown whether `*RST` stops a
   running acquisition. The plug never sends `*RST` on its own and `apply_capture` does not reset by default.
   To be measured.
-- **Reply formats.** Whether enumerations and booleans come back as the echo, the short form or the long form
-  (`INT` or `INTERNAL`, `ON` or `1`), and which unit a bare number gets in a command. `values_match` accepts
-  the long, short and case variants, and the plug writes units explicitly. To be measured.
+- **Reply formats.** Settled on 2026-10-05, fw 1.16: booleans come back as `0`/`1`, enumerations as the mixed-case
+  notation (`MASTer`, `INTernal`), times as shortest decimals (`2e-06`); see the section above. `values_match`
+  accepts the long, short, case and `ON`/`1` variants. Still to be measured: which unit a bare number gets in a
+  command (the plug writes units explicitly) and the formats of the headers not yet written (for example
+  `GAIN:TGC:LIN` after a write).
 - **Clamping.** The vendor documents silent clamping nowhere, so every value is read back after writing.
   Out-of-range behaviour (error, clamp or replace) is to be measured.
 - **Settling times** after a change of gain, pulser voltage or impedance, and changes of settings while
@@ -186,7 +243,7 @@ fake's data socket too. `examples/example_test.py --fake` does exactly that.
 
 What it models, from the vendor documents: the SCPI header set with long and short forms, unit conversion to
 the documented reply formats, the error queue with `-113` (undefined header) and `-221` (settings conflict on
-`AVER:DEL:CONS` while auto is on), `*IDN?` with the vendor's example reply, `*RST` to its default table, and a
+`AVER:DEL:CONS` while auto is on), `*IDN?` with firmware `1.16 (861f022a)`, `*RST` to its default table, and a
 data socket that sends `28 + 2 * DATA:LENG` byte packets only between `STAR AUTO` and `STOP`.
 
 What it invents: the signal (a damped sine burst at `TRAN:FREQ`, starting at 10 % of the record, amplitude
@@ -216,7 +273,7 @@ hardware-free stand-in · `capture.schema.json` generated JSON Schema · `captur
 (`vendor_example.yaml`, 20 V) · `examples/example_test.py` minimal OpenHTF test, see `examples/README.md` ·
 `tests/` pytest suite (including `tests/data/broken.yaml`) · `.vscode/settings.json` YAML schema mapping ·
 `.github/workflows/ci.yml` ruff, mypy and pytest · `PROTOCOL.md` digest of the vendor material, every claim cited,
-`UNKNOWN` and `CONFLICT n` kept · `SPEC.md`/`SPEC-capture.md` contracts for coder agents · `STATUS.md` current
+`UNKNOWN` and `CONFLICT n` kept · `VENDOR-ISSUES.md` where the device differs from the vendor material, one entry per observation, for the vendor · `SPEC.md`/`SPEC-capture.md` contracts for coder agents · `STATUS.md` current
 state and open questions · `AGENTS.md`/`CLAUDE.md` rules for agents · `pyproject.toml`, `uv.lock`, `LICENSE`.
 
 `192.168.200.18` is the address used in all vendor examples. Do not commit any other real address or serial number.

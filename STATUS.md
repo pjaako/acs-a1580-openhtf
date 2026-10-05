@@ -1,6 +1,6 @@
 # STATUS.md
 
-Last updated: 2026-10-04 (evening) by the project owner agent.
+Last updated: 2026-10-05 (after hardware phase A) by the project owner agent.
 
 ## Decisions taken (with the human owner)
 
@@ -12,7 +12,7 @@ Last updated: 2026-10-04 (evening) by the project owner agent.
   `mypy` on the typed modules, GitHub Actions running the hardware-free suite.
 - Acquisition API: blocking `acquire(n, timeout_s)` built on start/collect/stop, plus
   `start_stream(callback)` / `stop_stream()`.
-- Hardware: one A1580-HF at the vendor default `192.168.200.18`, firmware unknown.
+- Hardware: one A1580-HF at the vendor default `192.168.200.18`, firmware `1.16 (861f022a)`.
 - Package `a1580-openhtf`, import `a1580_openhtf`, class `A1580Plug`, MIT, Python 3.12+.
 - Code from rigol-dho-openhtf may be copied and adapted (provenance comment at the top).
 
@@ -29,26 +29,33 @@ Last updated: 2026-10-04 (evening) by the project owner agent.
       values_match false positives closed; dead-link abort; per-stream state and SCPI lock.
 - [x] `tools/hw_probe.py` implementing phases A and B of `HARDWARE-SESSION.md`, with
       `--dry-run` and `--fake`. Phase C (pulser on) is not implemented yet on purpose.
-- [ ] First hardware session (needs the device reachable from the agent, see HARDWARE-SESSION.md preconditions).
+- [x] Hardware phase A (read-only), 2026-10-05, fw 1.16: README "Measured on the device", fake
+      updated (booleans `0`/`1`, enumeration notation strings, error text, `SYST:VERS?`), 656 tests.
+      The probe tool no longer restores after phase A and runs the second-connection experiment last.
+      `VENDOR-ISSUES.md` lists every difference from the vendor material (A1 to A12).
+- [ ] Hardware phase B (pulser off, acquisition), then phase C (pulser on; the probe tool has no
+      phase C yet, a SPEC for it comes first).
 - [ ] SPEC-golden (golden A-scan comparison), not written yet.
 
-## Blocked: waiting for the human owner
+## Open questions after phase A
 
-The next step is the first hardware session (`HARDWARE-SESSION.md`). It needs:
-1. The A1580 reachable from the agent: forward TCP 5025 and the data port (default 2758,
-   confirmed by `DATA:PORT?`) to the cloud box, or run the session on the local machine.
-2. Confirmation of what is connected to the `IN`/`OUT` sockets and the safe pulser ceiling
-   (default 20 V; phases A and B do not enable the pulser at all).
-3. Nobody else using the device during the session.
+From `PROTOCOL.md` "Unknowns to verify on hardware"; the ones that block design choices are still
+single-shot acquisition, the meaning of `AVER:COUN` and the header `ascan_count`, and count-to-volt
+scaling. Settled: `DATA:PORT?` is `2758` (not after `*RST`), a bare `\n` terminator works, reply
+forms of booleans and enumerations. New or sharpened by phase A:
 
-Command to run first: `A1580_HOST=<ip> .venv/bin/python tools/hw_probe.py --phase A`
-(after `--dry-run` to see the plan).
-
-## Open questions for the first hardware session
-
-See `PROTOCOL.md`, section "Unknowns to verify on hardware". The ones that block design
-choices are: the real `DATA:PORT?` value, whether a single-shot acquisition exists,
-the meaning of `AVER:COUN` and the header `ascan_count`, and count-to-volt scaling.
+- Input-buffer overrun: 25 lines written back to back lost 24 of them (`-363`). How many lines
+  survive without a read in between is not measured. It matters for `tearDown`, which sends
+  `TRAN:ENAB OFF`, `STOP`, `TRAN:ENAB OFF` without reading. Error-queue depth is still unknown for
+  the same reason.
+- A second connection to port 5025 killed the first (seen once). Open or close? Does the data
+  socket count?
+- `DATA:LENG` was 114688 as found, above the documented 36864: real range unknown; will the
+  restore after phase B be accepted?
+- Are the as-found settings (pulser on, `DUAL`, `TRIG:INT` 1 s) power-on values?
+- Number format of time replies after a write (only `1`, `0.99992925`, `2e-06` seen so far); the
+  fake still answers in the vendor's `10.0E-3` style.
+- Automatic `AVER:DEL:CONS` seems to follow `TRIG:INT` (interval minus 70.75 us).
 
 ## Resuming as the owner agent on the local machine
 

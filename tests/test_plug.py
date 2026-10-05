@@ -94,8 +94,8 @@ def test_construction_parses_identity_and_drains_errors() -> None:
     fake = FakeA1580Resource()
     fake.write('NOPE 1')  # stale error from an earlier session
     plug = A1580Plug(resource=fake, restore_state=False)
-    assert plug.identity == Identity('ACS-Solutions GmbH', 'A1580-HF', '100500', '1.6.b41')
-    assert plug.identity.firmware == '1.6.b41'
+    assert plug.identity == Identity('ACS-Solutions GmbH', 'A1580-HF', '100500', '1.16 (861f022a)')
+    assert plug.identity.firmware == '1.16 (861f022a)'
     assert fake.query(ERR) == '0,"No error"'  # the stale entry was drained
     assert not any(entry.startswith('*RST') for entry in fake.log)
     assert fake.log.index(ERR) < fake.log.index('*IDN?')
@@ -265,6 +265,19 @@ def test_apply_setup_unknown_header_is_reported_not_a_crash() -> None:
         ('MODE', 'MASTer', 'MASTER', True),
         ('MODE', 'MASTer', 'MAST', True),
         ('MODE', 'MASTer', 'SLAVE', False),
+        # exact device replies, measured 2026-10-05, fw 1.16 (861f022a)
+        ('MODE', 'MASTER', 'MASTer', True),
+        ('MODE', 'master', 'MASTer', True),
+        ('MODE', 'MAST', 'MASTer', True),
+        ('MODE', 'SLAVe', 'MASTer', False),
+        ('TRIG:MODE', 'INT', 'INTernal', True),
+        ('TRIG:MODE', 'INTERNAL', 'INTernal', True),
+        ('TRIG:MODE', 'internal', 'INTernal', True),
+        ('TRAN:ENAB', 'OFF', '0', True),
+        ('TRAN:ENAB', 'ON', '0', False),
+        ('AVER:DEL:CONS:AUTO', 'ON', '1', True),
+        ('TRAN:REV', 'OFF', '0', True),
+        ('TRAN:DAMP', 'OFF', '0', True),
         ('TRAN:TYPE', 'SINGle', 'DUAL', False),
         ('TRAN:IMP', 'HIGH', 'HIGH', True),
         ('TRAN:IMP', '200', '200', True),
@@ -430,7 +443,7 @@ def test_set_state_never_writes_pulser_on_from_a_snapshot(
     fake = _fake(plug)
     plug.apply_setup({'TRAN:ENAB': 'ON'})
     state = plug.get_state()
-    assert state['TRAN:ENAB'] == 'ON'
+    assert state['TRAN:ENAB'] == '1'
     fake.log.clear()
     with caplog.at_level(logging.WARNING):
         plug.set_state(state)
@@ -439,7 +452,7 @@ def test_set_state_never_writes_pulser_on_from_a_snapshot(
     assert writes.count('TRAN:ENAB OFF') == 2
     assert not any(w.startswith('TRAN:ENAB ON') for w in writes)
     assert fake.log[:2] == ['TRAN:ENAB OFF', ERR]  # unchecked, before the drain
-    assert plug.query('TRAN:ENAB?') == 'OFF'
+    assert plug.query('TRAN:ENAB?') == '0'
     assert 'snapshot had the pulser ON' in caplog.text
 
 
@@ -465,10 +478,10 @@ def test_construction_does_not_warn_when_the_pulser_is_off(
 
 def test_teardown_leaves_the_pulser_off_when_it_was_on_at_construction() -> None:
     fake = FakeA1580Resource()
-    fake._values['TRAN:ENAB'] = 'ON'
+    fake._values['TRAN:ENAB'] = '1'
     plug = A1580Plug(resource=fake, restore_state=True)
     plug.tearDown()
-    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
     assert fake.closed
 
 
@@ -476,7 +489,7 @@ def test_set_state_skips_constant_delay_while_auto_is_on() -> None:
     plug = _plug()
     fake = _fake(plug)
     state = plug.get_state()
-    assert state['AVER:DEL:CONS:AUTO'] == 'ON'
+    assert state['AVER:DEL:CONS:AUTO'] == '1'
     fake.log.clear()
     plug.set_state(state)
     assert not any(e.startswith('AVER:DEL:CONS ') for e in fake.log)
@@ -548,7 +561,7 @@ def test_restore_state_false_stops_and_closes_only() -> None:
     plug.tearDown()
     # unchecked OFF, STOP, then the pulser off again (checked: one drain), nothing restored
     assert fake.log == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF', ERR]
-    assert fake._values == {**changed, 'TRAN:ENAB': 'OFF'}
+    assert fake._values == {**changed, 'TRAN:ENAB': '0'}
     assert fake.closed
 
 
@@ -556,11 +569,11 @@ def test_teardown_without_restore_switches_the_pulser_off_after_stop() -> None:
     plug = _plug(restore_state=False)
     fake = _fake(plug)
     plug.apply_setup({'TRAN:ENAB': 'ON'})
-    assert fake.query('TRAN:ENAB?') == 'ON'
+    assert fake.query('TRAN:ENAB?') == '1'
     fake.log.clear()
     plug.tearDown()
     assert fake.log[:3] == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF']
-    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
     assert fake.closed
 
 
@@ -1004,7 +1017,7 @@ def test_apply_capture_applies_the_vendor_example_file() -> None:
     assert '*RST' not in fake.log
     # TRAN:ENAB is the last header: its write, the error drain, then the read-back
     assert fake.log[-3:] == ['TRAN:ENAB ON', ERR, 'TRAN:ENAB?']
-    assert fake._values['TRAN:ENAB'] == 'ON'
+    assert fake._values['TRAN:ENAB'] == '1'
     assert fake._values['TRAN:PULS'] == '20'
 
 
@@ -1128,7 +1141,7 @@ def test_teardown_first_action_is_an_unchecked_pulser_off(restore: bool) -> None
     plug.tearDown()
     assert fake.log[0] == 'TRAN:ENAB OFF'  # before STOP, before any error-queue read
     assert fake.log[1] == 'STOP'
-    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
 
 
 def test_teardown_pulser_off_comes_before_stopping_a_running_stream() -> None:
@@ -1160,7 +1173,7 @@ def test_teardown_goes_on_when_the_first_pulser_off_fails(
         plug.tearDown()
     assert calls == ['TRAN:ENAB OFF', 'STOP', 'TRAN:ENAB OFF']  # the checked one still follows
     assert 'pulser off first' in caplog.text
-    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
     assert fake.closed
 
 
@@ -1188,7 +1201,7 @@ def test_set_state_goes_on_when_the_first_drain_raises(caplog: pytest.LogCapture
     assert fake.log[0] == 'TRAN:ENAB OFF'  # the unchecked write came before the failing drain
     assert 'draining the error queue failed' in caplog.text
     assert fake._values['FREQ'] == '100000000'  # the restore happened
-    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
 
 
 def test_set_state_sends_nothing_else_when_the_first_off_cannot_be_written() -> None:
@@ -1214,7 +1227,7 @@ def test_set_state_without_a_pulser_entry_still_ends_off() -> None:
     fake.log.clear()
     plug.set_state(state)
     assert fake.log[-2:] == ['TRAN:ENAB OFF', ERR]
-    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
 
 
 def test_docstrings_describe_the_pulser_rule() -> None:
@@ -1435,7 +1448,7 @@ def test_set_state_continues_after_a_failed_header_and_raises_at_the_end() -> No
     assert 'GAIN 0' in writes and 'AVER:DEL:RAND 2000 NS' in writes  # the later headers
     assert writes[-1] == 'TRAN:ENAB OFF'  # the final OFF came before the raise
     assert fake._values['GAIN'] == '0'
-    assert fake._values['TRAN:ENAB'] == 'OFF'
+    assert fake._values['TRAN:ENAB'] == '0'
 
 
 def test_set_state_collects_a_transport_error_and_discards_the_late_reply() -> None:
@@ -2140,10 +2153,10 @@ def test_apply_setup_collects_a_visa_timeout_and_applies_later_keys() -> None:
     plug = _plug(visa_errors=True)
     fake = _fake(plug)
     with pytest.raises(
-        RuntimeError, match=r'SYST:VERS.*no answer to SYST:VERS\?: VisaIOError'
+        RuntimeError, match=r'FILT:HPAS.*no answer to FILT:HPAS\?: VisaIOError'
     ) as exc:
-        # SYST:VERS is a valid node chain the fake has no value for: rejected, query times out
-        plug.apply_setup({'GAIN': 6, 'SYST:VERS': 1, 'FREQ': '50 MHZ'})
+        # FILT:HPAS is a valid node chain the fake has no value for: rejected, query times out
+        plug.apply_setup({'GAIN': 6, 'FILT:HPAS': 1, 'FREQ': '50 MHZ'})
     assert 'GAIN' not in str(exc.value).split('apply_setup failed:')[1]
     assert plug.query('GAIN?') == '6'
     assert plug.query('FREQ?') == '50000000'  # applied after the failure

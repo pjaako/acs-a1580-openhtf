@@ -46,6 +46,22 @@ def _json_files(out: Path) -> tuple[Path, Path]:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ('reply', 'shape'),
+    [
+        ('', 'empty'),
+        ('0', 'integer'),
+        ('2e-06', 'exponent notation'),
+        ('1999.0', 'decimal'),
+        ('0,0', 'list'),
+        ('HIGH', 'upper-case word'),
+        ('MASTer', 'mixed-case word'),
+    ],
+)
+def test_shape_labels_the_reply_format(reply: str, shape: str) -> None:
+    assert hw_probe._shape(reply) == shape
+
+
 def test_dry_run_lists_every_command_without_connecting(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -151,7 +167,7 @@ def test_fake_phase_ab_runs_all_steps(
 
     snapshot_path, probe_path = _json_files(tmp_path)
     snapshot = json.loads(snapshot_path.read_text(encoding='utf-8'))
-    assert snapshot['idn'] == 'ACS-Solutions GmbH,A1580-HF,100500,1.6.b41'
+    assert snapshot['idn'] == 'ACS-Solutions GmbH,A1580-HF,100500,1.16 (861f022a)'
     assert set(snapshot['state']) == set(STATE_HEADERS)
     assert set(snapshot['timing_s']) == set(STATE_HEADERS)
     assert snapshot_path.name.startswith('100500-')
@@ -182,7 +198,7 @@ def test_replies_are_printed_verbatim_between_backticks(
     fake = FakeA1580Resource()
     assert hw_probe.main(['--fake', '--out', str(tmp_path)], fake=fake) == 0
     out = capsys.readouterr().out
-    assert '`ACS-Solutions GmbH,A1580-HF,100500,1.6.b41`' in out
+    assert '`ACS-Solutions GmbH,A1580-HF,100500,1.16 (861f022a)`' in out
     assert 'TRIG:INT?' in out
     assert '`10.0E-3`' in out
     assert '`2758`' in out

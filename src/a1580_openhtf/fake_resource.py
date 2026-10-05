@@ -1,6 +1,8 @@
 # Adapted from rigol-dho-openhtf fake_resource.py (shape of the fake: log, error queue,
 # reject map, generic settings store). The command set, reply formats and the data socket
-# are specific to the A1580 and follow PROTOCOL.md; nothing in here was measured.
+# are specific to the A1580 and follow PROTOCOL.md. Phase A of the first hardware session
+# (2026-10-05, fw 1.16 (861f022a), read-only queries) is folded in where a comment says
+# `measured`; everything else was not measured.
 """Fake A1580: a stand-in for the pyvisa SCPI resource and for the A-scan data socket.
 
 A fake only knows what we told it. Every reply format below comes from the vendor
@@ -23,11 +25,13 @@ _KEYWORDS = ('MIN', 'MINIMUM', 'MAX', 'MAXIMUM', 'DEF', 'DEFAULT', 'UP', 'DOWN')
 # table). UNKNOWN defaults take the vendor example's value.
 DEFAULTS: dict[str, str] = {
     'FREQ': '100000000',
+    # measured 2026-10-05, fw 1.16: DATA:LENG? -> `114688` as found, above the documented
+    # range 1024..36864; the fake keeps its default and does not model a range: not modelled yet.
     'DATA:LENG': '1024',
     'DATA:PORT': '2758',  # vendor code default; the doc example shows 5025 (CONFLICT 1)
-    'MODE': 'MASTER',  # UNKNOWN default (vendor example sets MASTer)
-    'TRAN:TYPE': 'SING',
-    'TRAN:REV': 'OFF',
+    'MODE': 'MASTer',  # UNKNOWN default (vendor example sets MASTer)
+    'TRAN:TYPE': 'SINGle',
+    'TRAN:REV': '0',
     'TRAN:PULS': '20',
     'TRAN:FREQ': '5000000',
     'TRAN:DUR': '1',
@@ -35,28 +39,48 @@ DEFAULTS: dict[str, str] = {
     'TRAN:DAMP': '0',
     'TRAN:DAMP:GAP': '10',
     'TRAN:IMP': 'HIGH',
-    'TRAN:ENAB': 'OFF',
-    'TRIG:MODE': 'INT',  # UNKNOWN default (vendor example sets INTERNAL)
+    'TRAN:ENAB': '0',
+    'TRIG:MODE': 'INTernal',  # UNKNOWN default (vendor example sets INTERNAL)
+    # measured 2026-10-05, fw 1.16: TRIG:INT? -> `1`, AVER:DEL:CONS? -> `0.99992925`,
+    # AVER:DEL:RAND? -> `2e-06` (shortest decimal, lower-case e, no `.0`); the fake still
+    # answers in the doc's engineering notation (`10.0E-3`): not modelled yet.
     'TRIG:INT': '10.0E-3',
     'TRIG:DEL': '15000',
     'GAIN': '0',
     'GAIN:PRE:COMB': '0',  # UNKNOWN default
     'GAIN:PRE:SPLIT': '0',  # UNKNOWN default
     'GAIN:TGC:MODE': 'OFF',
+    # measured 2026-10-05, fw 1.16, before anything was set: GAIN:TGC:LIN? -> `0,0` and
+    # GAIN:TGC:ARB? -> an empty line; the fake still answers with the doc examples: not
+    # modelled yet.
     'GAIN:TGC:LIN': '20.0, 0.1',  # UNKNOWN default (doc example reply)
     'GAIN:TGC:ARB': '0,5,2,20,5,20,10,40,30,10',  # UNKNOWN default (vendor example points)
     'AVER:COUN': '0',
-    'AVER:DEL:CONS:AUTO': 'ON',  # UNKNOWN default (vendor example sets ON)
+    'AVER:DEL:CONS:AUTO': '1',  # UNKNOWN default (vendor example sets ON)
     'AVER:DEL:CONS': '10.0E-6',
     'AVER:DEL:RAND': '2.0E-6',
     'FILT:HPAS:IND': '1',  # UNKNOWN default (doc example reply)
 }
 
-# How each header stores a written value. Boolean reply styles follow the doc formats:
-# ON/OFF for TRAN:ENAB, TRAN:REV and AVER:DEL:CONS:AUTO, 0/1 for TRAN:DAMP and the preamps.
-_ONOFF = frozenset({'TRAN:ENAB', 'TRAN:REV', 'AVER:DEL:CONS:AUTO'})
-_DIGIT = frozenset({'TRAN:DAMP', 'GAIN:PRE:COMB', 'GAIN:PRE:SPLIT'})
-_ENUM = frozenset({'MODE', 'TRAN:TYPE', 'TRIG:MODE', 'GAIN:TGC:MODE', 'TRAN:IMP'})
+# How each header stores a written value. Booleans are accepted as ON/OFF/1/0 and always
+# answer 0/1 (measured 2026-10-05, fw 1.16, for all six: TRAN:ENAB, TRAN:REV, TRAN:DAMP,
+# GAIN:PRE:COMB, GAIN:PRE:SPLIT, AVER:DEL:CONS:AUTO; the vendor doc shows ON/OFF).
+_BOOLEAN = frozenset(
+    {'TRAN:ENAB', 'TRAN:REV', 'TRAN:DAMP', 'GAIN:PRE:COMB', 'GAIN:PRE:SPLIT', 'AVER:DEL:CONS:AUTO'}
+)
+# Enumerations answer with the vendor's mixed-case notation string, whatever form was sent
+# (measured 2026-10-05, fw 1.16: MODE? -> `MASTer`, TRIG:MODE? -> `INTernal`, TRAN:TYPE? ->
+# `DUAL`, TRAN:IMP? -> `HIGH`, GAIN:TGC:MODE? -> `OFF`). Measured notations: MASTer,
+# INTernal, DUAL, HIGH, OFF. Assumed by analogy with the doc's notation: SLAVe, CTP,
+# ENCoder, TTL, SINGle, LINear, ARBitrary, 200, 1000.
+_ENUM_VALUES: dict[str, tuple[str, ...]] = {
+    'MODE': ('MASTer', 'SLAVe'),
+    'TRAN:TYPE': ('SINGle', 'DUAL'),
+    'TRIG:MODE': ('INTernal', 'CTP', 'ENCoder', 'TTL'),
+    'GAIN:TGC:MODE': ('OFF', 'LINear', 'ARBitrary'),
+    'TRAN:IMP': ('HIGH', '200', '1000'),
+}
+_ENUM = frozenset(_ENUM_VALUES)
 _LIST = frozenset({'GAIN:TGC:LIN', 'GAIN:TGC:ARB'})
 _READ_ONLY = frozenset({'DATA:PORT'})
 _SIGNALS = ('burst', 'zeros', 'none')
@@ -82,15 +106,14 @@ def _engineering(value: float) -> str:
     return f'{text}E{exp3}'
 
 
-def _short_enum(token: str) -> str:
-    """Short upper form of an enumeration token: `LINear` -> `LIN`, `INTERNAL` -> `INT`."""
-    lead = ''.join(c for c in token if c.isupper())
-    if token != token.upper() and len(lead) >= 3:
-        return lead
-    token = token.upper()
-    if len(token) > 4:
-        token = token[:3] if token[3] in 'AEIOU' else token[:4]
-    return token
+def _enum_notation(header: str, token: str) -> str:
+    """The notation string of `token` (`MASTER`, `mast`, `MASTer`): `MASTer`. Raises ValueError."""
+    upper = token.upper()
+    for notation in _ENUM_VALUES[header]:
+        short = ''.join(c for c in notation if c.isupper() or c.isdigit())
+        if upper in (notation.upper(), short):
+            return notation
+    raise ValueError(f'{token!r} is not one of {_ENUM_VALUES[header]}')
 
 
 class FakeA1580Resource:
@@ -107,7 +130,7 @@ class FakeA1580Resource:
         *,
         reject: dict[str, str] | None = None,
         length: int = 1024,
-        idn: str = 'ACS-Solutions GmbH,A1580-HF,100500,1.6.b41',
+        idn: str = 'ACS-Solutions GmbH,A1580-HF,100500,1.16 (861f022a)',
         chunk: int | None = None,
         garbage_prefix: bytes = b'',
         signal: str = 'burst',
@@ -142,13 +165,20 @@ class FakeA1580Resource:
     # ── write / query ─────────────────────────────────────────────────────────
 
     def write(self, cmd: str) -> None:
+        # measured 2026-10-05, fw 1.16: 25 lines written back to back without a read left
+        # one processed `-113` and one `-363,"Input buffer overrun"` in the queue, and the
+        # next query was never answered (5 s timeout); the link stayed usable. The fake has
+        # no input buffer: not modelled yet.
+        # measured 2026-10-05, fw 1.16: opening, querying and closing a second connection
+        # to port 5025 killed the first one (seen once, open or close not isolated). The
+        # fake has one resource and no client count: not modelled yet.
         self.log.append(cmd)
         text = cmd.strip()
         head, _, arg = text.partition(' ')
         try:
             header = normalize_header(head)
         except ValueError:  # an unknown node (GAINX, FREQUE): the device does not know it
-            self._errors.append(f'-113,"Undefined header;Command: {text}"')
+            self._errors.append(f'-113,"Undefined header;{text}"')
             return
         arg = arg.strip()
         if header in self._reject:
@@ -168,12 +198,12 @@ class FakeA1580Resource:
         elif header == 'MEM:CLE':
             pass
         elif header in self._values and header not in _READ_ONLY and arg:
-            if header == 'AVER:DEL:CONS' and self._values['AVER:DEL:CONS:AUTO'] == 'ON':
+            if header == 'AVER:DEL:CONS' and self._values['AVER:DEL:CONS:AUTO'] == '1':
                 self._errors.append('-221,"Settings conflict"')
                 return
             self._store(header, arg)
         else:
-            self._errors.append(f'-113,"Undefined header;Command: {text}"')
+            self._errors.append(f'-113,"Undefined header;{text}"')
 
     def query(self, cmd: str) -> str:
         self.log.append(cmd)
@@ -181,10 +211,12 @@ class FakeA1580Resource:
         try:
             header = normalize_header(text)
         except ValueError:  # an unknown node: nothing answers
-            self._errors.append(f'-113,"Undefined header;Command: {text}"')
+            self._errors.append(f'-113,"Undefined header;{text}"')
             raise self._timeout_error(f'no reply to {text!r}') from None
         if header == '*IDN':
             return self.idn
+        if header == 'SYST:VERS':
+            return '1999.0'  # measured 2026-10-05, fw 1.16
         if header == 'SYST:ERR':
             return self._errors.pop(0) if self._errors else '0,"No error"'
         if header == 'SYST:ERR:COUN':
@@ -196,7 +228,7 @@ class FakeA1580Resource:
         if text.endswith('?') and header in self._values:
             return self._values[header]
         # A real socket resource would time out waiting for the reply of a bad query.
-        self._errors.append(f'-113,"Undefined header;Command: {text}"')
+        self._errors.append(f'-113,"Undefined header;{text}"')
         raise self._timeout_error(f'no reply to {text!r}')
 
     def _timeout_error(self, message: str) -> Exception:
@@ -237,16 +269,14 @@ class FakeA1580Resource:
         upper = arg.upper()
         if upper in _KEYWORDS:
             return self._values[header]  # MIN/MAX/DEF/UP/DOWN: the fake does not know the limits
-        if header in _ONOFF or header in _DIGIT:
+        if header in _BOOLEAN:
             if upper in ('ON', '1'):
                 truth = True
             elif upper in ('OFF', '0'):
                 truth = False
             else:
                 raise ValueError(f'{arg!r} is not a boolean')
-            if header in _DIGIT:
-                return '1' if truth else '0'
-            return 'ON' if truth else 'OFF'
+            return '1' if truth else '0'
         if header in _LIST:
             parts = [p.strip() for p in arg.split(',')]
             if header == 'GAIN:TGC:ARB':
@@ -258,11 +288,7 @@ class FakeA1580Resource:
             number = _NUMBER_WITH_UNIT.match(arg)
             if number:
                 return _plain(float(number.group(1)))
-            if header == 'MODE':  # the doc example sends MASTER and shows the reply MASTER
-                for word in ('MASTER', 'SLAVE'):
-                    if upper[:4] == word[:4]:
-                        return word
-            return _short_enum(arg)
+            return _enum_notation(header, arg)
         number = _NUMBER_WITH_UNIT.match(arg)
         if number is None:
             raise ValueError(f'{arg!r} is not a number')
