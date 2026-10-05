@@ -4,10 +4,11 @@ OpenHTF plug for the ACS A1580 ultrasonic pulser-receiver. Ethernet only: SCPI o
 A-scan stream on a second TCP port. Built on PyVISA + pyvisa-py for SCPI and a plain socket for the stream.
 Sibling of [rigol-dho-openhtf](https://github.com/pjaako/rigol-dho-openhtf): same concept, different instrument.
 
-**Status: hardware phases A and B are done (2026-10-05, firmware 1.16 (861f022a), one A1580-HF): read-only queries,
-the error queue, and acquisition with the pulser off and nothing connected. The results are in "Measured on the
-device" below; whatever is not listed there still comes from the vendor material (see PROTOCOL.md). Phase C
-(pulser on, a signal connected) is pending.**
+**Status: hardware phases A, B and C are done (2026-10-05, firmware 1.16 (861f022a), one A1580-HF): read-only
+queries, the error queue, acquisition with the pulser off and nothing connected, and the pulser-on experiments 10,
+10b and 11 with one pair of 50 kHz transducers face to face. The results are in "Measured on the device" below;
+whatever is not listed there still comes from the vendor material (see PROTOCOL.md). Phase C is done except `*RST`
+(experiment 13) and count-to-volt (experiment 12, deferred).**
 
 **Safety: after power-on this firmware has the pulser ENABLED at 20 V (`TRAN:ENAB?` -> `1`) until `TRAN:ENAB OFF` is
 sent; settings are volatile and a power cycle brings that state back (measured 2026-10-05, fw 1.16). Switch the
@@ -238,6 +239,42 @@ for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); tha
     counts). So acquisitions at the power-on length are partly invalid until `DATA:LENG` is set to a legal value.
     measured 2026-10-05, fw 1.16
 
+14. **Phase C, experiment 10: where is the signal (pulser on).** Bench: two single-element 50 kHz transducers, one on
+    OUT, one on IN, pressed face to face (this and entries 15 to 17 rest on this one bench setup). Settings:
+    `DATA:LENG 8192`, `FREQ 1 MHZ`, `TRIG:MODE INT`, `TRIG:INT 100 MS`, `TRAN:TYPE DUAL`, `TRAN:FREQ 50 KHZ`,
+    `TRAN:DUR 1`, `TRAN:IMP HIGH`, `GAIN:TGC:MODE OFF`, `AVER:COUN 0`, `FILT:HPAS:IND 0`, `TRIG:DEL 0 NS`, `TRAN:PULS`
+    20 V (the power-on value, not written). All read back (`FREQ?` -> `1000000`, `TRIG:INT?` -> `0.1`, `TRAN:FREQ?`
+    -> `50000`, `TRIG:MODE?` -> `INTernal`, `TRIG:DEL?` -> `0`; `TRAN:ENAB ON` reads back `1`, `OFF` reads `0`).
+    Run 1, `GAIN 0`: baseline (pulser off) mean 4.65 counts, std 3.63 (at `FREQ 100 MHZ` the mean had been about 11).
+    Pulser on: a repeatable wavelet of only +-15 to 18 counts in samples 11 to 40 (visible in the mean of 10 packets),
+    below the tool's single-packet threshold of 36 counts, so the tool reported "no signal". Run 2, `GAIN 40`:
+    baseline mean 4.3, std 25.7, peak 113. Pulser on, all 10 packets alike: onset at sample 3 (3 us), minimum about
+    -1190 at sample 14, maximum +1320 to +1393 at sample 24, then damped ringing with a period of about 20 us (50 kHz)
+    until about 120 us; from 200 us to the end of the 8.19 ms record only noise. No saturation. Amplitude ratio to
+    run 1 about 74 (37.4 dB) for the 40 dB gain step; the noise grew 7.1 times. Run 3, as run 2 with the transducers
+    pulled apart: no signal at all (no coherent wavelet in the mean of 10 packets), so the wavelet is the acoustic
+    signal through the two transducers and there is no visible electrical feed-through from the pulser into the
+    receiver at 40 dB. Time zero: with the transducers face to face the signal starts 3 us after sample 0, so sample 0
+    is the start of the burst to within a few microseconds. The pulser was on for 1.0 s (10 packets) per
+    `pulsed_acquire` and verified off after each. measured 2026-10-05, fw 1.16
+15. **Phase C, experiment 10b: averaging with a real signal** (run 2: `GAIN 40`, same bench). `AVER:COUN 4` gave a
+    peak of 1345.7 counts against 1347.7 at `AVER:COUN 0`, ratio 0.999: a mean, not a sum; header `ascan_count` stays
+    1. Reading 5 packets took 1.54 s with `AVER:COUN 4` against 0.51 s without at `TRIG:INT 100 MS`, so an averaged
+    packet takes about 3 trigger intervals, not 16; how the 16 acquisitions are spaced is not measured. The pulser
+    was on for 1.5 s (5 averaged packets) and 0.5 s (5 packets). One bench setup. measured 2026-10-05, fw 1.16
+16. **Phase C, experiment 11: what `TRIG:DEL` does** (run 2, same bench). `TRIG:DEL 0 NS`, `1000 US`, `2000 US`: onset
+    sample 3 and peak sample 24 in every packet at all three delays, cross-correlation lag 0. `TRIG:DEL` therefore
+    does not move the signal inside the record: burst and record are delayed together after the trigger. The
+    read-backs were `0`, `1000000` and `2000000`. Whether the nanosecond unit is right cannot be seen this way (not
+    measured). One bench setup. measured 2026-10-05, fw 1.16
+17. **Stale bytes after a change of `DATA:LENG`.** The first acquisition after `DATA:LENG` was changed from the
+    power-on 114688 to 8192: the plug's `FrameReader` reported `dropped_bytes=98332` (= 6 * 16384 + 28) and 5 resyncs
+    before 5 good packets, so stale bytes of the old length are at the start of the next stream. The vendor example
+    sends `MEM:CLEar` before `STAR AUTO`; neither the plug nor the probe tool does. Whether `MEM:CLEar` prevents it is
+    not measured (`tools/hw_probe.py --mem-clear` sends it in phase C for that). The restore after phase C put
+    everything back except the known power-on `DATA:LENG 114688` (`-224`). Seen once, after one change.
+    measured 2026-10-05, fw 1.16
+
 Also seen once: the main SCPI connection died right after a second connection to port 5025 had been opened, queried
 and closed (the next query on the first one timed out, later writes failed with a broken pipe; a new connection
 worked at once). One client at a time, and the tool runs its second-connection experiment last on its own connection.
@@ -268,11 +305,14 @@ Vendor statements contradicted by the device (A and B numbers are entries of the
   arrive after `STOP` and the socket stays open (B4), a setting can be changed while streaming (B5), a data connection
   does not disturb the SCPI one (B6).
 
-Not measured: `DATA:PORT?` and everything else after `*RST` (`*RST` was not sent); which of opening or closing a
+Not measured: `DATA:PORT?` and everything else after `*RST` (`*RST` was not sent, experiment 13); count-to-volt
+scaling (experiment 12, deferred); whether `TRIG:DEL` is in nanoseconds (only seen not to move the signal); how the
+16 acquisitions of an averaged packet are spaced (an averaged packet took about 3 trigger intervals); whether
+`MEM:CLEar` removes the stale bytes after a change of `DATA:LENG`; which of opening or closing a
 second connection kills the first; the exact input-buffer size; the wrap of `packet_number` (the header field is one
 byte) and whether `ctp[0]` goes on past 255; whether the automatic `AVER:DEL:CONS` offset of 70.75 us depends on
-`AVER:COUN` or `FREQ`; whether errors queue again after the queue was read once while it was full; everything with the pulser on or a signal
-connected (phase C): count-to-volt scaling, time zero, settling times.
+`AVER:COUN` or `FREQ`; whether errors queue again after the queue was read once while it was full; settling times; everything with another
+transducer pair, voltage or sample rate: phase C used one pair of 50 kHz transducers, 20 V, `FREQ 1 MHZ`.
 
 ## Things the vendor material does not tell you
 
@@ -286,8 +326,10 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
   measured. `STOP` itself: two packets already in flight arrive after it (within 20 ms), then the socket is idle and
   stays open (measured 2026-10-05, fw 1.16); a reader that stops at `STOP` leaves them unread.
 - **Averaging.** `AVER:COUN N` averages 2^N acquisitions as a mean (noise std 3.59 counts at 0, 0.94 at 4), and the
-  header field `ascan_count` stays 1 for every N (measured 2026-10-05, fw 1.16). The plug sends and reads back the
-  number and interprets nothing; `ascan_count` does not tell how much was averaged.
+  header field `ascan_count` stays 1 for every N (measured 2026-10-05, fw 1.16). With a real signal the peak is
+  unchanged (ratio 0.999 at `AVER:COUN 4`, one bench setup), so it is a mean, not a sum. An averaged packet took about
+  3 trigger intervals at `AVER:COUN 4`, not 16; how the acquisitions are spaced is not measured. The plug sends and
+  reads back the number and interprets nothing; `ascan_count` does not tell how much was averaged.
 - **Header fields.** Seen on 2026-10-05 (fw 1.16) with the pulser off, at five `DATA:LENG` values (1024 to 114688):
   `length_hi << 16 | length_lo` is the sample count plus 16 (24 bits, the carry measured), telemetry bytes 120, 86,
   52, `is_full` 0, `buffer_fill` 0, `ascan_count` 1, reserved bytes 0, `packet_number` +1 per packet and continuing
@@ -297,9 +339,11 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
   and the 16 mean, and the wrap of `packet_number` and `ctp[0]`. The plug stores them as received.
 - **Count-to-volt scaling.** ADC bit depth, full scale and whether gain and TGC act before the ADC are unknown.
   Hence no volts array. To be measured.
-- **Time zero.** Whether sample 0 is the trigger, the pulse start or the end of `TRIG:DEL`, and whether
-  `TRIG:DEL` is in nanoseconds (SCPI document) or samples (REST document), is unknown. `AScan.t` starts at 0
-  at the first sample and nothing more is claimed. To be measured.
+- **Time zero.** With one pair of 50 kHz transducers face to face the signal starts 3 us after sample 0, so sample 0
+  is the start of the burst to within a few microseconds, and `TRIG:DEL` does not move the signal inside the record:
+  burst and record are delayed together after the trigger (measured 2026-10-05, fw 1.16, one bench setup). Whether
+  `TRIG:DEL` is in nanoseconds (SCPI document) or samples (REST document) is still unknown. `AScan.t` starts at 0
+  at the first sample and nothing more is claimed.
 - **`*RST` defaults.** Not documented beyond the `DEFault` column, and it is unknown whether `*RST` stops a
   running acquisition. The plug never sends `*RST` on its own and `apply_capture` does not reset by default.
   To be measured.
@@ -314,6 +358,11 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
   other headers are unmeasured.
 - **Settling times** after a change of gain, pulser voltage or impedance, and changes of settings while
   streaming. The plug does not wait or retry. To be measured.
+- **Stale bytes after a change of `DATA:LENG`.** The first acquisition after the length was changed (from 114688 to
+  8192) started with 98332 stale bytes and 5 resyncs before good packets (measured 2026-10-05, fw 1.16, seen once).
+  `FrameReader` resynchronises over them, so the packets are right, but expect dropped bytes in the first
+  acquisition after a change. Whether `MEM:CLEar` before `STAR AUTO` (as the vendor example does) prevents it is
+  not measured.
 
 ## Testing without hardware
 
@@ -333,8 +382,10 @@ that starts at 2 and never restarts, two packets still delivered after `STOP`, `
 `AVER:DEL:CONS` (`TRIG:INT` minus 70.75 us), and optionally the power-on state, whose packets at `DATA:LENG` 114688
 are zero from sample 81906 on (the device's constant stretch is not modelled).
 
-What it invents: the signal (a damped sine burst at `TRAN:FREQ`, starting at 10 % of the record, amplitude
-scaled by `GAIN`), the defaults marked `UNKNOWN default` in the source, and every error code other than -113
+What it invents: the signal of the default `burst` (a damped sine burst at `TRAN:FREQ`, starting at 10 % of the
+record, amplitude scaled by `GAIN`; `signal='transmission'` follows the phase C measurement instead: a 50 kHz pair face
+to face, the burst 3 us after sample 0 and not moved by `TRIG:DEL`, noise growing with `GAIN`, measured 2026-10-05, fw
+1.16, one bench setup), the defaults marked `UNKNOWN default` in the source, and every error code other than -113
 and -221, -224, -350, -363 (-224 is measured for `DATA:LENG` only), the `1e-05` format of 10 us (extrapolated) and the `noise` signal's offset and spread (measured at `AVER:COUN` 0 and 4 only).
 A fake only knows what we told it;
 nothing is done until it has run on the instrument, and every finding from hardware goes back into it.
@@ -347,7 +398,7 @@ Constructor options:
 | `power_on=True` | start from the measured power-on state (pulser on, `DUAL`, `TRIG:INT` 1 s, `DATA:LENG` 114688, which its own setter refuses); `*RST` still goes to the vendor defaults. Off by default: the suite assumes the vendor defaults |
 | `chunk=k` | the data socket returns at most `k` bytes per `recv`, to exercise reassembly |
 | `garbage_prefix=b'..'` | bytes sent once before the first packet, to exercise resync |
-| `signal='burst'` | `'burst'` (default), `'zeros'` (all samples 0), `'noise'` (an open input: offset +11 counts, std 3.6 counts divided by 2^(`AVER:COUN`/2)) or `'none'` (never sends a packet: timeouts) |
+| `signal='burst'` | `'burst'` (default), `'zeros'` (all samples 0), `'noise'` (an open input: offset +11 counts, std 3.6 counts divided by 2^(`AVER:COUN`/2)), `'none'` (never sends a packet: timeouts) or `'transmission'` (pulser on: the measured two-transducer wavelet, off: noise) |
 | `reject={'TRAN:PULS': '-221,"Settings conflict"'}` | a write to that header queues the given error and does not store the value |
 | `idn=` | the `*IDN?` reply |
 

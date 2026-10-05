@@ -1260,7 +1260,7 @@ def test_cross_lag_is_positive_when_the_signal_comes_later() -> None:
 def test_phase_c_on_the_fake_finds_the_burst_and_exits_0(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code = hw_probe.main(_c_args(tmp_path), fake=_c_fake())
+    code = hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=_c_fake())  # 18 counts at 0 dB
     out = capsys.readouterr().out
     assert code == 0, out
     assert 'FAILED' not in out
@@ -1272,8 +1272,8 @@ def test_phase_c_on_the_fake_finds_the_burst_and_exits_0(
     assert step10['analysis']['warnings'] == []
     packets = step10['analysis']['packets']
     assert len(packets) == 10
-    assert {p['onset_index'] for p in packets} == {201}  # the fake's arrival 200 us at 1 MHz
-    assert {p['onset_us'] for p in packets} == {201.0}
+    assert {p['onset_index'] for p in packets} == {4}  # the fake's arrival 3 us at 1 MHz
+    assert {p['onset_us'] for p in packets} == {4.0}
     assert report['steps']['FINAL DIFF']['data']['changed'] == {}
     assert report['exit_code'] == 0
     assert report['warnings'] == []
@@ -1283,10 +1283,10 @@ def test_step_10b_reports_averaging_with_a_real_signal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake = _c_fake()
-    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    assert hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=fake) == 0
     data = _load_probe(tmp_path)['steps']['STEP 10b']['data']
     assert data['peak_ratio'] == pytest.approx(1.0, abs=0.1)  # a mean
-    assert 0.15 < data['noise_ratio'] < 0.4  # 1/4 for 2^4 acquisitions
+    assert data['noise_ratio'] is None  # the burst starts at sample 3: no pre-onset samples
     assert data['ascan_counts'] == [1]
     assert 'AVER:COUN 4' in fake.log
     assert (
@@ -1312,25 +1312,22 @@ def test_step_10b_without_enough_pre_onset_samples_says_so(tmp_path: Path) -> No
     assert data['noise_note'] == 'no pre-onset samples'
 
 
-def test_step_11_reports_the_shift_the_fake_applies(
+def test_step_11_reports_that_the_fake_signal_does_not_move(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake = _c_fake()
-    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    assert hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=fake) == 0
     data = _load_probe(tmp_path)['steps']['STEP 11']['data']
     delays = {d['delay']: d for d in data['delays']}
     assert list(delays) == ['0 NS', '1000 US', '2000 US']
     assert delays['0 NS']['shift_samples'] == 0
-    fs = 1e6
     for text, ns in (('1000 US', 1_000_000), ('2000 US', 2_000_000)):
-        expected = ns * 1e-9 * fs  # what the fake does: the burst moves later by TRIG:DEL
         entry = delays[text]
-        assert entry['shift_samples'] == expected
-        assert entry['shift_us'] == pytest.approx(expected / fs * 1e6)
-        assert entry['onset_index'] == 201 + expected
-        assert 'later by the delay' in entry['verdict']
-    out = capsys.readouterr().out
-    assert 'later by the delay' in out
+        assert entry['expected_shift_samples'] == ns * 1e-9 * 1e6
+        assert entry['shift_samples'] == 0  # measured: TRIG:DEL does not move the signal
+        assert entry['onset_index'] == 4
+        assert 'delayed together' in entry['verdict']
+    assert 'burst and record are delayed together' in capsys.readouterr().out
     # put back at the end of the step (the restore of the snapshot comes later)
     assert fake.log.index('TRIG:DEL 0 NS', fake.log.index('TRIG:DEL 2000 US')) > 0
 
@@ -1349,13 +1346,24 @@ def test_step_11_verdicts_for_earlier_other_and_left_the_window() -> None:
     assert 'left the window' in verdict(0, 1000.0, False)
 
 
-def test_step_11_without_the_signal_in_the_window_says_so(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_step_11_verdicts_without_a_reference_signal_and_for_a_signal_that_does_not_move() -> None:
+    verdict = hw_probe.shift_verdict
+    assert 'nothing to compare' in verdict(0, 1000.0, False, False)
+    assert 'nothing to compare' in verdict(0, 1000.0, True, False)
+    assert 'left the window' not in verdict(0, 1000.0, False, False)
+    assert 'left the window' in verdict(0, 1000.0, False, True)
+    assert 'burst and record are delayed together' in verdict(0, 1000.0, True, True)
+    assert 'delayed together' not in verdict(0, 0.0, True, True)
+
+
+def test_step_11_without_a_signal_at_the_reference_says_nothing_to_compare(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(hw_probe, 'STEP11_DELAYS', ('0 NS', '9000 US'))
-    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0  # window is 8.192 ms
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0  # 18 counts at 0 dB: below 20
     data = _load_probe(tmp_path)['steps']['STEP 11']['data']
-    assert 'left the window' in data['delays'][1]['verdict']
+    for entry in data['delays'][1:]:
+        assert entry['verdict'] == 'no signal above the threshold, nothing to compare'
+        assert entry['shift_samples'] is None
 
 
 def test_a_warning_of_step_10_is_printed_stored_repeated_and_does_not_change_the_exit_code(
@@ -1386,14 +1394,14 @@ def test_a_warning_of_step_10_is_printed_stored_repeated_and_does_not_change_the
 def test_no_warnings_block_without_warnings(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+    assert hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=_c_fake()) == 0
     assert 'WARNINGS' not in capsys.readouterr().out
 
 
 def test_saturation_in_the_fake_signal_is_reported(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code = hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=_c_fake())  # 2000 * 100 clips
+    code = hw_probe.main(_c_args(tmp_path, '--gain', '75'), fake=_c_fake())  # 18 * 10^3.5 clips
     out = capsys.readouterr().out
     assert code == 0
     assert 'WARNING: saturation' in out
@@ -1809,5 +1817,116 @@ def test_phase_ab_with_the_fake_flag_alone_still_works(tmp_path: Path) -> None:
 def test_phase_c_with_the_fake_flag_alone_uses_the_transmission_fake(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert hw_probe.main(_c_args(tmp_path)) == 0
+    assert hw_probe.main(_c_args(tmp_path, '--gain', '40')) == 0
     assert 'WARNING: no signal' not in capsys.readouterr().out
+
+
+# ── coherent signal, time per packet, --mem-clear, frame statistics ──────────
+
+
+def _weak_wavelet_records(k: int = 10, n: int = 2048, amplitude: float = 16.0) -> np.ndarray:
+    """k noisy records (std 3.6) with the same small wavelet in samples 11..40."""
+    records = _noise((k, n), seed=7).astype(np.float64)
+    records[:, 11:41] += amplitude * np.sin(np.arange(30) * 2 * np.pi / 20.0)
+    return np.rint(records).astype(np.int16)
+
+
+def test_coherent_signal_below_the_single_packet_threshold_is_found() -> None:
+    result = _analyse(_noise((5, 2048)), _weak_wavelet_records())
+    coherent = result['coherent']
+    assert coherent['found']
+    assert coherent['packets'] == 10
+    assert 11 <= coherent['peak_index'] < 41
+    assert 12 < coherent['peak'] < 20
+    assert all(x['peak'] <= result['threshold'] for x in result['packets'])  # no single packet
+    (warning,) = result['warnings']
+    assert warning.startswith('no signal')
+    assert 'but the mean of 10 packets shows a coherent signal' in warning
+    assert 'try more gain' in warning
+
+
+def test_pure_noise_has_no_coherent_signal_and_no_second_sentence() -> None:
+    result = _analyse(_noise((5, 2048)), _noise((10, 2048), seed=9))
+    assert not result['coherent']['found']
+    (warning,) = result['warnings']
+    assert 'coherent' not in warning
+
+
+def test_step_10_prints_and_stores_the_coherent_signal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0  # 18 counts at 0 dB
+    out = capsys.readouterr().out
+    assert 'coherent signal in the mean of 10 packets: peak ' in out
+    assert 'counts at sample ' in out
+    assert 'try more gain' in out
+    coherent = _load_probe(tmp_path)['steps']['STEP 10']['data']['analysis']['coherent']
+    assert coherent['found']
+    assert coherent['packets'] == 10
+
+
+def test_step_10_says_none_without_a_coherent_signal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _c_fake()
+    original = fake._packet
+
+    def quiet() -> bytes:
+        fake._values['TRAN:ENAB'] = '0'
+        return original()
+
+    fake._packet = quiet  # type: ignore[method-assign]
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    assert 'coherent signal in the mean of 10 packets: none' in capsys.readouterr().out
+    coherent = _load_probe(tmp_path)['steps']['STEP 10']['data']['analysis']['coherent']
+    assert coherent['found'] is False
+
+
+def test_step_10b_reports_the_time_per_packet_with_and_without_averaging(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=_c_fake()) == 0
+    report = _load_probe(tmp_path)['steps']
+    plain = report['STEP 10']['data']['analysis']['time_per_packet_s']
+    averaged = report['STEP 10b']['data']['time_per_packet_s']
+    assert plain > 0
+    assert averaged > 0
+    assert report['STEP 10b']['data']['time_ratio'] == pytest.approx(averaged / plain)
+    assert 'time per packet (pulser-on time / packets)' in capsys.readouterr().out
+
+
+def test_mem_clear_is_off_by_default(tmp_path: Path) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path), fake=fake) == 0
+    assert not [c for c in fake.log if c.startswith('MEM:')]
+
+
+def test_mem_clear_goes_right_before_every_star_auto_of_the_pulsed_acquisitions(
+    tmp_path: Path,
+) -> None:
+    fake = _c_fake()
+    assert hw_probe.main(_c_args(tmp_path, '--mem-clear'), fake=fake) == 0
+    log = fake.log
+    star = [i for i, c in enumerate(log) if c == 'STAR AUTO']
+    clears = [i for i, c in enumerate(log) if c == 'MEM:CLEar']
+    assert len(clears) == 1 + 5  # step 10: the baseline and one pulsed; 10b: 1; 11: 3
+    assert all(log[i + 1] == 'STAR AUTO' for i in clears[1:])
+    assert clears[0] < star[0]
+    assert len([i for i in star if log[i - 1] == 'MEM:CLEar']) == 5
+
+
+def test_mem_clear_is_in_the_dry_run_only_with_the_flag(capsys: pytest.CaptureFixture[str]) -> None:
+    assert hw_probe.main(['--dry-run', '--phase', 'C', '--pulse-v', '20']) == 0
+    assert 'MEM:CLEar' not in capsys.readouterr().out
+    assert hw_probe.main(['--dry-run', '--phase', 'C', '--pulse-v', '20', '--mem-clear']) == 0
+    assert capsys.readouterr().out.count('MEM:CLEar') == 6
+
+
+def test_the_frame_statistics_of_every_pulsed_acquisition_are_in_the_json(
+    tmp_path: Path,
+) -> None:
+    assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+    steps = _load_probe(tmp_path)['steps']
+    assert steps['STEP 10']['data']['frame_stats'] == [{'dropped_bytes': 0, 'resyncs': 0}]
+    assert steps['STEP 10b']['data']['frame_stats'] == [{'dropped_bytes': 0, 'resyncs': 0}]
+    assert len(steps['STEP 11']['data']['frame_stats']) == 3

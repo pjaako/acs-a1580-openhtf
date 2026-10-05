@@ -1,6 +1,6 @@
 # STATUS.md
 
-Last updated: 2026-10-05 (after hardware phases A and B) by the project owner agent.
+Last updated: 2026-10-05 (after hardware phases A, B and C without `*RST`) by the project owner agent.
 
 ## Decisions taken (with the human owner)
 
@@ -43,14 +43,23 @@ Last updated: 2026-10-05 (after hardware phases A and B) by the project owner ag
       one, the length field is a 24-bit "samples + 16", `ctp[0]` is the packet counter, packets at
       the power-on length 114688 are partly invalid, automatic `AVER:DEL:CONS` is `TRIG:INT` minus
       70.75 us; 692 tests.
-- [ ] Phase C (pulser on, transducer connected). The probe tool has no phase C yet; SPEC first.
+- [x] `SPEC-phaseC.md` and its implementation in `tools/hw_probe.py` (`--phase C --pulse-v N`,
+      `--phase RST --allow-rst`): the pulser is on only inside `pulsed_acquire`, behind a guard.
+- [x] Hardware phase C, experiments 10, 10b, 11, 2026-10-05, fw 1.16, two 50 kHz transducers face
+      to face, 20 V: three runs (0 dB, 40 dB, 40 dB with the transducers pulled apart as the
+      control). README entries 14 to 17; the fake's `signal='transmission'` follows the
+      measurement; 861 tests.
+- [ ] Experiment 13 (`*RST`): tool ready, needs the owner's go.
+- [ ] Experiment 12 (count-to-volt): deferred, a signal generator is available later.
 - [ ] SPEC-golden (golden A-scan comparison), not written yet.
 
 ## Open questions after phases A and B
 
 Still open from `PROTOCOL.md` "Unknowns to verify on hardware": single-shot acquisition,
-count-to-volt scaling, time zero and what `TRIG:DEL` shifts, `*RST` defaults, settling times,
-per-connection state, REST/WebSocket. Settled so far: data port 2758, terminators, reply forms,
+count-to-volt scaling, the unit of `TRIG:DEL`, `*RST` defaults, settling times, per-connection
+state, REST/WebSocket. Settled in phase C (one bench setup): sample 0 is the start of the burst
+to within a few microseconds; `TRIG:DEL` delays burst and record together, so the signal does
+not move in the record; averaging is a mean also with a real signal; 40 dB of `GAIN` gave 37.4 dB. Settled so far: data port 2758, terminators, reply forms,
 error-queue depth (16 + `-350`), `AVER:COUN` is an exponent and the result a mean, `ascan_count`
 stays 1, `STOP` leaves two packets in flight and the socket open, both connect orders work, a
 `GAIN` change while streaming is accepted, `DATA:LENG` range 1024 to 36864 with `-224` outside.
@@ -68,7 +77,11 @@ New questions:
 - Input buffer: a burst above 160 to 320 bytes is discarded with `-363` and a query in it is never
   answered. The longest line the plug can produce (a long `GAIN:TGC:ARB` list) is not checked.
 - `ctp[0]` equals the packet counter in `TRIG:MODE INT`; does it go on past 255?
-- Automatic `AVER:DEL:CONS` seems to follow `TRIG:INT` (interval minus 70.75 us).
+- Automatic `AVER:DEL:CONS` follows `TRIG:INT` (interval minus 70.75 us); an averaged packet at
+  `AVER:COUN 4` took about 3 trigger intervals, not 16: how the acquisitions are spaced is open.
+- Stale bytes of the old length at the start of the first stream after a `DATA:LENG` change.
+  Does `MEM:CLEar` remove them (`hw_probe.py --mem-clear`)? Should the plug send it before
+  `STAR AUTO`, as the vendor example does? Owner decision after the measurement.
 
 ## Resuming as the owner agent on the local machine
 

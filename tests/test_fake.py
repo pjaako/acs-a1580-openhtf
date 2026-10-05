@@ -684,7 +684,7 @@ def test_packets_at_the_power_on_length_are_zero_from_sample_81906() -> None:
     assert np.frombuffer(packet[HEADER_SIZE:], dtype='<i2')[-1000:].any()  # legal length: all real
 
 
-# ── signal='transmission' (not measured, invented for hw_probe phase C) ──────
+# ── signal='transmission' (measured 2026-10-05, fw 1.16, 50 kHz pair face to face) ──
 
 
 def _transmission_record(fake: FakeA1580Resource) -> np.ndarray:
@@ -709,51 +709,78 @@ def _transmission_fake(**settings: str) -> FakeA1580Resource:
     return fake
 
 
-def test_transmission_pulser_off_has_no_burst() -> None:
+def _dev(record: np.ndarray) -> np.ndarray:
+    return np.abs(record.astype(float) - 4.5)
+
+
+def test_transmission_pulser_off_is_noise_only_with_the_measured_std() -> None:
     fake = _transmission_fake()
     fake.write('TRAN:ENAB OFF')
-    record = _transmission_record(fake)
-    assert np.abs(record.astype(float) - 11.0).max() < 25
+    record = _transmission_record(fake).astype(float)
+    assert record.std() == pytest.approx(3.6, rel=0.05)  # measured 3.63 at 0 dB
+    assert record.mean() == pytest.approx(4.5, abs=0.3)
+    fake.write('GAIN 40')
+    assert _transmission_record(fake).astype(float).std() == pytest.approx(25.7, rel=0.05)
 
 
-def test_transmission_pulser_on_has_a_burst_at_the_arrival_time() -> None:
+def test_transmission_pulser_on_burst_starts_3_us_after_sample_0_with_the_measured_amplitude() -> (
+    None
+):
+    fake = _transmission_fake(GAIN='40')
+    fake.write('TRAN:ENAB ON')
+    dev = _dev(_transmission_record(fake))
+    assert int(np.flatnonzero(dev > 200)[0]) in (4, 5, 6)  # onset at 3 us, the sine starts at 0
+    assert 1200 < dev.max() < 1450  # measured 1190 to 1393
+    assert dev[300:].max() < 150  # measured: only noise from 200 us (std 25.7 at 40 dB)
+
+
+def test_transmission_amplitude_is_about_18_counts_at_0_db() -> None:
     fake = _transmission_fake()
     fake.write('TRAN:ENAB ON')
-    record = _transmission_record(fake)
-    dev = np.abs(record.astype(float) - 11.0)
-    assert dev.max() > 500
-    assert int(np.flatnonzero(dev > 100)[0]) == 201  # arrival 200 us at 1 MHz, sine starts at 0
+    mean = np.mean([_transmission_record(fake) for _ in range(10)], axis=0)
+    peak = np.abs(mean - np.median(mean)).max()
+    assert 14 < peak < 20  # measured +-15 to 18 counts in the mean of 10 packets
+
+
+def test_transmission_rings_at_the_transducer_frequency_for_about_5_periods() -> None:
+    fake = _transmission_fake(GAIN='40')
+    fake.write('TRAN:ENAB ON')
+    signal = _transmission_record(fake).astype(float) - 4.5
+    spectrum = np.abs(np.fft.rfft(signal[:200]))
+    assert np.fft.rfftfreq(200, 1e-6)[spectrum.argmax()] == pytest.approx(50e3, rel=0.1)
+    assert np.abs(signal[3:103]).max() > 10 * np.abs(signal[200:]).std()
 
 
 @pytest.mark.parametrize('delay', ['1000 US', '2000 US'])
-def test_transmission_burst_moves_later_with_trig_del(delay: str) -> None:
-    fake = _transmission_fake()
+def test_transmission_burst_does_not_move_with_trig_del(delay: str) -> None:
+    fake = _transmission_fake(GAIN='40')
     fake.write('TRAN:ENAB ON')
-    base = int(np.flatnonzero(np.abs(_transmission_record(fake).astype(float) - 11) > 100)[0])
+    base = _dev(_transmission_record(fake))
     fake.write(f'TRIG:DEL {delay}')
-    shifted = np.abs(_transmission_record(fake).astype(float) - 11)
-    assert int(np.flatnonzero(shifted > 100)[0]) - base == int(delay.split()[0])
+    shifted = _dev(_transmission_record(fake))
+    assert int(np.flatnonzero(shifted > 200)[0]) == int(np.flatnonzero(base > 200)[0])
+    assert abs(int(shifted[:100].argmax()) - int(base[:100].argmax())) <= 2  # noise only
 
 
 def test_transmission_amplitude_follows_pulser_voltage_and_gain() -> None:
-    fake = _transmission_fake()
+    fake = _transmission_fake(GAIN='40')
     fake.write('TRAN:ENAB ON')
-    full = np.abs(_transmission_record(fake).astype(float) - 11).max()
-    fake.write('TRAN:PULS 10 V')
-    half = np.abs(_transmission_record(fake).astype(float) - 11).max()
+    full = _dev(_transmission_record(fake)).max()
+    fake.write('TRAN:PULS 10 V')  # the voltage scaling is a guess, only 20 V was measured
+    half = _dev(_transmission_record(fake)).max()
     assert 0.4 < half / full < 0.6
-    fake.write('GAIN 6')
-    assert np.abs(_transmission_record(fake).astype(float) - 11).max() > 0.8 * full
+    fake.write('GAIN 20')
+    assert _dev(_transmission_record(fake)).max() < 0.3 * full
 
 
 def test_transmission_averaging_lowers_the_noise_not_the_burst() -> None:
-    fake = _transmission_fake()
+    fake = _transmission_fake(GAIN='40')
     fake.write('TRAN:ENAB ON')
     plain = _transmission_record(fake).astype(float)
     fake.write('AVER:COUN 4')
     averaged = _transmission_record(fake).astype(float)
-    assert averaged[:150].std() < 0.5 * plain[:150].std()
-    assert abs(np.abs(averaged - 11).max() / np.abs(plain - 11).max() - 1.0) < 0.1
+    assert averaged[300:].std() == pytest.approx(plain[300:].std() / 4.0, rel=0.1)
+    assert abs(_dev(averaged).max() / _dev(plain).max() - 1.0) < 0.05  # measured ratio 0.999
 
 
 def test_default_signal_ignores_the_pulser() -> None:

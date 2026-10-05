@@ -98,14 +98,22 @@ _ENUM = frozenset(_ENUM_VALUES)
 _LIST = frozenset({'GAIN:TGC:LIN', 'GAIN:TGC:ARB'})
 _READ_ONLY = frozenset({'DATA:PORT'})
 _SIGNALS = ('burst', 'zeros', 'noise', 'none', 'transmission')
-# `signal='transmission'`: not measured, invented so that hw_probe phase C can run; replace after
-# the hardware run. Two transducers face to face: with `TRAN:ENAB` on the record holds the
-# noise of `signal='noise'` plus a damped sine burst at `TRAN:FREQ` that arrives this long after
-# the trigger plus `TRIG:DEL` (the burst moves LATER by the delay: the direction is a guess),
-# amplitude 2000 counts at 0 dB and 20 V, scaled by `GAIN` and `TRAN:PULS`; with the pulser off
-# the record is the noise alone.
-_TRANSMISSION_ARRIVAL_S = 200e-6
-_TRANSMISSION_AMPLITUDE = 2000.0
+# `signal='transmission'`: measured 2026-10-05, fw 1.16, one pair of 50 kHz transducers face to
+# face, 20 V (one bench setup). With `TRAN:ENAB` on the record holds noise plus a damped sine at
+# `TRAN:FREQ` that starts 3 us after sample 0 (3 samples at 1 MHz) and does NOT move with
+# `TRIG:DEL`: burst and record are delayed together. Amplitude about 18 counts at `GAIN` 0 and
+# about 1350 at 40 dB (measured 37.4 dB for the 40 dB step, a ratio of 74; modelled as 18 counts
+# times 10^(0.935 * gain / 20), 1332 at 40 dB). It rings down in about 5 periods (measured
+# until about 120 us at 50 kHz, only noise from 200 us). The pulse-voltage scaling (counts
+# proportional to `TRAN:PULS` / 20 V) is a guess: only 20 V was measured. Pulser off: noise
+# alone, offset 4.5 counts (4.3 to 4.65 at 1 MHz), std 3.6 counts at 0 dB and 25.7 at 40 dB
+# (7.1 times); modelled as 3.6 * 7.1^(gain / 40), also with the pulser off.
+_TRANSMISSION_ARRIVAL_S = 3e-6
+_TRANSMISSION_AMPLITUDE = 18.0
+_TRANSMISSION_SIGNAL_DB_PER_DB = 37.4 / 40.0
+_TRANSMISSION_NOISE_STD = 3.6
+_TRANSMISSION_NOISE_PER_40_DB = 7.1
+_TRANSMISSION_OFFSET = 4.5
 _ERROR_QUEUE_DEPTH = 16  # measured 2026-10-05, fw 1.16: 16 entries, then `-350` as the 17th
 _QUEUE_OVERFLOW = '-350,"Queue overflow"'
 # measured for DATA:LENG out of range (2026-10-05, fw 1.16), assumed for out-of-range values
@@ -443,20 +451,26 @@ class FakeA1580Resource:
             noise = rng.normal(11.0, 3.6 / 2.0 ** (averaging / 2.0), length)
             samples = np.rint(noise).astype(np.int16)
         elif self.signal == 'transmission':
-            # not measured, invented so that hw_probe phase C can run; replace after the
-            # hardware run (see `_TRANSMISSION_ARRIVAL_S`)
+            # measured 2026-10-05, fw 1.16 (see `_TRANSMISSION_ARRIVAL_S`); averaging keeps the
+            # signal and divides the noise std by 2^(N/2) (measured with the pulser on: peak
+            # ratio 0.999 at AVER:COUN 4, the noise ratio under the signal is not measured)
             rng = np.random.default_rng(number)
-            wave = rng.normal(11.0, 3.6 / 2.0 ** (averaging / 2.0), length)
+            gain_db = float(self._values['GAIN'])
+            std = _TRANSMISSION_NOISE_STD * _TRANSMISSION_NOISE_PER_40_DB ** (gain_db / 40.0)
+            wave = rng.normal(_TRANSMISSION_OFFSET, std / 2.0 ** (averaging / 2.0), length)
             if self._values['TRAN:ENAB'] == '1':
                 fs = float(self._values['FREQ'])
                 freq = float(self._values['TRAN:FREQ'])
-                gain_db = float(self._values['GAIN'])
                 volts = float(self._values['TRAN:PULS'])
-                delay_s = float(self._values['TRIG:DEL']) * 1e-9
-                first = round((_TRANSMISSION_ARRIVAL_S + delay_s) * fs)
+                first = round(_TRANSMISSION_ARRIVAL_S * fs)
                 t = (np.arange(length) - first) / fs
-                envelope = np.where(t >= 0.0, np.exp(-np.maximum(t, 0.0) * freq / 5.0), 0.0)
-                amplitude = _TRANSMISSION_AMPLITUDE * 10.0 ** (gain_db / 20.0) * volts / 20.0
+                envelope = np.where(t >= 0.0, np.exp(-np.maximum(t, 0.0) * freq / 2.5), 0.0)
+                amplitude = (
+                    _TRANSMISSION_AMPLITUDE
+                    * 10.0 ** (_TRANSMISSION_SIGNAL_DB_PER_DB * gain_db / 20.0)
+                    * volts
+                    / 20.0
+                )
                 wave = wave + amplitude * envelope * np.sin(2.0 * np.pi * freq * t)
             samples = np.rint(np.clip(wave, -32768, 32767)).astype(np.int16)
         else:

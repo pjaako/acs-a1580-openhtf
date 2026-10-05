@@ -86,6 +86,8 @@ STEP11_DELAYS = ('0 NS', '1000 US', '2000 US')  # TRIG:DEL values of step 11, fi
 SHIFT_TOLERANCE_SAMPLES = 2  # "by the delay" means within this many samples
 ONSET_FACTOR = 10.0  # onset threshold: max(ONSET_FACTOR * noise std, ONSET_MIN_COUNTS)
 ONSET_MIN_COUNTS = 20.0
+COHERENT_FACTOR = 10.0  # coherent signal: peak of the mean > COHERENT_FACTOR * s / sqrt(n)
+COHERENT_MIN_COUNTS = 1.0  # ... and at least this (the int16 resolution)
 FLAT_TOP_RUN = 4  # this many equal extreme samples in a row: a flat top
 TAIL_FRACTION = 0.05  # "the end of the record"
 PRE_ONSET_MIN_SAMPLES = 50
@@ -1200,6 +1202,12 @@ def _make_pulser_safe(p: Probe, sock: RecordingSocket | None, t_on: float | None
         raise PulserCheckError(f'pulser not confirmed OFF after pulsed_acquire: {reply!r}')
 
 
+def _mem_clear(p: Probe) -> None:
+    """`--mem-clear`: `MEM:CLEar` (as the vendor example, before `STAR AUTO`), via the guard."""
+    if getattr(p.args, 'mem_clear', False):
+        p.plug.write('MEM:CLEar')
+
+
 def pulsed_acquire(p: Probe, n: int) -> list[PulsedPacket]:
     """The only place where the pulser is switched on (SPEC-phaseC.md 3.2).
 
@@ -1208,12 +1216,14 @@ def pulsed_acquire(p: Probe, n: int) -> list[PulsedPacket]:
     happened: `TRAN:ENAB OFF`, `STOP`, close the socket, verify OFF (`_make_pulser_safe`).
     """
     sock: RecordingSocket | None = None
+    reader: FrameReader | None = None
     t_on: float | None = None
     try:
         length = int(p.plug.query('DATA:LENG?'))
         port = int(p.plug.query('DATA:PORT?'))
         sock = p.data_socket(port)
         reader = FrameReader(sock, length)
+        _mem_clear(p)
         p.plug.write('STAR AUTO')
         t_on = time.monotonic()  # taken before the write: a failed ON write may still have worked
         with p.resource.pulser_gate():
@@ -1224,6 +1234,11 @@ def pulsed_acquire(p: Probe, n: int) -> list[PulsedPacket]:
             raise RuntimeError(f'TRAN:ENAB? answered {reply!r} after TRAN:ENAB ON')
         raw = reader.read(n, ACQ_TIMEOUT_S)
     finally:
+        if reader is not None:  # per acquisition: what the resync dropped (stale bytes)
+            p.current.data.setdefault('frame_stats', []).append(
+                {'dropped_bytes': reader.dropped_bytes, 'resyncs': reader.resyncs}
+            )
+            p.say(f'frame stats: dropped_bytes={reader.dropped_bytes}, resyncs={reader.resyncs}')
         _make_pulser_safe(p, sock, t_on)
     # parsed only now: the pulser is already off
     return [
@@ -1259,6 +1274,32 @@ def _long_runs(mask: np.ndarray, minimum: int) -> np.ndarray:
 def _spread(values: Sequence[float | int | None]) -> float | int | None:
     found = [v for v in values if v is not None]
     return (max(found) - min(found)) if found else None
+
+
+def coherent_signal(baseline: np.ndarray, pulsed: np.ndarray) -> dict[str, Any]:
+    """A signal in the mean of the pulsed packets that no single packet shows above the threshold.
+
+    `peak` is `max |mean_pulsed - median(mean_pulsed)|`; it counts as a signal when it exceeds
+    `max(COHERENT_FACTOR * s / sqrt(n), COHERENT_MIN_COUNTS)`, `s` being the baseline std of one
+    packet and `n` the number of pulsed packets (the noise of the mean is `s / sqrt(n)`). The
+    baseline's own mean waveform is measured the same way for comparison.
+    """
+    pul = np.asarray(pulsed, dtype=np.float64)
+    n = pul.shape[0]
+    _mean, std, _threshold = baseline_stats(baseline)
+    limit = max(COHERENT_FACTOR * std / np.sqrt(n), COHERENT_MIN_COUNTS)
+    mean_wave = pul.mean(axis=0)
+    dev = np.abs(mean_wave - np.median(mean_wave))
+    base_wave = np.asarray(baseline, dtype=np.float64).mean(axis=0)
+    return {
+        'packets': n,
+        'peak': float(dev.max()),
+        'peak_index': int(dev.argmax()),
+        'limit': float(limit),
+        'found': bool(dev.max() > limit),
+        'baseline_packets': int(np.asarray(baseline).shape[0]),
+        'baseline_peak': float(np.abs(base_wave - np.median(base_wave)).max()),
+    }
 
 
 def analyse_pulsed(baseline: np.ndarray, pulsed: np.ndarray, fs_hz: float) -> dict[str, Any]:
@@ -1305,11 +1346,18 @@ def analyse_pulsed(baseline: np.ndarray, pulsed: np.ndarray, fs_hz: float) -> di
             f'({flat_total} of them in a flat top of {FLAT_TOP_RUN} or more equal samples) '
             f'in {sat_packets} of {count} pulsed packets'
         )
+    coherent = coherent_signal(base, pul)
     if all(x['peak'] <= threshold for x in packets):
-        warnings.append(
+        text = (
             f'no signal: peak <= {threshold:.1f} counts in every pulsed packet '
             f'(largest peak {max(x["peak"] for x in packets):.1f})'
         )
+        if coherent['found']:
+            text += (
+                f'; but the mean of {coherent["packets"]} packets shows a coherent signal of '
+                f'{coherent["peak"]:.1f} counts at sample {coherent["peak_index"]}, try more gain'
+            )
+        warnings.append(text)
     if base_peak > threshold:
         warnings.append(
             f'signal already present in the baseline (pulser off): baseline peak '
@@ -1333,6 +1381,7 @@ def analyse_pulsed(baseline: np.ndarray, pulsed: np.ndarray, fs_hz: float) -> di
         'onset_spread_samples': _spread([x['onset_index'] for x in packets]),
         'peak_index_spread_samples': _spread([x['peak_index'] for x in packets]),
         'peak_spread': _spread(peaks),
+        'coherent': coherent,
         'warnings': warnings,
     }
 
@@ -1350,8 +1399,12 @@ def cross_lag(ref: np.ndarray, other: np.ndarray) -> int:
     return int(np.argmax(lags)) - (n - 1)
 
 
-def shift_verdict(lag: int, expected_samples: float, in_window: bool) -> str:
+def shift_verdict(
+    lag: int, expected_samples: float, in_window: bool, ref_in_window: bool = True
+) -> str:
     """What `TRIG:DEL` did to the record: `lag` samples (positive: later) against the delay."""
+    if not ref_in_window:
+        return 'no signal above the threshold, nothing to compare'
     if not in_window:
         return 'the signal left the window'
     tol = SHIFT_TOLERANCE_SAMPLES
@@ -1360,6 +1413,8 @@ def shift_verdict(lag: int, expected_samples: float, in_window: bool) -> str:
     if abs(lag + expected_samples) <= tol:
         return f'the record moves earlier by the delay (within {tol} samples)'
     if abs(lag) <= tol:
+        if expected_samples:
+            return 'the signal does not move in the record: burst and record are delayed together'
         return 'the record does not move (TRIG:DEL has no effect on the position)'
     direction = 'later' if lag > 0 else 'earlier'
     ratio = f', {abs(lag) / expected_samples:.3g} x the delay' if expected_samples else ''
@@ -1405,6 +1460,17 @@ def _report_analysis(p: Probe, result: dict[str, Any]) -> None:
             f'pulsed packet {i}: min {x["min"]} max {x["max"]} peak {x["peak"]:.1f} at '
             f'{x["peak_index"]} ({x["peak_us"]:.1f} us), onset {onset}'
         )
+    coherent = result['coherent']
+    p.say(
+        f'coherent signal in the mean of {coherent["packets"]} packets: '
+        + (
+            f'peak {coherent["peak"]:.1f} counts at sample {coherent["peak_index"]}'
+            if coherent['found']
+            else 'none'
+        )
+        + f' (limit {coherent["limit"]:.1f} counts; mean of the {coherent["baseline_packets"]} '
+        f'baseline packets: peak {coherent["baseline_peak"]:.1f})'
+    )
     p.say(
         f'packet-to-packet spread: onset {result["onset_spread_samples"]} samples, peak position '
         f'{result["peak_index_spread_samples"]} samples, '
@@ -1412,9 +1478,16 @@ def _report_analysis(p: Probe, result: dict[str, Any]) -> None:
     )
 
 
+def _time_per_packet(p: Probe, n: int) -> float | None:
+    """Pulser-on time of the last `pulsed_acquire` per packet (it includes a few queries)."""
+    on_s = p.pulses[-1]['on_s'] if p.pulses else None
+    return None if on_s is None else float(on_s) / n
+
+
 def step_10(p: Probe) -> None:
     """Experiment 10: where is the signal (pulser on, `--pulse-v`, the bench of the SPEC)."""
     fs = _sample_rate(p)
+    _mem_clear(p)
     scans = p.plug.acquire(BASELINE_PACKETS, timeout_s=ACQ_TIMEOUT_S)  # pulser off
     baseline = np.vstack([x.raw for x in scans]).astype(np.int16)
     p.baseline = baseline
@@ -1423,6 +1496,7 @@ def step_10(p: Probe) -> None:
     pulsed = _stack(pulsed_acquire(p, STEP10_PACKETS))
     p.pulsed10 = pulsed
     result = analyse_pulsed(baseline, pulsed, fs)
+    result['time_per_packet_s'] = _time_per_packet(p, STEP10_PACKETS)
     p.step10 = result
     _report_analysis(p, result)
     for text in result['warnings']:
@@ -1438,10 +1512,12 @@ def step_10b(p: Probe) -> None:
         _apply_report(p, {'AVER:COUN': STEP10B_AVER})
         packets = pulsed_acquire(p, STEP10B_PACKETS)
     pulsed = _stack(packets)
+    per_packet = _time_per_packet(p, STEP10B_PACKETS)
     counts = sorted({x.header.ascan_count for x in packets})
     p.say(f'ascan_count values: {counts}')
     data: dict[str, Any] = {
         'ascan_counts': counts,
+        'time_per_packet_s': per_packet,
         'peak_ratio': None,
         'noise_ratio': None,
         'noise_note': None,
@@ -1458,6 +1534,14 @@ def step_10b(p: Probe) -> None:
             f'peak amplitude {peak:.1f} against {prev["peak_median"]:.1f} in step 10: ratio '
             f'{data["peak_ratio"]:.3f} (1.0 means a mean, 16 a sum)'
         )
+        plain = prev.get('time_per_packet_s')
+        if per_packet is not None and plain:
+            data['time_ratio'] = per_packet / plain
+            p.say(
+                f'time per packet (pulser-on time / packets): {per_packet:.3f} s with '
+                f'AVER:COUN {STEP10B_AVER} against {plain:.3f} s without: ratio '
+                f'{data["time_ratio"]:.2f} (16 acquisitions in a row would be 16)'
+            )
         onsets = [x['onset_index'] for x in prev['packets'] if x['onset_index'] is not None]
         onset = min(onsets) if onsets else None
         if onset is None or onset < PRE_ONSET_MIN_SAMPLES:
@@ -1544,7 +1628,7 @@ def step_11(p: Probe) -> None:
             expected_shift_samples=expected,
             shift_samples=lag if both else None,
             shift_us=lag / fs * 1e6 if both else None,
-            verdict=shift_verdict(lag, expected, both),
+            verdict=shift_verdict(lag, expected, bool(entry['in_window']), bool(ref['in_window'])),
         )
         shift = f'{lag} samples = {lag / fs * 1e6:.1f} us' if both else 'no shift measured'
         p.say(
@@ -1681,11 +1765,12 @@ _ACQUIRE = ['DATA:LENG?', 'FREQ?', 'TRIG:DEL?', 'DATA:PORT?', 'STAR AUTO', 'STOP
 _ONLY_IF_VOLTAGE = '   (only if TRAN:PULS? differs from --pulse-v)'
 
 
-def _pulsed_commands(n: int) -> list[str]:
+def _pulsed_commands(n: int, mem_clear: bool = False) -> list[str]:
     """What `pulsed_acquire(n)` sends, in order."""
     return [
         'DATA:LENG?',
         'DATA:PORT?',
+        *(['MEM:CLEar   (--mem-clear)'] if mem_clear else []),
         'STAR AUTO',
         'TRAN:ENAB ON   (PULSER ON, announced, only from pulsed_acquire)',
         ERR_QUERY,
@@ -1700,6 +1785,7 @@ def _pulsed_commands(n: int) -> list[str]:
 
 def _phase_c_commands(args: argparse.Namespace) -> dict[int | str, list[str]]:
     volts = '<--pulse-v>' if args.pulse_v is None else format(args.pulse_v, 'g')
+    mem_clear = bool(getattr(args, 'mem_clear', False))
     drain = [ERR_QUERY + '   (drain)']
     return {
         'prep': drain
@@ -1710,11 +1796,15 @@ def _phase_c_commands(args: argparse.Namespace) -> dict[int | str, list[str]]:
             ERR_QUERY + _ONLY_IF_VOLTAGE,
             'TRAN:PULS?' + _ONLY_IF_VOLTAGE,
         ],
-        10: [*_ACQUIRE, *_pulsed_commands(STEP10_PACKETS)],
+        10: [
+            *(['MEM:CLEar   (--mem-clear)'] if mem_clear else []),
+            *_ACQUIRE,
+            *_pulsed_commands(STEP10_PACKETS, mem_clear),
+        ],
         '10b': [
             *drain,
             *_setup_commands({'AVER:COUN': STEP10B_AVER}),
-            *_pulsed_commands(STEP10B_PACKETS),
+            *_pulsed_commands(STEP10B_PACKETS, mem_clear),
             *drain,
             *_setup_commands({'AVER:COUN': 0}),
         ],
@@ -1724,7 +1814,7 @@ def _phase_c_commands(args: argparse.Namespace) -> dict[int | str, list[str]]:
             for line in (
                 *drain,
                 *_setup_commands({'TRIG:DEL': delay}),
-                *_pulsed_commands(STEP11_PACKETS),
+                *_pulsed_commands(STEP11_PACKETS, mem_clear),
             )
         ]
         + [*drain, *_setup_commands({'TRIG:DEL': TRIG_DEL_ZERO})],
@@ -2180,6 +2270,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--length', type=int, default=8192, help='phase C DATA:LENG (default 8192)')
     parser.add_argument('--interval', default='100 MS', help='phase C TRIG:INT (default 100 MS)')
     parser.add_argument('--gain', type=float, default=0.0, help='phase C GAIN in dB (default 0)')
+    parser.add_argument(
+        '--mem-clear',
+        action='store_true',
+        help='phase C: send MEM:CLEar before every STAR AUTO of steps 10 to 11 (default off)',
+    )
     return parser
 
 
