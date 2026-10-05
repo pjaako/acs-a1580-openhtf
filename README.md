@@ -169,8 +169,8 @@ Phases A and B of `HARDWARE-SESSION.md` (A: read-only queries, pulser not touche
 A1580-HF. Lines were
 sent to TCP 5025 with `\r\n`; replies are shown without the trailing `\r\n`. The serial number is written
 `<serial>`. Phase B (entries 6 to 9 and later) ran with the pulser off, nothing connected to IN/OUT, `DATA:LENG 1024`,
-`FREQ 100 MHZ`, `TRIG:MODE INT`, `TRIG:INT 10 MS`, data port 2758. The project owner keeps the same facts as tickets
-for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); that file is not part of the repository.
+`FREQ 100 MHZ`, `TRIG:MODE INT`, `TRIG:INT 10 MS`, data port 2758. The same facts are kept as tickets for the vendor in
+`vendor-tickets/`: `VENDOR-ISSUES.md` (entries A1 to A13, B1 to B9, C1 to C6) and nine issue drafts made from it.
 
 1. **Identity.** `*IDN?` -> `ACS-Solutions GmbH,A1580-HF,<serial>,1.16 (861f022a)` (the firmware field contains a
    space and brackets), `SYST:VERS?` -> `1999.0`, `SYST:ERR:COUN?` -> `0`. measured 2026-10-05, fw 1.16
@@ -307,7 +307,7 @@ back; B works normally; a new connection afterwards works at once; no error is q
 have this effect on the SCPI connection. The tool runs its second-connection experiment last on its own connection.
 measured 2026-10-05, fw 1.16
 
-Vendor statements contradicted by the device (A and B numbers are entries of the owner's local ticket list, see above):
+Vendor statements contradicted by the device (A and B numbers are entries of `vendor-tickets/VENDOR-ISSUES.md`):
 
 - Replies to booleans are `ON`/`OFF` in the manual: they are `0`/`1` (A4).
 - Enumeration replies are the short, upper-case or echoed form in the manual examples (`MASTER`, `INT`): they are

@@ -32,8 +32,8 @@ Last updated: 2026-10-05 (end of the first hardware session) by the project owne
 - [x] Hardware phase A (read-only), 2026-10-05, fw 1.16: README "Measured on the device", fake
       updated (booleans `0`/`1`, enumeration notation strings, error text, `SYST:VERS?`), 656 tests.
       The probe tool no longer restores after phase A and runs the second-connection experiment last.
-      The differences from the vendor material are kept by the owner as a local ticket list
-      (not in the repository); README lists them in short.
+      The differences from the vendor material are in `vendor-tickets/VENDOR-ISSUES.md`;
+      README lists them in short.
 - [x] Hardware phase B (pulser off, acquisition, nothing connected), 2026-10-05, fw 1.16, plus the
       extra experiments 5b (error queue) and B2 (`DATA:LENG` limits, header length field) and a
       power cycle. README entries 5 to 11; fake: queue depth 16 + `-350`, `-224` for illegal values,
@@ -79,7 +79,8 @@ Owner decisions of 2026-10-05 (final):
   `DATA:LENG` in the restore, and does not send `MEM:CLEar` before `STAR AUTO` (no measured
   need: stale bytes were not reproduced with legal lengths). The first two are firmware defects
   and are reported to the vendor; README section "Firmware defects the plug does not work around".
-- The tickets for the vendor are kept by the owner outside the repository.
+- The tickets for the vendor are in `vendor-tickets/` (nine drafts and `post-tickets.sh`); the
+  owner posts them himself. Not posted yet as of 2026-10-05.
 
 Still open:
 
@@ -130,5 +131,5 @@ Next steps, in the order the owner last agreed:
    queue, the unit of `TRIG:DEL`, single-shot acquisition, settling times.
 
 Not in this repository (kept by the owner on the lab machine, they contain the serial number or
-are his to publish): the session log of 2026-10-05, the raw records and probe reports under
-`setups/`, and the tickets for the vendor. Every fact from them that matters is in README.
+are his to publish): the session log of 2026-10-05 and the raw records and probe reports under
+`setups/`. Every fact from them that matters is in README.
