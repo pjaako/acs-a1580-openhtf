@@ -91,6 +91,15 @@ COHERENT_MIN_COUNTS = 1.0  # ... and at least this (the int16 resolution)
 FLAT_TOP_RUN = 4  # this many equal extreme samples in a row: a flat top
 TAIL_FRACTION = 0.05  # "the end of the record"
 PRE_ONSET_MIN_SAMPLES = 50
+# Step 13 moves these away from the snapshot before `*RST` (never TRAN:PULS or TRAN:ENAB).
+RST_DETUNE: dict[str, object] = {
+    'GAIN': 6,
+    'TRIG:INT': '10 MS',
+    'AVER:COUN': 2,
+    'TRAN:FREQ': '50 KHZ',
+    'FILT:HPAS:IND': 2,
+    'TRIG:DEL': '0 NS',
+}
 SAMPLE_MAX = 32767
 SAMPLE_MIN = -32768
 PHASES = ('A', 'B', 'AB', 'C', 'RST')
@@ -1520,7 +1529,6 @@ def step_10b(p: Probe) -> None:
         'time_per_packet_s': per_packet,
         'peak_ratio': None,
         'noise_ratio': None,
-        'noise_note': None,
     }
     prev = p.step10
     if prev is None or p.pulsed10 is None:
@@ -1544,18 +1552,22 @@ def step_10b(p: Probe) -> None:
             )
         onsets = [x['onset_index'] for x in prev['packets'] if x['onset_index'] is not None]
         onset = min(onsets) if onsets else None
-        if onset is None or onset < PRE_ONSET_MIN_SAMPLES:
-            data['noise_note'] = 'no pre-onset samples'
-            p.say('noise std before the onset: no pre-onset samples')
+        if onset is not None and onset >= PRE_ONSET_MIN_SAMPLES:
+            cut = slice(0, onset)
+            part = f'the first {onset} samples (before the onset)'
         else:
-            now = float(np.median(pulsed[:, :onset].std(axis=1)))
-            before = float(np.median(p.pulsed10[:, :onset].std(axis=1)))
-            data.update(noise_std=now, noise_std_step10=before, pre_onset_samples=onset)
-            data['noise_ratio'] = now / before if before else None
-            p.say(
-                f'noise std in the first {onset} samples: {now:.2f} against {before:.2f} in '
-                f'step 10: ratio {data["noise_ratio"]} (0.25 is a mean of 16)'
-            )
+            cut = slice(pulsed.shape[1] - pulsed.shape[1] // 4, None)
+            part = 'the last quarter of the record (fewer than 50 samples before the onset)'
+        now = float(np.median(pulsed[:, cut].std(axis=1)))
+        before = float(np.median(p.pulsed10[:, cut].std(axis=1)))
+        data.update(noise_std=now, noise_std_step10=before, noise_part=part)
+        if cut.start == 0:
+            data['pre_onset_samples'] = onset
+        data['noise_ratio'] = now / before if before else None
+        p.say(
+            f'noise std in {part}: {now:.2f} against {before:.2f} in '
+            f'step 10: ratio {data["noise_ratio"]} (0.25 is a mean of 16)'
+        )
     path = _save_npz(p, 'step10b', {'pulsed': pulsed}, _run_settings(p, aver_coun=STEP10B_AVER))
     p.say(f'raw samples saved to {path}')
     data['npz'] = path
@@ -1654,7 +1666,19 @@ def _same_value(a: str, b: str) -> bool:
 
 
 def step_13(p: Probe) -> None:
-    """Experiment 13: `*RST`, pulser off at once, every header against snapshot and default."""
+    """Experiment 13: `*RST`, pulser off at once, every header against snapshot and default.
+
+    Unless `--no-detune`, six settings are moved away first (`RST_DETUNE`, read back by
+    `apply_setup`) so that a `*RST` that does something shows; the restore at teardown puts
+    them back with everything else.
+    """
+    detuned = not p.args.no_detune
+    before: dict[str, str] = {}
+    if detuned:
+        _apply_report(p, RST_DETUNE)
+        for header in STATE_HEADERS:
+            reply, error, _dt = p.try_query(f'{header}?')
+            before[header] = reply if error is None and reply is not None else f'<ERROR {error}>'
     try:
         p.plug.write('*RST')  # announced by the guard, sent once
         enab = p.plug.query('TRAN:ENAB?')  # at once: the pulser may come on with *RST
@@ -1682,15 +1706,27 @@ def step_13(p: Probe) -> None:
         default = DEFAULTS.get(header, '-') if header != 'SYST:ERR:COUN' else '-'
         is_snapshot = snapshot != '-' and _same_value(after, snapshot)
         is_default = default != '-' and _same_value(after, default)
-        mark = (
-            '= snapshot, = vendor default'
-            if is_snapshot and is_default
-            else '= snapshot'
-            if is_snapshot
-            else '= vendor default'
-            if is_default
-            else 'neither'
-        )
+        was = before.get(header, '-')
+        if was != '-' and snapshot != '-' and not _same_value(was, snapshot):
+            mark = (  # a detuned header (or one that follows from one)
+                'kept the detuned value'
+                if _same_value(after, was)
+                else 'back to the snapshot value'
+                if is_snapshot
+                else '= vendor default'
+                if is_default
+                else 'a third value'
+            )
+        else:
+            mark = (
+                '= snapshot, = vendor default'
+                if is_snapshot and is_default
+                else '= snapshot'
+                if is_snapshot
+                else '= vendor default'
+                if is_default
+                else 'neither'
+            )
         rows.append(
             {
                 'header': header,
@@ -1699,17 +1735,36 @@ def step_13(p: Probe) -> None:
                 'default': default,
                 'default_guessed': header in GUESSED_DEFAULTS,
                 'mark': mark,
+                **({'before_rst': was} if detuned else {}),
             }
         )
-    p.say(
-        f'{"header":22s} {"after *RST":26s} {"snapshot (step 2)":26s} {"vendor DEFault":26s} mark'
-    )
+    head = f'{"header":22s} {"after *RST":26s} {"snapshot (step 2)":26s} {"vendor DEFault":26s} '
+    if detuned:
+        head += f'{"before *RST (detuned)":26s} '
+    p.say(head + 'mark')
     for row in rows:
         star = '*' if row['default_guessed'] else ''
-        p.say(
+        line = (
             f'{row["header"]:22s} {row["after_rst"]:26s} {row["snapshot"]:26s} '
-            f'{row["default"] + star:26s} {row["mark"]}'
+            f'{row["default"] + star:26s} '
         )
+        if detuned:
+            line += f'{row["before_rst"]:26s} '
+        p.say(line + row['mark'])
+    if detuned:
+        changed = [
+            h
+            for h in RST_DETUNE
+            if not _same_value(
+                next(r['after_rst'] for r in rows if r['header'] == h), before.get(h, '')
+            )
+        ]
+        p.say(
+            f'*RST changed {len(changed)} of {len(RST_DETUNE)} detuned settings'
+            + (f': {", ".join(changed)}' if changed else '')
+        )
+        p.current.data['detuned_changed_by_rst'] = changed
+        p.current.data['detuned'] = {h: before.get(h) for h in RST_DETUNE}
     p.say('* = the fake uses a guess for this default (not documented by the vendor)')
     p.current.data['table'] = rows
 
@@ -1819,6 +1874,15 @@ def _phase_c_commands(args: argparse.Namespace) -> dict[int | str, list[str]]:
         ]
         + [*drain, *_setup_commands({'TRIG:DEL': TRIG_DEL_ZERO})],
         13: [
+            *(
+                []
+                if args.no_detune
+                else [
+                    *drain,
+                    *_setup_commands(RST_DETUNE),
+                    *[f'{h}?' for h in STATE_HEADERS],
+                ]
+            ),
             '*RST   (announced, sent once)',
             'TRAN:ENAB?',
             'TRAN:ENAB OFF',
@@ -2264,6 +2328,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--allow-rst', action='store_true', help='phase RST (required): allow the one *RST'
+    )
+    parser.add_argument(
+        '--no-detune',
+        action='store_true',
+        help='phase RST: do not move six settings away before *RST (the old behaviour)',
     )
     parser.add_argument('--tran-freq', default='50 KHZ', help='phase C TRAN:FREQ (default 50 KHZ)')
     parser.add_argument('--sample-freq', default='1 MHZ', help='phase C FREQ (default 1 MHZ)')

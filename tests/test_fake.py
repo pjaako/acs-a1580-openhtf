@@ -196,18 +196,26 @@ def test_data_port_is_read_only() -> None:
     assert fake.query('DATA:PORT?') == '2758'
 
 
-def test_rst_restores_defaults_and_keeps_the_error_queue() -> None:
+def test_rst_changes_no_setting_and_keeps_the_error_queue() -> None:
+    # measured 2026-10-05, fw 1.16: six settings moved away, `*RST`, all read the same after
     fake = FakeA1580Resource(length=2048)
-    fake.write('FREQ 10 MHZ')
-    fake.write('AVER:COUN 4')
-    fake.write('STAR AUTO')
+    moved = {'GAIN': '6', 'TRIG:INT': '0.01', 'AVER:COUN': '2', 'TRAN:FREQ': '50000'}
+    fake.write('GAIN 6')
+    fake.write('TRIG:INT 10 MS')
+    fake.write('AVER:COUN 2')
+    fake.write('TRAN:FREQ 50 KHZ')
+    fake.write('FILT:HPAS:IND 2')
+    fake.write('TRIG:DEL 0 NS')
     fake.write('NOPE 1')
+    before = dict(fake._values)
     fake.write('*RST')
-    assert fake.query('FREQ?') == DEFAULTS['FREQ']
-    assert fake.query('AVER:COUN?') == DEFAULTS['AVER:COUN']
-    assert fake.query('DATA:LENG?') == DEFAULTS['DATA:LENG']
-    assert not fake.started
-    assert len(_drain(fake)) == 1  # *RST does not clear the queue, *CLS does
+    assert fake._values == before
+    for header, reply in moved.items():
+        assert fake.query(f'{header}?') == reply
+    assert fake.query('FILT:HPAS:IND?') == '2'
+    assert fake.query('TRIG:DEL?') == '0'
+    assert fake.query('TRAN:ENAB?') == '0'
+    assert len(_drain(fake)) == 1  # *RST does not clear the queue (assumed), *CLS does
     fake.write('NOPE 1')
     fake.write('*CLS')
     assert _drain(fake) == []
@@ -446,15 +454,32 @@ def test_data_leng_1024_is_accepted_after_power_on_but_its_own_value_is_refused(
     assert fake.query('DATA:LENG?') == '1024'
 
 
-def test_power_on_state_has_the_pulser_on_and_rst_goes_to_the_vendor_defaults() -> None:
+def test_power_on_state_has_the_pulser_on_and_rst_leaves_it_as_it_is() -> None:
     fake = FakeA1580Resource(power_on=True)
     for header in ('TRAN:ENAB', 'TRAN:TYPE', 'TRIG:INT', 'AVER:DEL:CONS', 'GAIN:TGC:LIN'):
         assert fake.query(f'{header}?') == POWER_ON[header]
     assert (fake.query('TRAN:ENAB?'), fake.query('TRAN:TYPE?')) == ('1', 'DUAL')
     assert (fake.query('TRIG:INT?'), fake.query('AVER:DEL:CONS?')) == ('1', '0.99992925')
-    fake.write('*RST')
-    assert (fake.query('TRAN:ENAB?'), fake.query('DATA:LENG?')) == ('0', '1024')
+    fake.write('*RST')  # measured 2026-10-05, fw 1.16: no setting changes
+    assert (fake.query('TRAN:ENAB?'), fake.query('DATA:LENG?')) == ('1', '114688')
     assert FakeA1580Resource().query('TRAN:ENAB?') == '0'  # opt-in: the default fake is as before
+
+
+@pytest.mark.parametrize(
+    ('interval', 'count', 'reply'),
+    [  # measured 2026-10-05, fw 1.16, FREQ 100 MHz: TRIG:INT / 2^AVER:COUN - 70.75 us
+        ('1 S', '0', '0.99992925'),
+        ('10 MS', '0', '0.00992925'),
+        ('10 MS', '2', '0.00242925'),
+    ],
+)
+def test_automatic_averaging_delay_follows_the_interval_and_the_count(
+    interval: str, count: str, reply: str
+) -> None:
+    fake = FakeA1580Resource()
+    fake.write(f'TRIG:INT {interval}')
+    fake.write(f'AVER:COUN {count}')
+    assert fake.query('AVER:DEL:CONS?') == reply
 
 
 @pytest.mark.parametrize(

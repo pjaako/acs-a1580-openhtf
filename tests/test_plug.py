@@ -160,7 +160,7 @@ def test_reset_sends_rst_then_drains() -> None:
     fake.log.clear()
     plug.reset()
     assert fake.log == ['*RST', ERR, ERR]
-    assert plug.query('GAIN?') == '0'
+    assert plug.query('GAIN?') == '7'  # measured 2026-10-05, fw 1.16: *RST changes no setting
 
 
 # ── 2. apply_setup, vendor example ───────────────────────────────────────────

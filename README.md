@@ -7,8 +7,9 @@ Sibling of [rigol-dho-openhtf](https://github.com/pjaako/rigol-dho-openhtf): sam
 **Status: hardware phases A, B and C are done (2026-10-05, firmware 1.16 (861f022a), one A1580-HF): read-only
 queries, the error queue, acquisition with the pulser off and nothing connected, and the pulser-on experiments 10,
 10b and 11 with one pair of 50 kHz transducers face to face. The results are in "Measured on the device" below;
-whatever is not listed there still comes from the vendor material (see PROTOCOL.md). Phase C is done except `*RST`
-(experiment 13) and count-to-volt (experiment 12, deferred).**
+whatever is not listed there still comes from the vendor material (see PROTOCOL.md). `*RST` was measured too
+(experiment 13): on this firmware it changes no setting. All experiments of the first hardware session are done except
+count-to-volt (experiment 12, deferred).**
 
 **Safety: after power-on this firmware has the pulser ENABLED at 20 V (`TRAN:ENAB?` -> `1`) until `TRAN:ENAB OFF` is
 sent; settings are volatile and a power cycle brings that state back (measured 2026-10-05, fw 1.16). Switch the
@@ -66,7 +67,7 @@ The plug stays thin: it has no per-setting setters. Settings are data: a dict of
 | Method | Behaviour |
 |---|---|
 | `apply_setup(settings)` | For each `header: value`: write, drain the error queue, query `<header>?`, compare with `values_match`. Collects every failure (device error, no answer, read-back mismatch) and raises one `RuntimeError`. Settings after a failed one are still written. |
-| `apply_capture(capture_or_path, *, reset=False)` | Loads and validates a capture file (or a `Capture`) before anything is sent, optionally calls `reset()`, then `apply_setup(capture.to_scpi())`. Returns the `Capture`. Raises `CaptureError` for an invalid file. `reset` is off by default because what `*RST` restores is unknown. |
+| `apply_capture(capture_or_path, *, reset=False)` | Loads and validates a capture file (or a `Capture`) before anything is sent, optionally calls `reset()`, then `apply_setup(capture.to_scpi())`. Returns the `Capture`. Raises `CaptureError` for an invalid file. `reset` is off by default because `*RST` resets nothing on fw 1.16 (entry 18). |
 | `acquire(n=1, *, timeout_s=5.0)` | Queries `DATA:LENG?`, `FREQ?`, `TRIG:DEL?`, `DATA:PORT?`, opens the data socket, sends `STAR AUTO`, collects `n` packets, sends `STOP`, closes the socket, drains the error queue. Returns `list[AScan]`. `ValueError` for bad arguments, `TimeoutError` (with `DATA:LENG` and port) if fewer than `n` packets arrive, `RuntimeError` if the device queued errors or a stream is running. |
 | `start_stream(callback, *, timeout_s=5.0)` / `stop_stream()` | Same start as `acquire`, then a daemon thread calls `callback(ascan)` for every A-scan. `timeout_s` is how long the stream may stay silent. `stop_stream()` sends `STOP`, joins the thread, closes the socket and returns the number delivered. It re-raises a callback exception, a stall or lost connection, a failed `STOP` or queued device errors, in that order. |
 | `get_state()` / `set_state(state)` | `get_state()` queries every header in `STATE_HEADERS` (27 headers) and returns `{header: reply}`. `set_state()` writes a snapshot back with `write_checked`: `TRAN:ENAB OFF` first, the other headers in `STATE_HEADERS` order, the snapshot's `TRAN:ENAB` last. `AVER:DEL:CONS` is skipped unless `AVER:DEL:CONS:AUTO` is off, because the vendor says the device rejects it otherwise (-221). Replies are written back with unit suffixes (`REPLY_UNITS` gives the reply unit of each header). |
@@ -223,7 +224,8 @@ for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); tha
     `65536`, `114688` and `1023` each -> `-224,"Illegal parameter value"` and the previous value is kept (no
     clamping); `1025` accepted (reads `1025`), so there is no block-size rule. `TRIG:INT 10 MS` -> `TRIG:INT?`
     `0.01`. With `AVER:DEL:CONS:AUTO` on, `AVER:DEL:CONS?` is `0.99992925` at `TRIG:INT` 1 s and `0.00992925` at
-    10 ms: the trigger interval minus 70.75 us (at `AVER:COUN` 0, `FREQ` 100 MHz). Header length field: `DATA:LENG`
+    10 ms (both `AVER:COUN` 0), and `0.00242925` at 10 ms with `AVER:COUN 2` (entry 18): `TRIG:INT / 2^AVER:COUN`
+    minus 70.75 us (at `FREQ` 100 MHz only). Header length field: `DATA:LENG`
     1024 / 2048 / 8192 / 36864 -> packet 2076 / 4124 / 16412 / 73756 bytes, `length_lo` 1040 / 2064 / 8208 / 36880,
     `length_hi` 0; at the power-on length 114688 -> packet 229404 bytes, `length_lo` 49168, `length_hi` 1, i.e. the
     24-bit value 114704 = 114688 + 16: the pair is a 24-bit "samples + 16" (the carry into `length_hi` is measured).
@@ -273,6 +275,18 @@ for the vendor in a local file (entry numbers A1 to A13 and B1 to B6 below); tha
     sends `MEM:CLEar` before `STAR AUTO`; neither the plug nor the probe tool does. Whether `MEM:CLEar` prevents it is
     not measured (`tools/hw_probe.py --mem-clear` sends it in phase C for that). The restore after phase C put
     everything back except the known power-on `DATA:LENG 114688` (`-224`). Seen once, after one change.
+18. **`*RST`.** Sent once by `tools/hw_probe.py --phase RST`, pulser off. First run: the connection stayed usable,
+    the error queue was empty, `TRAN:ENAB?` right after -> `0`, `DATA:PORT?` -> `2758`, and all 27 state headers equal
+    to the snapshot, including `DATA:LENG` 8192 (neither the vendor default 1024 nor the power-on 114688). That run
+    could not tell a reset from no reset, because the device was in its power-on state apart from `DATA:LENG` and
+    `TRAN:ENAB`. Second run, discriminating: six settings were moved away first and read back: `GAIN 6` (`6`),
+    `TRIG:INT 10 MS` (`0.01`), `AVER:COUN 2` (`2`), `TRAN:FREQ 50 KHZ` (`50000`), `FILT:HPAS:IND 2` (`2`), `TRIG:DEL
+    0 NS` (`0`). After `*RST`: no error, the next query answered 59 ms later, `TRAN:ENAB?` -> `0`, and all 27 headers
+    read exactly as before `*RST`, also 2 s later. So on this firmware `*RST` changes no setting: not back to the
+    documented defaults and not to the power-on state. Not tested: whether `*RST` stops a running acquisition or
+    clears the error queue. Third point of the automatic delay: `TRIG:INT 10 MS` with `AVER:COUN 2` ->
+    `AVER:DEL:CONS?` `0.00242925`, so the formula is `TRIG:INT / 2^AVER:COUN - 70.75 us` (`FREQ` 100 MHz only).
+    measured 2026-10-05, fw 1.16
     measured 2026-10-05, fw 1.16
 
 Also seen once: the main SCPI connection died right after a second connection to port 5025 had been opened, queried
@@ -292,7 +306,9 @@ Vendor statements contradicted by the device (A and B numbers are entries of the
   value breaks it (entry 12).
 - Settings as found differ from the `DEFault` column: pulser on, `DUAL`, `TRIG:INT` 1 s (A9). They are power-on values:
   a power cycle brings them back.
-- Automatic `AVER:DEL:CONS` depends on `TRIG:INT`: it is the interval minus 70.75 us (A10, entry 12).
+- Automatic `AVER:DEL:CONS` depends on `TRIG:INT` and `AVER:COUN`: it is `TRIG:INT / 2^AVER:COUN` minus 70.75 us
+  (A10, entries 12 and 18).
+- `*RST` is documented as restoring the `DEFault` column: on fw 1.16 it changes no setting at all (entry 18).
 - TGC replies before anything was set are `0,0` and an empty line, not the manual's examples (A11).
 - `SYST:VERS?` has no documented reply: `1999.0`; the firmware field of `*IDN?` is `1.16 (861f022a)` (A12).
 - `AVER:COUN` is "acquisitions per averaged vector": the count is an exponent (2^N, a mean), and the header field
@@ -305,13 +321,13 @@ Vendor statements contradicted by the device (A and B numbers are entries of the
   arrive after `STOP` and the socket stays open (B4), a setting can be changed while streaming (B5), a data connection
   does not disturb the SCPI one (B6).
 
-Not measured: `DATA:PORT?` and everything else after `*RST` (`*RST` was not sent, experiment 13); count-to-volt
+Not measured: whether `*RST` stops a running acquisition or clears the error queue; count-to-volt
 scaling (experiment 12, deferred); whether `TRIG:DEL` is in nanoseconds (only seen not to move the signal); how the
 16 acquisitions of an averaged packet are spaced (an averaged packet took about 3 trigger intervals); whether
 `MEM:CLEar` removes the stale bytes after a change of `DATA:LENG`; which of opening or closing a
 second connection kills the first; the exact input-buffer size; the wrap of `packet_number` (the header field is one
 byte) and whether `ctp[0]` goes on past 255; whether the automatic `AVER:DEL:CONS` offset of 70.75 us depends on
-`AVER:COUN` or `FREQ`; whether errors queue again after the queue was read once while it was full; settling times; everything with another
+`FREQ`; whether errors queue again after the queue was read once while it was full; settling times; everything with another
 transducer pair, voltage or sample rate: phase C used one pair of 50 kHz transducers, 20 V, `FREQ 1 MHZ`.
 
 ## Things the vendor material does not tell you
@@ -320,8 +336,8 @@ The vendor documents are partly inconsistent and silent on these. The plug does 
 are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
 
 - **Data port.** `SCPI_COMMANDS.md` shows `DATA:PORT?` replying 5025, the vendor script starts with 2758. The
-  device answered `2758` (measured 2026-10-05, fw 1.16). The plug still queries it on every acquisition and never
-  hard-codes it. Whether the value changes after `*RST` is to be measured.
+  device answered `2758` (measured 2026-10-05, fw 1.16), also right after `*RST`. The plug still queries it on every
+  acquisition and never hard-codes it.
 - **Single-shot acquisition.** Only `STAR AUTO` is documented, although the text mentions single acquisitions. To be
   measured. `STOP` itself: two packets already in flight arrive after it (within 20 ms), then the socket is idle and
   stays open (measured 2026-10-05, fw 1.16); a reader that stops at `STOP` leaves them unread.
@@ -344,9 +360,10 @@ are listed in PROTOCOL.md "Unknowns to verify on hardware" with the experiment.
   burst and record are delayed together after the trigger (measured 2026-10-05, fw 1.16, one bench setup). Whether
   `TRIG:DEL` is in nanoseconds (SCPI document) or samples (REST document) is still unknown. `AScan.t` starts at 0
   at the first sample and nothing more is claimed.
-- **`*RST` defaults.** Not documented beyond the `DEFault` column, and it is unknown whether `*RST` stops a
-  running acquisition. The plug never sends `*RST` on its own and `apply_capture` does not reset by default.
-  To be measured.
+- **`*RST` defaults.** Settled on fw 1.16 (measured 2026-10-05): `*RST` resets nothing, neither to the `DEFault`
+  column nor to the power-on state (entry 18). The plug never sends `*RST` on its own and `apply_capture` does not
+  reset by default. To get the power-on state, power-cycle the device, and remember that the pulser is then on.
+  Whether `*RST` stops a running acquisition or clears the error queue is not tested.
 - **Reply formats.** Settled on 2026-10-05, fw 1.16: booleans come back as `0`/`1`, enumerations as the mixed-case
   notation (`MASTer`, `INTernal`), times as shortest decimals (`2e-06`); see the section above. `values_match`
   accepts the long, short, case and `ON`/`1` variants. Still to be measured: which unit a bare number gets in a
@@ -372,14 +389,14 @@ fake's data socket too. `examples/example_test.py --fake` does exactly that.
 
 What it models, from the vendor documents: the SCPI header set with long and short forms, unit conversion to
 the documented reply formats, the error queue with `-113` (undefined header) and `-221` (settings conflict on
-`AVER:DEL:CONS` while auto is on), `*IDN?` with firmware `1.16 (861f022a)`, `*RST` to its default table, and a
+`AVER:DEL:CONS` while auto is on), `*IDN?` with firmware `1.16 (861f022a)`, `*RST` that changes no setting (measured), and a
 data socket that sends `28 + 2 * DATA:LENG` byte packets between `STAR AUTO` and `STOP`. Measured 2026-10-05
 (fw 1.16) and folded in: the error queue of 16 entries plus `-350`, `-224` for a refused value (`DATA:LENG` outside
 1024 to 36864 and bad words or numbers), `-363` for one line over 256 bytes (the real input buffer limit is between 160 and
 about 320 bytes and the fake cannot see bursts), seconds replies as shortest decimals (`1`, `2e-06`), header length
 fields (a 24-bit samples + 16) and telemetry bytes, `ctp[0]` = the packet counter, `ascan_count` 1, a packet counter
 that starts at 2 and never restarts, two packets still delivered after `STOP`, `DATA:LENG MIN/MAX/DEF`, the automatic
-`AVER:DEL:CONS` (`TRIG:INT` minus 70.75 us), and optionally the power-on state, whose packets at `DATA:LENG` 114688
+`AVER:DEL:CONS` (`TRIG:INT / 2^AVER:COUN` minus 70.75 us), and optionally the power-on state, whose packets at `DATA:LENG` 114688
 are zero from sample 81906 on (the device's constant stretch is not modelled).
 
 What it invents: the signal of the default `burst` (a damped sine burst at `TRAN:FREQ`, starting at 10 % of the
@@ -395,7 +412,7 @@ Constructor options:
 | Option | Effect |
 |---|---|
 | `length=1024` | initial `DATA:LENG` (1024 unless `power_on`, then 114688) |
-| `power_on=True` | start from the measured power-on state (pulser on, `DUAL`, `TRIG:INT` 1 s, `DATA:LENG` 114688, which its own setter refuses); `*RST` still goes to the vendor defaults. Off by default: the suite assumes the vendor defaults |
+| `power_on=True` | start from the measured power-on state (pulser on, `DUAL`, `TRIG:INT` 1 s, `DATA:LENG` 114688, which its own setter refuses); `*RST` changes nothing either way. Off by default: the suite assumes the vendor defaults |
 | `chunk=k` | the data socket returns at most `k` bytes per `recv`, to exercise reassembly |
 | `garbage_prefix=b'..'` | bytes sent once before the first packet, to exercise resync |
 | `signal='burst'` | `'burst'` (default), `'zeros'` (all samples 0), `'noise'` (an open input: offset +11 counts, std 3.6 counts divided by 2^(`AVER:COUN`/2)), `'none'` (never sends a packet: timeouts) or `'transmission'` (pulser on: the measured two-transducer wavelet, off: noise) |

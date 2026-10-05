@@ -1,6 +1,6 @@
 # STATUS.md
 
-Last updated: 2026-10-05 (after hardware phases A, B and C without `*RST`) by the project owner agent.
+Last updated: 2026-10-05 (end of the first hardware session) by the project owner agent.
 
 ## Decisions taken (with the human owner)
 
@@ -49,15 +49,20 @@ Last updated: 2026-10-05 (after hardware phases A, B and C without `*RST`) by th
       to face, 20 V: three runs (0 dB, 40 dB, 40 dB with the transducers pulled apart as the
       control). README entries 14 to 17; the fake's `signal='transmission'` follows the
       measurement; 861 tests.
-- [ ] Experiment 13 (`*RST`): tool ready, needs the owner's go.
+- [x] Experiment 13 (`*RST`), two runs, 2026-10-05, fw 1.16: `*RST` changes no setting (six
+      detuned settings stayed detuned). README entry 18; the fake's `*RST` no longer resets;
+      `hw_probe.py --phase RST` detunes first by default; 868 tests.
+- [x] Second SCPI connection, repeated 4 times: the device closes the first connection as soon as
+      a second one to port 5025 is accepted.
 - [ ] Experiment 12 (count-to-volt): deferred, a signal generator is available later.
 - [ ] SPEC-golden (golden A-scan comparison), not written yet.
 
 ## Open questions after phases A and B
 
 Still open from `PROTOCOL.md` "Unknowns to verify on hardware": single-shot acquisition,
-count-to-volt scaling, the unit of `TRIG:DEL`, `*RST` defaults, settling times, per-connection
-state, REST/WebSocket. Settled in phase C (one bench setup): sample 0 is the start of the burst
+count-to-volt scaling (experiment 12, deferred until a signal generator is on the bench), the
+unit of `TRIG:DEL`, settling times, REST/WebSocket, whether `*RST` stops an acquisition or clears
+the error queue, whether the pulser emits before `STAR AUTO` while `TRAN:ENAB` is 1. Settled in phase C (one bench setup): sample 0 is the start of the burst
 to within a few microseconds; `TRIG:DEL` delays burst and record together, so the signal does
 not move in the record; averaging is a mean also with a real signal; 40 dB of `GAIN` gave 37.4 dB. Settled so far: data port 2758, terminators, reply forms,
 error-queue depth (16 + `-350`), `AVER:COUN` is an exponent and the result a mean, `ascan_count`
@@ -72,8 +77,8 @@ New questions:
   everything else restored). At 114688 the device streams partly invalid packets (README entry 13).
 - The device powers on with the pulser enabled at 20 V. The plug switches it off at `tearDown`
   only; should construction switch it off too? Owner decision.
-- A second connection to port 5025 killed the first (seen once). Open or close? The data port does
-  not have this effect.
+- One SCPI client only: a second connection to port 5025 makes the device close the first at
+  once (4 of 4). The data port does not have this effect. The fake does not model it.
 - Input buffer: a burst above 160 to 320 bytes is discarded with `-363` and a query in it is never
   answered. The longest line the plug can produce (a long `GAIN:TGC:ARB` list) is not checked.
 - `ctp[0]` equals the packet counter in `TRIG:MODE INT`; does it go on past 255?

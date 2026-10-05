@@ -23,7 +23,8 @@ _KEYWORDS = ('MIN', 'MINIMUM', 'MAX', 'MAXIMUM', 'DEF', 'DEFAULT', 'UP', 'DOWN')
 
 # Reply of `*RST`: the vendor's `DEFault` column in the device's reply format (PROTOCOL.md
 # command table). UNKNOWN defaults take the vendor example's value. What the device does on
-# `*RST` was not measured; what it has after power-on is `POWER_ON` below.
+# The fake starts from it, but `*RST` does not go back to it: on fw 1.16 `*RST` changes no
+# setting (see the `*RST` branch of `write`). What the device has after power-on is `POWER_ON`.
 DEFAULTS: dict[str, str] = {
     'FREQ': '100000000',
     'DATA:LENG': '1024',
@@ -63,7 +64,7 @@ DEFAULTS: dict[str, str] = {
 # see `_check_range`), `AVER:DEL:CONS` 0.99992925 (automatic), no HPAS index, TGC `0,0` and an
 # empty `GAIN:TGC:ARB`. The fake starts from this only with `power_on=True` (a fake that
 # starts with the pulser on and a `DATA:LENG` its own setter refuses changed 36 tests of the
-# suite, so it is opt-in); `*RST` always goes to `DEFAULTS`.
+# suite, so it is opt-in).
 POWER_ON: dict[str, str] = {
     **DEFAULTS,
     'DATA:LENG': '114688',
@@ -131,9 +132,9 @@ _DATA_LENG_KEYWORDS = {
     'DEF': _DATA_LENG_DEFAULT,
     'DEFAULT': _DATA_LENG_DEFAULT,
 }
-# Automatic `AVER:DEL:CONS` = `TRIG:INT` minus this many seconds. Measured 2026-10-05, fw 1.16
-# at `AVER:COUN` 0 and `FREQ` 100 MHz only: 0.99992925 at 1 s, 0.00992925 at 10 ms. Whether it
-# depends on `AVER:COUN` or `FREQ` is not measured.
+# Automatic `AVER:DEL:CONS` = `TRIG:INT` / 2^`AVER:COUN` minus this many seconds. Measured
+# 2026-10-05, fw 1.16 at `FREQ` 100 MHz only: 0.99992925 at 1 s / count 0, 0.00992925 at 10 ms /
+# count 0, 0.00242925 at 10 ms / count 2. Whether it depends on `FREQ` is not measured.
 _AUTO_CONSTANT_DELAY_OFFSET_S = 70.75e-6
 # `DATA:LENG` above the limit (only the power-on value 114688 gets there) gives packets that
 # are partly invalid: measured 2026-10-05, fw 1.16 at 114688, samples from this index on are
@@ -264,8 +265,13 @@ class FakeA1580Resource:
             self.started = False
             self.stop_count += 1
         elif header == '*RST':
-            self._values = dict(DEFAULTS)
-            self.started = False
+            # Measured 2026-10-05, fw 1.16: `*RST` changes no setting, neither back to the
+            # vendor `DEFault` values nor to the power-on state (six settings moved away first:
+            # GAIN 6, TRIG:INT 10 MS, AVER:COUN 2, TRAN:FREQ 50 KHZ, FILT:HPAS:IND 2,
+            # TRIG:DEL 0 NS; all 27 state headers read the same after, also 2 s later;
+            # TRAN:ENAB? -> 0). Not tested: whether it stops a running acquisition or clears
+            # the error queue; the fake does neither.
+            pass
         elif header == '*CLS':
             self._errors.clear()
         elif header == 'MEM:CLE':
@@ -303,8 +309,9 @@ class FakeA1580Resource:
             and text.endswith('?')
             and self._values['AVER:DEL:CONS:AUTO'] == '1'
         ):
-            # measured 2026-10-05, fw 1.16 at AVER:COUN 0, FREQ 100 MHz only (see the constant)
-            return _seconds(float(self._values['TRIG:INT']) - _AUTO_CONSTANT_DELAY_OFFSET_S)
+            # measured 2026-10-05, fw 1.16 at FREQ 100 MHz only (see the constant)
+            interval = float(self._values['TRIG:INT']) / 2 ** int(float(self._values['AVER:COUN']))
+            return _seconds(interval - _AUTO_CONSTANT_DELAY_OFFSET_S)
         if text.endswith('?') and header in self._values:
             return self._values[header]
         # A real socket resource would time out waiting for the reply of a bad query.

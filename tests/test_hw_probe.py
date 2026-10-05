@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from a1580_openhtf.fake_resource import FakeA1580Resource
+from a1580_openhtf.fake_resource import DEFAULTS, FakeA1580Resource
 from a1580_openhtf.plug import STATE_HEADERS, normalize_header
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1286,7 +1286,9 @@ def test_step_10b_reports_averaging_with_a_real_signal(
     assert hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=fake) == 0
     data = _load_probe(tmp_path)['steps']['STEP 10b']['data']
     assert data['peak_ratio'] == pytest.approx(1.0, abs=0.1)  # a mean
-    assert data['noise_ratio'] is None  # the burst starts at sample 3: no pre-onset samples
+    # the burst starts at sample 3: the noise comes from the last quarter of the record
+    assert data['noise_ratio'] == pytest.approx(0.25, abs=0.08)
+    assert 'last quarter' in data['noise_part']
     assert data['ascan_counts'] == [1]
     assert 'AVER:COUN 4' in fake.log
     assert (
@@ -1298,18 +1300,31 @@ def test_step_10b_reports_averaging_with_a_real_signal(
     assert '1.0 means a mean, 16 a sum' in out
 
 
-def test_step_10b_without_enough_pre_onset_samples_says_so(tmp_path: Path) -> None:
+def test_step_10b_without_enough_pre_onset_samples_uses_the_last_quarter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=_c_fake()) == 0
+    data = _load_probe(tmp_path)['steps']['STEP 10b']['data']
+    assert data['noise_ratio'] == pytest.approx(0.25, abs=0.08)
+    assert 'pre_onset_samples' not in data
+    out = capsys.readouterr().out
+    assert 'noise std in the last quarter of the record' in out
+    assert 'no pre-onset samples' not in out
+
+
+def test_step_10b_with_enough_pre_onset_samples_uses_them(tmp_path: Path) -> None:
     import a1580_openhtf.fake_resource as fr
 
     old = fr._TRANSMISSION_ARRIVAL_S
-    fr._TRANSMISSION_ARRIVAL_S = 20e-6  # the burst arrives at once: nothing before the onset
+    fr._TRANSMISSION_ARRIVAL_S = 200e-6  # 200 samples of noise before the onset
     try:
-        assert hw_probe.main(_c_args(tmp_path), fake=_c_fake()) == 0
+        assert hw_probe.main(_c_args(tmp_path, '--gain', '40'), fake=_c_fake()) == 0
     finally:
         fr._TRANSMISSION_ARRIVAL_S = old
     data = _load_probe(tmp_path)['steps']['STEP 10b']['data']
-    assert data['noise_ratio'] is None
-    assert data['noise_note'] == 'no pre-onset samples'
+    assert data['pre_onset_samples'] >= 50
+    assert data['noise_part'].startswith('the first')
+    assert data['noise_ratio'] == pytest.approx(0.25, abs=0.08)
 
 
 def test_step_11_reports_that_the_fake_signal_does_not_move(
@@ -1476,21 +1491,59 @@ def test_phase_rst_sends_rst_once_switches_the_pulser_off_at_once_and_prints_the
     assert 'RESTORE FAILED (known firmware defect' in out
 
 
-def test_phase_rst_table_marks_rows_and_is_in_the_report(tmp_path: Path) -> None:
+def test_phase_rst_table_marks_rows_and_is_in_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     fake = _power_on_like()
     assert hw_probe.main(_rst_args(tmp_path), fake=fake) == 0
-    rows = {r['header']: r for r in _load_probe(tmp_path)['steps']['STEP 13']['data']['table']}
+    out = capsys.readouterr().out
+    assert 'before *RST (detuned)' in out
+    assert '*RST changed 0 of 6 detuned settings' in out
+    data = _load_probe(tmp_path)['steps']['STEP 13']['data']
+    rows = {r['header']: r for r in data['table']}
     assert set(rows) == {*STATE_HEADERS, 'DATA:PORT', 'SYST:ERR:COUN'}
-    # power-on TRAN:TYPE is DUAL, the vendor default SINGle: not the default, equal to the snapshot
-    assert rows['TRAN:TYPE']['after_rst'] == 'SINGle'
-    assert rows['TRAN:TYPE']['snapshot'] == 'DUAL'
-    assert rows['TRAN:TYPE']['default'] == 'SINGle'
-    assert rows['TRAN:TYPE']['mark'] == '= vendor default'
+    assert data['detuned_changed_by_rst'] == []
+    # the fake's `*RST` changes nothing (measured on the device): the six keep the detuned value
+    # (the fake's TRIG:INT is already 10 ms, so that row is no detune and keeps its old mark)
+    assert rows['TRIG:INT']['mark'] == '= snapshot, = vendor default'
+    for header, before in (('GAIN', '6'), ('AVER:COUN', '2')):
+        assert rows[header]['before_rst'] == before
+        assert rows[header]['after_rst'] == before
+        assert rows[header]['mark'] == 'kept the detuned value'
+    assert rows['TRAN:FREQ']['before_rst'] == '50000'
+    assert rows['FILT:HPAS:IND']['before_rst'] == '2'
+    assert rows['TRIG:DEL']['before_rst'] == '0'
+    # an undetuned header keeps the old marks; DUAL is the power-on value, not the default
+    assert rows['TRAN:TYPE']['after_rst'] == 'DUAL'
+    assert rows['TRAN:TYPE']['mark'] == '= snapshot'
     assert rows['TRAN:IMP']['mark'] == '= snapshot, = vendor default'
-    assert rows['DATA:LENG']['mark'] == '= vendor default'
-    assert rows['TRIG:INT']['after_rst'] == '0.01'
     assert rows['DATA:PORT']['snapshot'] == '-'
     assert rows['SYST:ERR:COUN']['default'] == '-'
+    # detune writes: the six, never the pulser or its voltage
+    detune = [
+        c for c in fake.log[: fake.log.index('*RST')] if c.split(' ')[0] in hw_probe.RST_DETUNE
+    ]
+    assert len(detune) >= 6
+    assert not [c for c in fake.log if c.startswith(('TRAN:PULS ', 'TRAN:ENAB ON'))]
+
+
+def test_phase_rst_no_detune_gives_the_old_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _power_on_like()
+    assert hw_probe.main(_rst_args(tmp_path, '--no-detune'), fake=fake) == 0
+    out = capsys.readouterr().out
+    assert 'before *RST (detuned)' not in out
+    assert 'detuned settings' not in out
+    assert 'GAIN 6' not in fake.log
+    rows = {r['header']: r for r in _load_probe(tmp_path)['steps']['STEP 13']['data']['table']}
+    assert 'before_rst' not in rows['GAIN']
+    assert rows['TRAN:TYPE']['mark'] == '= snapshot'
+
+
+def test_phase_rst_detunes_only_settings_that_are_not_the_pulser() -> None:
+    assert not {h for h in hw_probe.RST_DETUNE if h.startswith(('TRAN:PULS', 'TRAN:ENAB'))}
+    assert len(hw_probe.RST_DETUNE) == 6
 
 
 def test_phase_rst_row_that_matches_neither_is_marked_neither(tmp_path: Path) -> None:
@@ -1500,9 +1553,30 @@ def test_phase_rst_row_that_matches_neither_is_marked_neither(tmp_path: Path) ->
             if cmd == '*RST':
                 self._values['GAIN'] = '33'
 
-    assert hw_probe.main(_rst_args(tmp_path), fake=Odd()) == 0
+    assert hw_probe.main(_rst_args(tmp_path, '--no-detune'), fake=Odd()) == 0
     rows = {r['header']: r for r in _load_probe(tmp_path)['steps']['STEP 13']['data']['table']}
     assert rows['GAIN']['mark'] == 'neither'
+
+
+def test_phase_rst_detuned_rows_that_a_reset_changes_are_marked_and_counted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Resets(FakeA1580Resource):
+        def write(self, cmd: str) -> None:
+            super().write(cmd)
+            if cmd == '*RST':
+                self._values['GAIN'] = '33'  # a third value
+                self._values['AVER:COUN'] = DEFAULTS['AVER:COUN']  # the vendor default
+                self._values['TRIG:DEL'] = '15000'  # the snapshot value of the plain fake
+
+    assert hw_probe.main(_rst_args(tmp_path), fake=Resets()) == 0
+    data = _load_probe(tmp_path)['steps']['STEP 13']['data']
+    rows = {r['header']: r for r in data['table']}
+    assert rows['GAIN']['mark'] == 'a third value'
+    assert rows['AVER:COUN']['mark'] == 'back to the snapshot value'  # snapshot 0 = default
+    assert rows['TRAN:FREQ']['mark'] == 'kept the detuned value'
+    assert sorted(data['detuned_changed_by_rst']) == ['AVER:COUN', 'GAIN', 'TRIG:DEL']
+    assert '*RST changed 3 of 6 detuned settings' in capsys.readouterr().out
 
 
 def test_phase_rst_pulser_that_comes_on_with_rst_is_a_result_and_ends_off(
@@ -1757,7 +1831,7 @@ def test_dry_run_phase_rst_matches_what_the_fake_run_sends(tmp_path: Path) -> No
     planned = _plan_commands(hw_probe.plan('RST', args), 'STEP 13', 'TEARDOWN')
     fake = _power_on_like()
     assert hw_probe.main(_rst_args(tmp_path), fake=fake) == 0
-    start = fake.log.index('*RST')
+    start = fake.log.index('GAIN 6') - 1  # the error-queue drain before the detune
     last_stop = max(i for i, c in enumerate(fake.log) if c == 'STOP')
     assert planned == fake.log[start : last_stop - 1]
 
