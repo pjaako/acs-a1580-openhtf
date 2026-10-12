@@ -1,6 +1,6 @@
 # STATUS.md
 
-Last updated: 2026-10-05 (end of the first hardware session) by the project owner agent.
+Last updated: 2026-10-12 (phase V implemented on the fake, not yet run on hardware) by the project owner agent.
 
 ## Decisions taken (with the human owner)
 
@@ -58,7 +58,14 @@ Last updated: 2026-10-05 (end of the first hardware session) by the project owne
       measured on the device with a raw socket.
 - [x] Second SCPI connection, repeated 4 times: the device closes the first connection as soon as
       a second one to port 5025 is accepted.
-- [ ] Experiment 12 (count-to-volt): deferred, a signal generator is available later.
+- [x] `SPEC-volt.md` and its implementation in `tools/hw_probe.py` (`--phase V`, experiment 12,
+      count-to-volt): amplitude sweep with the human setting the generator at prompts, `GAIN` steps,
+      optional preamp, impedance and high-pass steps, sine fit, saturation and code-usage checks,
+      raw int16 per step; the fake got `signal='sine'` with invented constants; 963 tests. Checked on
+      the fake only. Written by a coder subagent, reviewed (one blocker fixed: the input ceiling is
+      checked on the open-circuit voltage; the flat-top rule allows for a coarse ADC).
+- [ ] Experiment 12 on hardware: needs a signal generator on `IN` and the human's confirmation of
+      the input ceiling (`--max-gen-vpp`, default 1.0 Vpp; the receiver's rating is unknown).
 - [ ] SPEC-golden (golden A-scan comparison), not written yet.
 
 ## Open questions after phases A and B
@@ -100,12 +107,15 @@ owner whether you may push from the machine you are on (on the lab machine he pu
 1. Read `AGENTS.md`, this file, `HARDWARE-SESSION.md`, then README sections "Measured on the
    device" and "Firmware defects the plug does not work around". `PROTOCOL.md` is the vendor
    digest and is never edited; README wins where they differ.
-2. `uv sync --extra dev`, then the gates from `CLAUDE.md`. Expect 876 tests passing, ruff and
+2. `uv sync --extra dev`, then the gates from `CLAUDE.md`. Expect 963 tests passing, ruff and
    mypy clean, and `tools/hw_probe.py --phase AB --fake`, `--phase C --pulse-v 20 --gain 40 --fake`,
-   `--phase RST --allow-rst --fake` all exiting 0.
+   `--phase RST --allow-rst --fake`, `--phase V --fake` all exiting 0.
 3. Before any contact with the device ask the human the preconditions of `HARDWARE-SESSION.md`
    again (address and reachability, what is connected and the voltage ceiling, exclusive use).
-   The device is only reachable from a machine on its network.
+   The device is only reachable from a machine on its network: the vendor default
+   `192.168.200.18/24`. `host/` holds a Proxmox kit that gives the LXC container a second NIC on
+   that network, with the no-kit alternatives in its README; which one applies depends on how the
+   device is cabled (open as of 2026-10-12).
 
 What to know before touching the device (firmware 1.16):
 
@@ -121,10 +131,10 @@ What to know before touching the device (firmware 1.16):
 
 Next steps, in the order the owner last agreed:
 
-1. Experiment 12, count-to-volt scaling: needs a signal generator on `IN` with known amplitude
-   and frequency, pulser off. The probe tool has no phase for it: write a SPEC first (settings,
-   amplitude steps, saturation check, raw int16 records saved, gain steps), then a coder, then the
-   run. Result: README entry, a `v` conversion only if the scaling proves stable.
+1. Experiment 12, count-to-volt scaling, on hardware: `tools/hw_probe.py --phase V` (`--dry-run`
+   first), a signal generator on `IN`, pulser off, the human at the generator. Result: README
+   entry, the fake's invented `COUNTS_PER_VOLT`, `PRE`, `IMP`, `HPF` replaced by measurements, a
+   `v` conversion only if the scaling proves stable.
 2. SPEC-golden (golden A-scan comparison): the next feature, not written yet.
 3. Smaller open measurements, when convenient: `ctp[0]` past 255, whether the pulser emits before
    `STAR AUTO`, spacing of averaged acquisitions, whether `*RST` stops a stream or clears the error

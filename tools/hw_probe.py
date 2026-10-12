@@ -5,7 +5,9 @@ Phase A is read-only (experiments 1 to 5, the only writes are the deliberate bad
 step 5). Phase B (experiments 6 to 9) switches the pulser off first, then changes a few
 acquisition settings and streams A-scans. Phase C (experiments 10, 10b and 11) is the only
 one that switches the pulser ON, at `--pulse-v`, with transducers connected; phase RST
-(experiment 13) sends `*RST` once. Experiment 12 is deferred.
+(experiment 13) sends `*RST` once. Phase V (experiment 12, SPEC-volt.md) feeds a known sine from
+a signal generator into `IN` with the pulser off: the human sets the generator at prompts, the
+tool never switches the pulser on and opens no gate.
 
 Safety, enforced in code and not only by convention:
 
@@ -29,6 +31,7 @@ Usage:
     A1580_HOST=... tools/hw_probe.py --phase A
     A1580_HOST=... tools/hw_probe.py --phase C --pulse-v 20
     A1580_HOST=... tools/hw_probe.py --phase RST --allow-rst
+    A1580_HOST=... tools/hw_probe.py --phase V [--with-preamps --with-impedance --with-hpf]
     tools/hw_probe.py --fake --phase AB --out /tmp/probe # against FakeA1580Resource
 """
 
@@ -38,6 +41,7 @@ import argparse
 import contextlib
 import datetime
 import json
+import math
 import os
 import re
 import socket
@@ -102,8 +106,9 @@ RST_DETUNE: dict[str, object] = {
 }
 SAMPLE_MAX = 32767
 SAMPLE_MIN = -32768
-PHASES = ('A', 'B', 'AB', 'C', 'RST')
-PULSER_OFF_BEFORE = (6, 10, 13)  # the pulser-off check runs before the first of these steps
+PHASES = ('A', 'B', 'AB', 'C', 'RST', 'V')
+# the pulser-off check runs before the first of these steps
+PULSER_OFF_BEFORE: tuple[int | str, ...] = (6, 10, 13, '12a')
 # Phase C settings are words that go into SCPI strings: letters, digits, blanks, `.`, `+`, `-`.
 _SAFE_SETTING = re.compile(r'[A-Za-z0-9 .+\-]+')
 # `DEFAULTS` entries of the fake that its source marks `UNKNOWN default`: a guess, not the vendor's
@@ -438,6 +443,7 @@ class Probe:
         self.baseline: np.ndarray | None = None  # step 10, pulser off, int16 (packets, samples)
         self.pulsed10: np.ndarray | None = None
         self.step10: dict[str, Any] | None = None
+        self.v_reference: dict[str, Any] | None = None  # phase V: GAIN 0 amplitude of step 12b
         self.pulse_written = False  # phase C changed TRAN:PULS (it is never written back)
         self.expected_diffs: dict[str, str] = {}  # header -> why a final-diff change is expected
         resource.set_announce(self._announce)
@@ -1430,9 +1436,15 @@ def shift_verdict(
     return f'something else: the record moves {direction} by {abs(lag)} samples{ratio}'
 
 
-def _save_npz(p: Probe, name: str, arrays: dict[str, np.ndarray], settings: dict[str, Any]) -> str:
-    """`<out>/phaseC-<serial>-<stamp>-<name>.npz`: int16 arrays plus the settings as JSON text."""
-    path = p.out_dir / f'phaseC-{p.serial}-{p.stamp}-{name}.npz'
+def _save_npz(
+    p: Probe,
+    name: str,
+    arrays: dict[str, np.ndarray],
+    settings: dict[str, Any],
+    prefix: str = 'phaseC',
+) -> str:
+    """`<out>/<prefix>-<serial>-<stamp>-<name>.npz`: int16 arrays plus the settings as JSON text."""
+    path = p.out_dir / f'{prefix}-{p.serial}-{p.stamp}-{name}.npz'
     p.out_dir.mkdir(parents=True, exist_ok=True)
     np.savez(
         path,
@@ -1769,6 +1781,651 @@ def step_13(p: Probe) -> None:
     p.current.data['table'] = rows
 
 
+# ── Phase V: count-to-volt scaling (experiment 12, SPEC-volt.md) ─────────────
+#
+# A signal generator feeds a known sine into `IN`, the pulser stays off. The generator is set by
+# the human at a prompt (`set_generator`), never by a command. Phase V opens no gate.
+
+V_GEN_VPP_DEFAULT = '0,0.02,0.05,0.1,0.2,0.5,1.0'
+V_GAINS_DEFAULT = '0,6,12,20,40,60'
+V_SAMPLE_FREQ = '10 MHZ'
+FREQ_TOLERANCE = 0.02  # FFT peak against --gen-hz: more than this is a warning
+FIT_RESIDUAL_LIMIT = 0.05  # largest relative residual of the 12a fit before a warning
+FIT_MIN_POINTS = 3
+V_COMBOS = ((1, 0), (0, 1), (1, 1))  # step 12c: (GAIN:PRE:COMB, GAIN:PRE:SPLIT)
+V_IMPEDANCES = ('200', '1000', 'HIGH')  # step 12d, HIGH last
+V_HPF_INDEXES = (1, 2, 3)  # step 12e
+V_PREAMPS_OFF: dict[str, object] = {'GAIN:PRE:COMB': 0, 'GAIN:PRE:SPLIT': 0}
+
+
+def _as_floats(value: str | Sequence[float]) -> list[float]:
+    """A comma-separated list (or a sequence) as finite floats; ValueError otherwise."""
+    items = value.split(',') if isinstance(value, str) else list(value)
+    numbers = [float(x) for x in items]
+    if not numbers or not all(math.isfinite(x) for x in numbers):
+        raise ValueError(f'not a list of finite numbers: {value!r}')
+    return numbers
+
+
+def phase_v_settings(args: argparse.Namespace) -> dict[str, object]:
+    """Section 3.1 of SPEC-volt.md: what the preparation writes (in this order)."""
+    return {
+        'DATA:LENG': int(args.length),
+        'FREQ': args.sample_freq,
+        'TRIG:MODE': 'INT',
+        'TRIG:INT': args.interval,
+        'TRAN:IMP': 'HIGH',
+        'GAIN': 0,
+        'GAIN:PRE:COMB': 0,
+        'GAIN:PRE:SPLIT': 0,
+        'GAIN:TGC:MODE': 'OFF',
+        'AVER:COUN': 0,
+        'FILT:HPAS:IND': 0,
+        'TRIG:DEL': TRIG_DEL_ZERO,
+    }
+
+
+def open_circuit_vpp(vpp_display: float, gen_display: str) -> float:
+    """Open-circuit voltage: the display with 'High-Z', twice the display with '50 ohm'."""
+    return vpp_display * (2.0 if str(gen_display).upper() == '50' else 1.0)
+
+
+def input_vpp(vpp_display: float, gen_display: str, zout: float, imp: str = 'HIGH') -> float:
+    """Voltage at `IN` (SPEC-volt.md section 0): `v_open * R / (R + Z_out)`, `HIGH` = infinite."""
+    v_open = open_circuit_vpp(vpp_display, gen_display)
+    if str(imp).strip().upper() == 'HIGH':
+        return v_open
+    r = float(imp)
+    return v_open * r / (r + zout)
+
+
+def generator_description(args: argparse.Namespace) -> dict[str, Any]:
+    """The generator as the human declared it, plus the assumption the input voltage rests on."""
+    display = str(args.gen_display).upper()
+    shown = (
+        'the display is the open-circuit voltage'
+        if display == 'HIGHZ'
+        else 'the open-circuit voltage is twice the display'
+    )
+    return {
+        'gen_hz': args.gen_hz,
+        'gen_vpp': _as_floats(args.gen_vpp),
+        'max_gen_vpp': args.max_gen_vpp,
+        'gen_display': display,
+        'gen_zout_ohm': args.gen_zout,
+        'gen_note': args.gen_note,
+        'assumption': (
+            f'generator display {display} ({shown}); v_in = v_open * R / (R + Z_out) with '
+            f'Z_out {args.gen_zout:g} ohm and R from TRAN:IMP (HIGH = infinite, so v_in = v_open)'
+        ),
+    }
+
+
+def generator_line(args: argparse.Namespace, vpp: float) -> str:
+    output = 'OFF' if vpp == 0 else 'ON'
+    return (
+        f'GENERATOR: set {vpp:g} Vpp (display {str(args.gen_display).upper()}) sine at '
+        f'{args.gen_hz:.12g} Hz on IN, output {output}, then press Enter'
+    )
+
+
+def connect_line(args: argparse.Namespace) -> str:
+    return (
+        'GENERATOR: connect the generator to IN (nothing on OUT), confirm the input ceiling '
+        f'{args.max_gen_vpp:g} Vpp, then press Enter'
+    )
+
+
+def _prompt_loop(p: Probe, line: str, allowed: dict[str, str]) -> str:
+    """Print `line`, read answers from stdin until one is empty or in `allowed`; returns it."""
+    p.say(line)
+    while True:
+        try:
+            answer = input(
+                '[Enter = continue' + ''.join(f', {k} = {v}' for k, v in allowed.items()) + '] '
+            )
+        except EOFError as exc:
+            raise AbortRun(
+                EXIT_FAILED_STEP, 'no input at the generator prompt (stdin closed)'
+            ) from exc
+        except KeyboardInterrupt as exc:
+            raise AbortRun(EXIT_FAILED_STEP, 'interrupted at the generator prompt') from exc
+        answer = answer.strip().lower()
+        if answer == '' or answer in allowed:
+            return answer
+        p.say(f'unknown answer {answer!r}')
+
+
+def _generator_is_scripted(p: Probe) -> bool:
+    return bool(p.fake or getattr(p.args, 'no_prompt', False))
+
+
+def confirm_connection(p: Probe) -> None:
+    """The extra prompt before step 12a: generator on `IN`, input ceiling confirmed."""
+    line = connect_line(p.args)
+    if _generator_is_scripted(p):
+        p.say(line + ('   [fake: no prompt]' if p.fake else '   [--no-prompt]'))
+        return
+    if _prompt_loop(p, line, {'a': 'abort'}) == 'a':
+        raise AbortRun(EXIT_FAILED_STEP, 'aborted at the generator prompt')
+
+
+def set_generator(p: Probe, vpp: float) -> bool:
+    """Ask the human to set the generator to `vpp` (displayed Vpp, 0 = output off).
+
+    Returns True when the generator is set and False when the entry is skipped (`s`); `a`
+    raises AbortRun. With `--fake` the fake's generator is set instead of prompting (to the
+    open-circuit voltage: the fake applies the `TRAN:IMP` divider itself); with `--no-prompt`
+    the line is only printed.
+    """
+    line = generator_line(p.args, vpp)
+    if p.fake:
+        p.resource.gen_vpp = open_circuit_vpp(vpp, p.args.gen_display)
+        p.resource.gen_hz = float(p.args.gen_hz)
+        p.say(line + '   [fake: set by the tool]')
+        return True
+    if getattr(p.args, 'no_prompt', False):
+        p.say(line + '   [--no-prompt]')
+        return True
+    answer = _prompt_loop(p, line, {'s': 'skip this entry', 'a': 'abort'})
+    if answer == 'a':
+        raise AbortRun(EXIT_FAILED_STEP, 'aborted at the generator prompt')
+    return answer != 's'
+
+
+def prepare_phase_v(p: Probe) -> None:
+    """Section 3.1. Any failure aborts the run; a pulser that is not off is EXIT_PULSER."""
+    try:
+        p.current.data['readbacks'] = _apply_report(p, phase_v_settings(p.args))
+        reply = p.plug.query('TRAN:ENAB?')
+        p.say(f'TRAN:ENAB? -> {bt(reply)}')
+        if not values_match('TRAN:ENAB', 'OFF', reply):
+            raise PulserCheckError(f'TRAN:ENAB? answered {reply!r} after the preparation')
+    except AbortRun:
+        raise
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        raise AbortRun(
+            EXIT_FAILED_STEP, f'the preparation failed, nothing was measured: {exc}'
+        ) from exc
+
+
+# ── analysis of one generator setting (pure function, int16 arrays in) ───────
+
+
+def _longest_run(mask: np.ndarray) -> int:
+    """Length of the longest run of True in a boolean array."""
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return int((edges[1::2] - edges[0::2]).max()) if edges.size else 0
+
+
+def analyse_sine(
+    packets: np.ndarray | Sequence[Sequence[int]],
+    fs_hz: float,
+    gen_hz: float,
+    *,
+    expect_signal: bool = True,
+) -> dict[str, Any]:
+    """SPEC-volt.md 3.2 on int16 records, one row per packet.
+
+    Per packet: mean, min, max, std; least-squares fit of `a sin + b cos + c` at `gen_hz`
+    (`amplitude` = hypot(a, b), peak counts, `offset` = c, `residual_std`); the FFT peak of the
+    mean-removed record (`peak_hz`) and its relative difference to `gen_hz`. For the setting:
+    the medians, `distinct_values` and `lowest_used_bit` (computed first), saturation (a sample
+    at the int16 limit, or a run of the largest or smallest value of at least
+    `max(4, ceil(3 * n_q))` samples, `n_q` being the peak width that quantisation explains,
+    SPEC-volt.md 3.2), `n_q` and the longest such run.
+    The frequency warning is given once, when the median FFT peak is off by more than
+    `FREQ_TOLERANCE` (or one FFT bin, whichever is larger) and `expect_signal` (False for
+    "generator output off", where the FFT peak is noise).
+    """
+    data = np.atleast_2d(np.asarray(packets))
+    count, n = data.shape
+    x = data.astype(np.float64)
+    arg = 2.0 * np.pi * gen_hz * np.arange(n) / fs_hz
+    design = np.column_stack([np.sin(arg), np.cos(arg), np.ones(n)])
+    coef = np.linalg.lstsq(design, x.T, rcond=None)[0]  # (3, count)
+    residual = x.T - design @ coef
+    amplitude = np.hypot(coef[0], coef[1])
+    spectrum = np.abs(np.fft.rfft(x - x.mean(axis=1, keepdims=True), axis=1))
+    peak_hz = np.fft.rfftfreq(n, 1.0 / fs_hz)[spectrum.argmax(axis=1)]
+    rel_diff = np.abs(peak_hz - gen_hz) / gen_hz
+    rows: list[dict[str, Any]] = []
+    levels = data.astype(np.int64)
+    ored = int(np.bitwise_or.reduce((levels - levels.min()).ravel()))
+    lowest_bit = 0 if ored == 0 else (ored & -ored).bit_length() - 1  # before the saturation check
+    q = 2**lowest_bit
+    saturated_samples = 0
+    clip_value: int | None = None
+    for i, row in enumerate(data):
+        at_limit = (row >= SAMPLE_MAX) | (row <= SAMPLE_MIN)
+        n_q = (
+            2.0 * (fs_hz / (2.0 * np.pi * gen_hz)) * np.sqrt(2.0 * q / max(1.0, amplitude[i])) + 1.0
+        )
+        min_run = max(FLAT_TOP_RUN, math.ceil(3.0 * n_q))
+        longest = max(_longest_run(row == row.max()), _longest_run(row == row.min()))
+        flat = _long_runs(row == row.max(), min_run) | _long_runs(row == row.min(), min_run)
+        bad = at_limit | flat
+        bad_count = int(np.count_nonzero(bad))
+        if bad_count:
+            worst = int(row[bad][np.abs(row[bad].astype(np.int64)).argmax()])
+            if clip_value is None or abs(worst) > abs(clip_value):
+                clip_value = worst
+        saturated_samples += bad_count
+        rows.append(
+            {
+                'mean': float(x[i].mean()),
+                'min': int(row.min()),
+                'max': int(row.max()),
+                'std': float(x[i].std()),
+                'amplitude': float(amplitude[i]),
+                'offset': float(coef[2, i]),
+                'residual_std': float(residual[:, i].std()),
+                'peak_hz': float(peak_hz[i]),
+                'freq_rel_diff': float(rel_diff[i]),
+                'saturated_samples': bad_count,
+                'n_q': float(n_q),
+                'longest_run': longest,
+            }
+        )
+    median = {
+        key: float(np.median([r[key] for r in rows]))
+        for key in rows[0]
+        if key not in ('saturated_samples', 'longest_run')
+    }
+    warnings: list[str] = []
+    bin_hz = fs_hz / n
+    if expect_signal and abs(median['peak_hz'] - gen_hz) > max(FREQ_TOLERANCE * gen_hz, bin_hz):
+        warnings.append(
+            f'generator or sample rate off: FFT peak at {median["peak_hz"]:.0f} Hz, '
+            f'--gen-hz {gen_hz:g} Hz (limit {FREQ_TOLERANCE:.0%} or one bin of {bin_hz:.0f} Hz)'
+        )
+    return {
+        'fs_hz': fs_hz,
+        'gen_hz': gen_hz,
+        'n_packets': int(count),
+        'n_samples': int(n),
+        'packets': rows,
+        'median': median,
+        'saturated': saturated_samples > 0,
+        'saturated_samples': saturated_samples,
+        'clip_value': clip_value,
+        'clip_counts': None if clip_value is None else abs(clip_value),
+        'distinct_values': int(np.unique(data).size),
+        'lowest_used_bit': lowest_bit,
+        'n_q': median['n_q'],
+        'longest_run': max(r['longest_run'] for r in rows),
+        'warnings': warnings,
+    }
+
+
+# ── steps 12a to 12e ─────────────────────────────────────────────────────────
+
+
+def _acquire_sine(
+    p: Probe, fs: float, expect_signal: bool = True
+) -> tuple[np.ndarray, dict[str, Any]]:
+    scans = p.plug.acquire(int(p.args.packets), timeout_s=ACQ_TIMEOUT_S)
+    raw = np.vstack([x.raw for x in scans]).astype(np.int16)
+    return raw, analyse_sine(raw, fs, float(p.args.gen_hz), expect_signal=expect_signal)
+
+
+def _v_settings(p: Probe, **extra: Any) -> dict[str, Any]:
+    settings: dict[str, Any] = {str(k): v for k, v in phase_v_settings(p.args).items()}
+    settings.update(
+        fs_hz=_sample_rate(p), packets=int(p.args.packets), generator=generator_description(p.args)
+    )
+    settings.update(extra)
+    return settings
+
+
+def _save_v(p: Probe, name: str, arrays: dict[str, np.ndarray], **extra: Any) -> str:
+    path = _save_npz(p, name, arrays, _v_settings(p, **extra), prefix='phaseV')
+    p.say(f'raw samples saved to {path}')
+    return path
+
+
+def _report_sine(p: Probe, label: str, analysis: dict[str, Any]) -> None:
+    m = analysis['median']
+    p.say(
+        f'{label}: amplitude {m["amplitude"]:.2f} counts (peak), offset {m["offset"]:.2f}, '
+        f'residual std {m["residual_std"]:.2f}, mean {m["mean"]:.2f}, std {m["std"]:.2f}, '
+        f'min {m["min"]:.0f} max {m["max"]:.0f}, FFT peak {m["peak_hz"]:.0f} Hz, '
+        f'distinct values {analysis["distinct_values"]}, lowest used bit '
+        f'{analysis["lowest_used_bit"]}, n_q {analysis["n_q"]:.1f}, longest extreme run '
+        f'{analysis["longest_run"]}, saturated '
+        + (
+            f'YES ({analysis["saturated_samples"]} samples, clip value {analysis["clip_value"]})'
+            if analysis['saturated']
+            else 'no'
+        )
+    )
+
+
+def _db(amplitude: float, reference: float) -> float | None:
+    if amplitude <= 0 or reference <= 0:
+        return None
+    return float(20.0 * np.log10(amplitude / reference))
+
+
+def _fmt(value: float | None, spec: str = '.2f') -> str:
+    return 'n/a' if value is None else format(value, spec)
+
+
+def fit_counts_per_volt(entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Section 3.3: least squares of `amplitude` against `v_in_peak` over the usable entries."""
+    points = [
+        e
+        for e in entries
+        if not e.get('skipped') and e['vpp_display'] > 0 and not e['analysis']['saturated']
+    ]
+    if len(points) < 2:
+        return {
+            'possible': False,
+            'points': len(points),
+            'reason': 'fewer than 2 unsaturated points',
+        }
+    x = np.array([e['v_in_peak'] for e in points])
+    y = np.array([e['analysis']['median']['amplitude'] for e in points])
+    slope, intercept = np.polyfit(x, y, 1)
+    rel = np.abs(y - (slope * x + intercept)) / np.abs(y)
+    return {
+        'possible': True,
+        'counts_per_volt': float(slope),
+        'intercept_counts': float(intercept),
+        'max_rel_residual': float(rel.max()),
+        'points': len(points),
+    }
+
+
+def step_12a(p: Probe) -> None:
+    """Experiment 12a: amplitude sweep, counts against volts at `GAIN 0`."""
+    args = p.args
+    vpps = _as_floats(args.gen_vpp)
+    fs = _sample_rate(p)
+    gen = generator_description(args)
+    p.say(f'generator assumption: {gen["assumption"]}')
+    p.say(
+        f'generator note: {args.gen_note!r}, {args.gen_hz:g} Hz, ceiling {args.max_gen_vpp:g} Vpp'
+    )
+    confirm_connection(p)
+    entries: list[dict[str, Any]] = []
+    arrays: dict[str, np.ndarray] = {}
+    stopped_at: float | None = None
+    for index, vpp in enumerate(vpps):
+        base: dict[str, Any] = {'index': index, 'vpp_display': vpp}
+        if stopped_at is not None:
+            entries.append({**base, 'skipped': f'saturated at {stopped_at:g} Vpp'})
+            continue
+        if not set_generator(p, vpp):
+            p.say(f'entry {vpp:g} Vpp skipped at the prompt')
+            entries.append({**base, 'skipped': 'skipped at the prompt'})
+            continue
+        raw, analysis = _acquire_sine(p, fs, expect_signal=vpp > 0)
+        v_pp = input_vpp(vpp, args.gen_display, args.gen_zout)
+        entry = {
+            **base,
+            'v_in_pp': v_pp,
+            'v_in_peak': v_pp / 2.0,
+            'assumption': gen['assumption'],
+            'analysis': analysis,
+        }
+        entries.append(entry)
+        arrays[f'vpp_{index}'] = raw
+        _report_sine(p, f'12a display {vpp:g} Vpp -> v_in {v_pp:g} Vpp', analysis)
+        for text in analysis['warnings']:
+            p.warn(f'{vpp:g} Vpp: {text}')
+        if analysis['saturated'] and vpp > 0:
+            stopped_at = vpp
+            p.say(f'saturated at {vpp:g}; higher entries skipped')
+    off = next((e for e in entries if e['vpp_display'] == 0 and 'analysis' in e), None)
+    mean_off = off['analysis']['median']['mean'] if off else None
+    noise_off = off['analysis']['median']['std'] if off else None
+    fit = fit_counts_per_volt(entries)
+    clip = max(
+        (e['analysis']['clip_counts'] for e in entries if e.get('analysis', {}).get('clip_counts')),
+        default=None,
+    )
+    if fit['possible']:
+        if clip is not None:
+            fit['full_scale_v_estimate'] = clip / fit['counts_per_volt']
+        if fit['points'] < FIT_MIN_POINTS:
+            p.warn('fewer than 3 unsaturated points')
+        if fit['max_rel_residual'] > FIT_RESIDUAL_LIMIT:
+            p.warn(f'largest residual over 5 % ({fit["max_rel_residual"]:.1%})')
+        p.say(
+            f'12a SUMMARY: counts_per_volt {fit["counts_per_volt"]:.2f}, intercept '
+            f'{fit["intercept_counts"]:.2f} counts, largest residual '
+            f'{fit["max_rel_residual"]:.2%}, {fit["points"]} points, mean_off {_fmt(mean_off)}, '
+            f'noise_off {_fmt(noise_off)}'
+            + (
+                f', full_scale_v_estimate {fit["full_scale_v_estimate"]:.4g} V'
+                if 'full_scale_v_estimate' in fit
+                else ''
+            )
+        )
+    else:
+        p.say(
+            f'12a SUMMARY: fit: not possible ({fit["reason"]}), mean_off {_fmt(mean_off)}, '
+            f'noise_off {_fmt(noise_off)}'
+        )
+    path = _save_v(
+        p,
+        'step12a',
+        arrays,
+        entries=[{k: v for k, v in e.items() if k != 'analysis'} for e in entries],
+    )
+    p.current.data.update(
+        generator=gen,
+        entries=entries,
+        fit=fit,
+        mean_off=mean_off,
+        noise_off=noise_off,
+        saturated_at=stopped_at,
+        npz=path,
+    )
+
+
+def _reference(p: Probe) -> dict[str, Any]:
+    if p.v_reference is None:
+        raise RuntimeError('no reference at GAIN 0 from step 12b: nothing to compare with')
+    return p.v_reference
+
+
+def step_12b(p: Probe) -> None:
+    """Experiment 12b: `GAIN` steps at a fixed input; measured dB against nominal."""
+    args = p.args
+    gains = _as_floats(args.gains)
+    fs = _sample_rate(p)
+    entries: list[dict[str, Any]] = []
+    arrays: dict[str, np.ndarray] = {}
+    if not set_generator(p, float(args.gain_vpp)):
+        p.say('step 12b skipped at the generator prompt')
+        p.current.data['skipped'] = True
+        return
+    v_pp = input_vpp(float(args.gain_vpp), args.gen_display, args.gen_zout)
+    reference: float | None = None
+    stopped_at: float | None = None
+    with _put_back(p, {'GAIN': 0}):
+        for gain in gains:
+            base: dict[str, Any] = {'gain_db': gain}
+            if stopped_at is not None:
+                entries.append({**base, 'skipped': f'saturated at GAIN {stopped_at:g}'})
+                continue
+            readbacks = _apply_report(p, {'GAIN': format(gain, 'g')})
+            raw, analysis = _acquire_sine(p, fs)
+            amplitude = analysis['median']['amplitude']
+            if reference is None:
+                reference = amplitude
+            measured = _db(amplitude, reference)
+            entry = {
+                **base,
+                'readback': readbacks['GAIN'],
+                'measured_db': measured,
+                'deviation_db': None if measured is None else measured - gain,
+                'analysis': analysis,
+            }
+            entries.append(entry)
+            arrays[f'gain_{gain:g}'] = raw
+            _report_sine(p, f'12b GAIN {gain:g}', analysis)
+            p.say(
+                f'12b GAIN {gain:g}: measured {_fmt(measured)} dB against GAIN {gains[0]:g}, '
+                f'deviation from nominal {_fmt(entry["deviation_db"], "+.2f")} dB'
+            )
+            for text in analysis['warnings']:
+                p.warn(f'GAIN {gain:g}: {text}')
+            if analysis['saturated']:
+                stopped_at = gain
+                p.say(f'saturated at GAIN {gain:g}; higher values skipped')
+    usable = [
+        e
+        for e in entries
+        if 'analysis' in e and not e['analysis']['saturated'] and e['deviation_db'] is not None
+    ]
+    worst = max((abs(e['deviation_db']) for e in usable), default=None)
+    p.say(
+        f'12b SUMMARY: {len(usable)} unsaturated gains, largest deviation from nominal '
+        f'{_fmt(worst)} dB, reference amplitude {_fmt(reference)} counts at '
+        f'{v_pp / 2:g} V peak'
+    )
+    p.v_reference = (
+        None
+        if reference is None
+        else {'amplitude': reference, 'vpp_display': float(args.gain_vpp), 'v_in_pp': v_pp}
+    )
+    path = _save_v(
+        p,
+        'step12b',
+        arrays,
+        entries=[{k: v for k, v in e.items() if k != 'analysis'} for e in entries],
+    )
+    p.current.data.update(
+        entries=entries,
+        reference_amplitude=reference,
+        largest_deviation_db=worst,
+        saturated_at=stopped_at,
+        npz=path,
+    )
+
+
+def step_12c(p: Probe) -> None:
+    """Experiment 12c (`--with-preamps`): `GAIN:PRE:COMB` and `GAIN:PRE:SPLIT`."""
+    reference = _reference(p)['amplitude']
+    fs = _sample_rate(p)
+    entries: list[dict[str, Any]] = []
+    arrays: dict[str, np.ndarray] = {}
+    with _put_back(p, V_PREAMPS_OFF):
+        for comb, split in V_COMBOS:
+            name = f'comb{comb}_split{split}'
+            entry: dict[str, Any] = {'comb': comb, 'split': split}
+            try:
+                entry['readbacks'] = _apply_report(
+                    p, {'GAIN:PRE:COMB': comb, 'GAIN:PRE:SPLIT': split}
+                )
+            except RuntimeError as exc:  # a refused combination is a result
+                entry['error'] = str(exc)
+                p.say(f'12c COMB {comb} SPLIT {split}: error: {exc}')
+                entries.append(entry)
+                continue
+            raw, analysis = _acquire_sine(p, fs)
+            entry.update(analysis=analysis, db=_db(analysis['median']['amplitude'], reference))
+            entries.append(entry)
+            arrays[name] = raw
+            _report_sine(p, f'12c COMB {comb} SPLIT {split}', analysis)
+            p.say(
+                f'12c COMB {comb} SPLIT {split}: {_fmt(entry["db"])} dB against GAIN 0'
+                + (' (SATURATED)' if analysis['saturated'] else '')
+            )
+            for text in analysis['warnings']:
+                p.warn(f'COMB {comb} SPLIT {split}: {text}')
+    path = _save_v(
+        p,
+        'step12c',
+        arrays,
+        entries=[{k: v for k, v in e.items() if k != 'analysis'} for e in entries],
+    )
+    p.current.data.update(entries=entries, npz=path)
+
+
+def step_12d(p: Probe) -> None:
+    """Experiment 12d (`--with-impedance`): `TRAN:IMP` 200, 1000, HIGH."""
+    args = p.args
+    _reference(p)
+    fs = _sample_rate(p)
+    entries: list[dict[str, Any]] = []
+    arrays: dict[str, np.ndarray] = {}
+    with _put_back(p, {'TRAN:IMP': 'HIGH'}):
+        for imp in V_IMPEDANCES:
+            readbacks = _apply_report(p, {'TRAN:IMP': imp})
+            raw, analysis = _acquire_sine(p, fs)
+            v_pp = input_vpp(float(args.gain_vpp), args.gen_display, args.gen_zout, imp)
+            amplitude = analysis['median']['amplitude']
+            entry: dict[str, Any] = {
+                'imp': imp,
+                'readback': readbacks['TRAN:IMP'],
+                'v_in_pp': v_pp,
+                'v_in_peak': v_pp / 2.0,
+                'counts_per_volt_at_R': amplitude / (v_pp / 2.0) if v_pp > 0 else None,
+                'analysis': analysis,
+            }
+            entries.append(entry)
+            arrays[f'imp_{imp}'] = raw
+            _report_sine(p, f'12d TRAN:IMP {imp}', analysis)
+            p.say(
+                f'12d TRAN:IMP {imp}: v_in {v_pp:.4g} Vpp, counts_per_volt_at_R '
+                f'{_fmt(entry["counts_per_volt_at_R"])}'
+                + (' (SATURATED)' if analysis['saturated'] else '')
+            )
+            for text in analysis['warnings']:
+                p.warn(f'TRAN:IMP {imp}: {text}')
+    path = _save_v(
+        p,
+        'step12d',
+        arrays,
+        entries=[{k: v for k, v in e.items() if k != 'analysis'} for e in entries],
+    )
+    p.current.data.update(entries=entries, npz=path)
+
+
+def step_12e(p: Probe) -> None:
+    """Experiment 12e (`--with-hpf`): `FILT:HPAS:IND` 1 to 3 against index 0."""
+    reference = _reference(p)['amplitude']
+    fs = _sample_rate(p)
+    entries: list[dict[str, Any]] = []
+    arrays: dict[str, np.ndarray] = {}
+    if abs(p.args.gen_hz - 100e3) <= 0.1 * 100e3:
+        p.say(
+            f'note: at --gen-hz {p.args.gen_hz:g} Hz the index-1 corner (100 kHz) lies on the '
+            'generator frequency, so a value near -3 dB is expected there'
+        )
+    with _put_back(p, {'FILT:HPAS:IND': 0}):
+        for index in V_HPF_INDEXES:
+            readbacks = _apply_report(p, {'FILT:HPAS:IND': index})
+            raw, analysis = _acquire_sine(p, fs)
+            entry: dict[str, Any] = {
+                'index': index,
+                'readback': readbacks['FILT:HPAS:IND'],
+                'attenuation_db': _db(analysis['median']['amplitude'], reference),
+                'analysis': analysis,
+            }
+            entries.append(entry)
+            arrays[f'hpf_{index}'] = raw
+            _report_sine(p, f'12e FILT:HPAS:IND {index}', analysis)
+            p.say(
+                f'12e FILT:HPAS:IND {index}: {_fmt(entry["attenuation_db"])} dB against index 0'
+                + (' (SATURATED)' if analysis['saturated'] else '')
+            )
+            for text in analysis['warnings']:
+                p.warn(f'FILT:HPAS:IND {index}: {text}')
+    path = _save_v(
+        p,
+        'step12e',
+        arrays,
+        entries=[{k: v for k, v in e.items() if k != 'analysis'} for e in entries],
+    )
+    p.current.data.update(entries=entries, npz=path)
+
+
 # ── the plan (also what --dry-run prints) ────────────────────────────────────
 
 StepFn = Callable[[Probe], None]
@@ -1787,19 +2444,42 @@ STEPS: dict[int | str, tuple[str, StepFn]] = {
     '10b': ('pulser on: averaging with a real signal', step_10b),
     11: ('pulser on: what TRIG:DEL shifts', step_11),
     13: ('*RST: every header against snapshot and vendor default', step_13),
+    '12a': (
+        'generator: counts against volts, amplitude sweep (stops at the first saturated)',
+        step_12a,
+    ),
+    '12b': ('generator: GAIN steps at a fixed input (stops at the first saturated)', step_12b),
+    '12c': ('generator: preamplifier paths GAIN:PRE:COMB / SPLIT', step_12c),
+    '12d': ('generator: TRAN:IMP 200, 1000, HIGH', step_12d),
+    '12e': ('generator: FILT:HPAS:IND 1 to 3', step_12e),
 }
 
 
-def steps_for(phase: str) -> list[int | str]:
-    """Step ids of a phase. Every phase but A includes 1 and 2: the snapshot comes first."""
+def steps_for(phase: str, args: argparse.Namespace | None = None) -> list[int | str]:
+    """Step ids of a phase. Every phase but A includes 1 and 2: the snapshot comes first.
+
+    Phase V adds 12c, 12d, 12e only when `args` has `--with-preamps`, `--with-impedance`,
+    `--with-hpf`.
+    """
+    optional: list[int | str] = [
+        step
+        for flag, step in (
+            ('with_preamps', '12c'),
+            ('with_impedance', '12d'),
+            ('with_hpf', '12e'),
+        )
+        if getattr(args, flag, False)
+    ]
     a: list[int | str] = [1, 2, 3, 4, 5]  # step 4 is listed here but `run` and `plan` put it last
-    return {
+    plans: dict[str, list[int | str]] = {
         'A': a,
         'B': [1, 2, 6, 7, 8, 9],
         'AB': a + [6, 7, 8, 9],
         'C': [1, 2, 10, '10b', 11],
         'RST': [1, 2, 13],
-    }[phase]
+        'V': [1, 2, '12a', '12b', *optional],
+    }
+    return plans[phase]
 
 
 def restores(phase: str) -> bool:
@@ -1895,18 +2575,55 @@ def _phase_c_commands(args: argparse.Namespace) -> dict[int | str, list[str]]:
     }
 
 
+def _phase_v_commands(args: argparse.Namespace) -> dict[int | str, list[str]]:
+    """What phase V sends per step, with the prompts as `PROMPT: ...` lines at their place."""
+    drain = [ERR_QUERY + '   (drain)']
+
+    def prompt(vpp: float) -> str:
+        return 'PROMPT: ' + generator_line(args, vpp)
+
+    def changes(settings: Sequence[dict[str, object]], tail: dict[str, object]) -> list[str]:
+        return [
+            line
+            for one in [*settings, tail]
+            for line in (
+                *drain,
+                *_setup_commands(one),
+                *(_ACQUIRE if one is not tail else []),
+            )
+        ]
+
+    gains = _as_floats(args.gains)
+    return {
+        'prep': drain + _setup_commands(phase_v_settings(args)) + ['TRAN:ENAB?'],
+        '12a': [
+            'PROMPT: ' + connect_line(args),
+            *[line for vpp in _as_floats(args.gen_vpp) for line in (prompt(vpp), *_ACQUIRE)],
+        ],
+        '12b': [
+            prompt(float(args.gain_vpp)),
+            *changes([{'GAIN': format(g, 'g')} for g in gains], {'GAIN': 0}),
+        ],
+        '12c': changes(
+            [{'GAIN:PRE:COMB': c, 'GAIN:PRE:SPLIT': s} for c, s in V_COMBOS], V_PREAMPS_OFF
+        ),
+        '12d': changes([{'TRAN:IMP': imp} for imp in V_IMPEDANCES], {'TRAN:IMP': 'HIGH'}),
+        '12e': changes([{'FILT:HPAS:IND': i} for i in V_HPF_INDEXES], {'FILT:HPAS:IND': 0}),
+    }
+
+
 def plan(phase: str, args: argparse.Namespace | None = None) -> list[tuple[str, list[str]]]:
     """`(heading, commands)` for every step of `phase`, in execution order."""
-    chosen = steps_for(phase)
     if args is None:
         args = build_parser().parse_args(['--phase', phase])
+    chosen = steps_for(phase, args)
     blocks: list[tuple[str, list[str]]] = [
         (
             'CONNECT (plug construction, restore_state snapshot deferred to step 2)',
             [ERR_QUERY, '*IDN?'],
         )
     ]
-    commands: dict[int, list[str]] = {
+    commands: dict[int | str, list[str]] = {
         1: ['*IDN?', 'SYST:VERS?', 'SYST:ERR:COUN?'],
         2: [f'{h}?' for h in STATE_HEADERS],
         3: ['DATA:PORT?', 'DATA:PORT?'],
@@ -1949,6 +2666,7 @@ def plan(phase: str, args: argparse.Namespace | None = None) -> list[tuple[str, 
         ],
     }
     phase_c = _phase_c_commands(args)
+    phase_v = _phase_v_commands(args) if phase == 'V' else {}
     for number in chosen:
         if number == 4:
             continue
@@ -1961,8 +2679,13 @@ def plan(phase: str, args: argparse.Namespace | None = None) -> list[tuple[str, 
             )
         if number == 10:
             blocks.append(('PREPARATION (aborts the run on failure)', phase_c['prep']))
+        if number == '12a':
+            blocks.append(('PREPARATION (aborts the run on failure)', phase_v['prep']))
         blocks.append(
-            (f'STEP {number}: {STEPS[number][0]}', commands.get(number, phase_c.get(number, [])))
+            (
+                f'STEP {number}: {STEPS[number][0]}',
+                commands.get(number, phase_v.get(number, phase_c.get(number, []))),
+            )
         )
     final_queries = [f'{h}?' for h in STATE_HEADERS]
     if restores(phase):
@@ -2007,6 +2730,10 @@ def plan(phase: str, args: argparse.Namespace | None = None) -> list[tuple[str, 
 
 
 _NEVER_SENT = {
+    'V': (
+        'NEVER SENT: TRAN:PULS writes, TRAN:ENAB ON, *RST, anything to /config/ (refused in '
+        'code); the generator is set by the human at the PROMPT lines, never by a command.'
+    ),
     'C': (
         'NEVER SENT: TRAN:PULS writes other than --pulse-v (at most one, only if the device '
         'differs), TRAN:ENAB ON outside pulsed_acquire, *RST, anything to /config/ '
@@ -2132,11 +2859,8 @@ def _open(
     )
     if args.fake:
         # phase C needs a signal that depends on the pulser; the other phases keep the old fake
-        sim = (
-            fake
-            if fake is not None
-            else FakeA1580Resource(signal='transmission' if args.phase == 'C' else 'burst')
-        )
+        signal = {'C': 'transmission', 'V': 'sine'}.get(args.phase, 'burst')
+        sim = fake if fake is not None else FakeA1580Resource(signal=signal)
         return GuardedResource(sim, policy=policy), sim.data_socket_factory, args.host or 'fake'
     import pyvisa  # lazy: --dry-run and --fake need no pyvisa
 
@@ -2172,7 +2896,7 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
     diff: dict[str, Any] | None = None
     try:
         # tearDown restores only after a phase that changes settings (step 6 and above).
-        steps = steps_for(args.phase)
+        steps = steps_for(args.phase, args)
         plug._restore_state = restores(args.phase)
         for number in steps:
             if number == 4:
@@ -2181,6 +2905,8 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
                 probe.run_block('PULSER-OFF CHECK', 'TRAN:ENAB OFF and read-back', pulser_off_check)
             if number == 10:
                 probe.run_block('PREPARATION', 'settings and pulser voltage', prepare_phase_c)
+            if number == '12a':
+                probe.run_block('PREPARATION', 'settings and pulser read-back', prepare_phase_v)
             title, func = STEPS[number]
             probe.run_block(f'STEP {number}', title, func)
             if number == 2:
@@ -2237,7 +2963,7 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
             probe.say('WARNINGS')
             for text in probe.warnings:
                 probe.say(f'WARNING: {text}')
-        if 4 in steps_for(args.phase):
+        if 4 in steps:
             probe.run_block('STEP 4', *STEPS[4])
             if probe.records[-1].status == 'failed':
                 code = code or EXIT_FAILED_STEP
@@ -2247,7 +2973,7 @@ def run(args: argparse.Namespace, fake: FakeA1580Resource | None = None) -> int:
 
 def _expected_restore_failure(p: Probe, failure: str) -> bool:
     """Phases C and RST: the restore of a power-on `DATA:LENG` outside 1024 to 36864 is refused."""
-    if p.args.phase not in ('C', 'RST') or not failure.startswith('DATA:LENG:'):
+    if p.args.phase not in ('C', 'RST', 'V') or not failure.startswith('DATA:LENG:'):
         return False
     snapshot = _parse_volts(p.state.get('DATA:LENG'))  # any leading number
     low, high = EXPECTED_LENG_RANGE
@@ -2296,14 +3022,28 @@ def _write_probe_json(p: Probe, code: int, diff: dict[str, Any] | None) -> None:
         'pulses': p.pulses,
         'commands_sent': list(p.resource.sent),
     }
+    if p.args.phase == 'V':
+        doc['generator'] = generator_description(p.args)
     p.out_dir.mkdir(parents=True, exist_ok=True)
     path = p.out_dir / f'probe-{p.serial}-{p.stamp}.json'
     path.write_text(json.dumps(doc, indent=2, default=str) + '\n', encoding='utf-8')
     print(f'\nreport written to {path}', flush=True)
 
 
+class _Parser(argparse.ArgumentParser):
+    """Resolves the defaults that depend on the phase (`--sample-freq`)."""
+
+    def parse_known_args(  # type: ignore[override]
+        self, args: Sequence[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> tuple[argparse.Namespace, list[str]]:
+        ns, rest = super().parse_known_args(args, namespace)
+        if ns.sample_freq is None:
+            ns.sample_freq = V_SAMPLE_FREQ if ns.phase == 'V' else '1 MHZ'
+        return ns, rest
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description='First-hardware-session probe for the A1580 (see HARDWARE-SESSION.md).'
     )
     parser.add_argument('--host', default=os.environ.get('A1580_HOST'), help='default $A1580_HOST')
@@ -2335,15 +3075,58 @@ def build_parser() -> argparse.ArgumentParser:
         help='phase RST: do not move six settings away before *RST (the old behaviour)',
     )
     parser.add_argument('--tran-freq', default='50 KHZ', help='phase C TRAN:FREQ (default 50 KHZ)')
-    parser.add_argument('--sample-freq', default='1 MHZ', help='phase C FREQ (default 1 MHZ)')
-    parser.add_argument('--length', type=int, default=8192, help='phase C DATA:LENG (default 8192)')
-    parser.add_argument('--interval', default='100 MS', help='phase C TRIG:INT (default 100 MS)')
+    parser.add_argument(
+        '--sample-freq',
+        default=None,
+        help=f'phase C and V FREQ (default 1 MHZ; {V_SAMPLE_FREQ} in phase V)',
+    )
+    parser.add_argument(
+        '--length',
+        type=int,
+        default=8192,
+        help=(
+            'phase C and V DATA:LENG (default 8192); in phase V a short record widens the '
+            'tolerance of the frequency check (one FFT bin)'
+        ),
+    )
+    parser.add_argument(
+        '--interval', default='100 MS', help='phase C and V TRIG:INT (default 100 MS)'
+    )
     parser.add_argument('--gain', type=float, default=0.0, help='phase C GAIN in dB (default 0)')
     parser.add_argument(
         '--mem-clear',
         action='store_true',
         help='phase C: send MEM:CLEar before every STAR AUTO of steps 10 to 11 (default off)',
     )
+    # phase V (SPEC-volt.md)
+    parser.add_argument('--gen-hz', type=float, default=100e3, help='phase V: generator Hz')
+    parser.add_argument(
+        '--gen-vpp',
+        default=V_GEN_VPP_DEFAULT,
+        help='phase V: displayed Vpp list, ascending, 0 (output off) first if present',
+    )
+    parser.add_argument(
+        '--max-gen-vpp', type=float, default=1.0, help='phase V: ceiling for --gen-vpp (Vpp)'
+    )
+    parser.add_argument(
+        '--gen-display',
+        type=str.upper,
+        choices=['HIGHZ', '50'],
+        default='HIGHZ',
+        help='phase V: what the generator display assumes (default HIGHZ)',
+    )
+    parser.add_argument('--gen-zout', type=float, default=50.0, help='phase V: generator ohm')
+    parser.add_argument('--gen-note', default='', help='phase V: model, output used, cable')
+    parser.add_argument('--gains', default=V_GAINS_DEFAULT, help='phase V step 12b: GAIN list, dB')
+    parser.add_argument(
+        '--gain-vpp', type=float, default=0.05, help='phase V: displayed Vpp of steps 12b to 12e'
+    )
+    parser.add_argument(
+        '--no-prompt', action='store_true', help='phase V: never wait for the human'
+    )
+    parser.add_argument('--with-preamps', action='store_true', help='phase V: step 12c')
+    parser.add_argument('--with-impedance', action='store_true', help='phase V: step 12d')
+    parser.add_argument('--with-hpf', action='store_true', help='phase V: step 12e')
     return parser
 
 
@@ -2362,6 +3145,58 @@ def _usage_problem(args: argparse.Namespace) -> str | None:
                 return f'--{flag.replace("_", "-")} may only hold letters, digits, blanks and . + -'
     if args.phase == 'RST' and not args.allow_rst:
         return 'phase RST sends *RST: pass --allow-rst'
+    if args.phase == 'V':
+        return _usage_problem_v(args)
+    return None
+
+
+def _usage_problem_v(args: argparse.Namespace) -> str | None:
+    """The phase V usage rules (SPEC-volt.md section 1); also checked for `--dry-run`."""
+    if not (math.isfinite(args.max_gen_vpp) and args.max_gen_vpp > 0):
+        return '--max-gen-vpp must be a positive number'
+    if not (math.isfinite(args.gen_hz) and args.gen_hz > 0):
+        return '--gen-hz must be a positive number'
+    if not (math.isfinite(args.gen_zout) and args.gen_zout >= 0):
+        return '--gen-zout must be a number >= 0'
+    try:
+        vpps = _as_floats(args.gen_vpp)
+    except ValueError:
+        return f'--gen-vpp must be a comma-separated list of numbers, got {args.gen_vpp!r}'
+    if any(v < 0 for v in vpps):
+        return '--gen-vpp entries must not be negative'
+    if 0 in vpps[1:]:
+        return '--gen-vpp: 0 (generator output off) must be the first entry'
+    if any(b <= a for a, b in zip(vpps, vpps[1:], strict=False)):
+        return f'--gen-vpp must be ascending, got {args.gen_vpp!r}'
+    display = str(args.gen_display)
+    # the ceiling is on the open-circuit voltage: twice the display with --gen-display 50
+    if input_vpp(vpps[-1], display, args.gen_zout, 'HIGH') > args.max_gen_vpp:
+        return (
+            f'--gen-vpp entry {vpps[-1]:g} (display {display}) gives '
+            f'{input_vpp(vpps[-1], display, args.gen_zout, "HIGH"):g} Vpp open-circuit, above '
+            f'--max-gen-vpp {args.max_gen_vpp:g}'
+        )
+    if not (math.isfinite(args.gain_vpp) and args.gain_vpp > 0):
+        return f'--gain-vpp {args.gain_vpp:g} must be above 0'
+    if input_vpp(args.gain_vpp, display, args.gen_zout, 'HIGH') > args.max_gen_vpp:
+        return (
+            f'--gain-vpp {args.gain_vpp:g} (display {display}) gives '
+            f'{input_vpp(args.gain_vpp, display, args.gen_zout, "HIGH"):g} Vpp open-circuit, '
+            f'above --max-gen-vpp {args.max_gen_vpp:g}'
+        )
+    try:
+        gains = _as_floats(args.gains)
+    except ValueError:
+        return f'--gains must be a comma-separated list of numbers, got {args.gains!r}'
+    if gains[0] != 0 or any(b <= a for a, b in zip(gains, gains[1:], strict=False)):
+        return '--gains must be ascending and start with 0 (the reference of 12b to 12e)'
+    if gains[-1] > GAIN_MAX_DB:
+        return f'--gains above {GAIN_MAX_DB} dB'
+    if args.length < 1:
+        return '--length must be >= 1'
+    for flag in ('sample_freq', 'interval'):
+        if not _SAFE_SETTING.fullmatch(getattr(args, flag)):
+            return f'--{flag.replace("_", "-")} may only hold letters, digits, blanks and . + -'
     return None
 
 

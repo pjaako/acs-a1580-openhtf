@@ -2004,3 +2004,602 @@ def test_the_frame_statistics_of_every_pulsed_acquisition_are_in_the_json(
     assert steps['STEP 10']['data']['frame_stats'] == [{'dropped_bytes': 0, 'resyncs': 0}]
     assert steps['STEP 10b']['data']['frame_stats'] == [{'dropped_bytes': 0, 'resyncs': 0}]
     assert len(steps['STEP 11']['data']['frame_stats']) == 3
+
+
+# ═══ phase V (SPEC-volt.md): count-to-volt scaling with a signal generator ═══
+#
+# Fake only. The fake's `signal='sine'` constants are invented (fake_resource.py).
+
+import types  # noqa: E402
+
+from a1580_openhtf import fake_resource  # noqa: E402
+
+V_COUNTS_PER_VOLT = fake_resource.COUNTS_PER_VOLT
+
+
+def _v_fake(**kwargs: Any) -> FakeA1580Resource:
+    return FakeA1580Resource(signal='sine', **kwargs)
+
+
+def _v_args(out: Path, *extra: str) -> list[str]:
+    return ['--fake', '--phase', 'V', '--out', str(out), *extra]
+
+
+def _v_run(out: Path, *extra: str, fake: FakeA1580Resource | None = None) -> FakeA1580Resource:
+    sim = fake if fake is not None else _v_fake()
+    assert hw_probe.main(_v_args(out, *extra), fake=sim) == 0
+    return sim
+
+
+def _sine(
+    n: int = 8192,
+    fs: float = 10e6,
+    hz: float = 100e3,
+    amplitude: float = 1000.0,
+    offset: float = 20.0,
+    phase: float = 0.3,
+    k: int = 3,
+) -> np.ndarray:
+    t = np.arange(n) / fs
+    one = np.rint(offset + amplitude * np.sin(2 * np.pi * hz * t + phase))
+    return np.tile(one, (k, 1)).astype(np.int16)
+
+
+# ── section 1: command line ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    'extra',
+    [
+        ['--gen-vpp', '0,0.5,1.5'],  # above --max-gen-vpp
+        ['--gen-vpp', '0.1,0.05'],  # not ascending
+        ['--gen-vpp', '0.1,0,0.5'],  # 0 not first
+        ['--gen-vpp', '0.1,0.1'],
+        ['--gen-vpp', '0,abc'],
+        ['--gain-vpp', '1.5'],  # above the ceiling
+        ['--gain-vpp', '0'],
+        ['--max-gen-vpp', '0.3'],  # the default list reaches 1.0
+        ['--gains', '6,12'],  # must start with 0
+        ['--gen-hz', '0'],
+        ['--gen-display', '50', '--gen-vpp', '0,0.5', '--gain-vpp', '1.0', '--gains', '0,6'],
+        ['--gen-display', '50'],  # the default list reaches 1.0 Vpp display, 2.0 open-circuit
+        ['--gen-display', '50', '--gen-vpp', '0,0.4', '--gain-vpp', '0.6'],
+    ],
+)
+@pytest.mark.parametrize('dry', [[], ['--dry-run']])
+def test_phase_v_usage_errors_before_connecting(
+    extra: list[str], dry: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _no_sockets(monkeypatch)
+    fake = _v_fake()
+    assert hw_probe.main([*_v_args(tmp_path, *extra), *dry], fake=fake) == hw_probe.EXIT_USAGE
+    assert fake.log == []
+
+
+def test_phase_v_accepts_a_one_entry_list_and_the_ceiling(tmp_path: Path) -> None:
+    fake = _v_run(tmp_path, '--gen-vpp', '0.05', '--gains', '0,6', '--no-prompt')
+    assert fake.gen_vpp == 0.05
+
+
+def test_sample_freq_defaults_to_10_mhz_in_phase_v_only() -> None:
+    parser = hw_probe.build_parser()
+    assert parser.parse_args(['--phase', 'v']).sample_freq == '10 MHZ'
+    assert parser.parse_args(['--phase', 'C', '--pulse-v', '20']).sample_freq == '1 MHZ'
+    assert parser.parse_args(['--phase', 'V', '--sample-freq', '5 MHZ']).sample_freq == '5 MHZ'
+    assert parser.parse_args(['--phase', 'V']).length == 8192
+
+
+# ── section 2: guard ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize('cmd', ['TRAN:ENAB ON', 'TRAN:ENAB 1', 'TRAN:PULS 20 V', '*RST'])
+def test_phase_v_opens_no_gate(cmd: str) -> None:
+    guarded = hw_probe.GuardedResource(_v_fake(), policy=_policy('V', 20.0))
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write(cmd)
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        with guarded.pulser_gate():
+            guarded.write('TRAN:ENAB ON')
+    with pytest.raises(hw_probe.ForbiddenCommand):
+        guarded.write('SYST:COMM /config/dev.eth')
+
+
+def test_phase_v_sends_the_pulser_only_off_and_no_voltage(tmp_path: Path) -> None:
+    fake = _v_run(tmp_path)
+    assert _enab_writes(fake.log)
+    assert set(_enab_writes(fake.log)) == {'TRAN:ENAB OFF'}
+    assert not [c for c in fake.log if c.startswith(('TRAN:PULS ', '*RST', 'MEM:'))]
+
+
+# ── sections 3.1 to 3.3: preparation, 12a, 12b on the fake ───────────────────
+
+
+def test_phase_v_defaults_on_the_fake(tmp_path: Path) -> None:
+    _v_run(tmp_path)
+    report = _load_probe(tmp_path)
+    assert report['exit_code'] == 0
+    assert report['phase'] == 'V'
+    assert report['generator']['gen_display'] == 'HIGHZ'
+    steps = report['steps']
+    prep = steps['PREPARATION']['data']['readbacks']
+    assert prep['FREQ'] == '10000000'
+    assert prep['DATA:LENG'] == '8192'
+    assert prep['TRAN:IMP'] == 'HIGH'
+    assert prep['GAIN'] == '0'
+    a = steps['STEP 12a']['data']
+    assert [e['vpp_display'] for e in a['entries']] == [0, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]
+    assert not any(e['analysis']['saturated'] for e in a['entries'])
+    assert a['fit']['counts_per_volt'] == pytest.approx(V_COUNTS_PER_VOLT, rel=0.02)
+    assert a['fit']['points'] == 6
+    assert a['mean_off'] == pytest.approx(11.0, abs=0.5)
+    assert a['noise_off'] == pytest.approx(3.6, rel=0.1)
+    assert a['entries'][3]['v_in_pp'] == 0.1
+    assert a['entries'][3]['v_in_peak'] == 0.05
+    b = steps['STEP 12b']['data']
+    for entry in b['entries']:
+        if 'analysis' in entry and not entry['analysis']['saturated']:
+            assert entry['deviation_db'] == pytest.approx(0.0, abs=0.1)
+    good = [e for e in b['entries'] if 'analysis' in e and not e['analysis']['saturated']]
+    assert len(good) >= 3
+    assert [e['gain_db'] for e in b['entries']] == [0, 6, 12, 20, 40, 60]
+    assert b['entries'][-1]['analysis']['saturated']  # 0.05 Vpp at 60 dB is far over full scale
+    assert report['final_diff']['changed'] == {}
+    assert 'STEP 12c' not in steps
+
+
+def test_the_summary_lines_of_12a_and_12b_are_printed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _v_run(tmp_path)
+    out = capsys.readouterr().out
+    assert '12a SUMMARY: counts_per_volt ' in out
+    assert '12b SUMMARY: 5 unsaturated gains' in out
+    assert 'saturated at GAIN 60; higher values skipped' in out
+    assert 'WARNING' not in out
+
+
+def test_the_generator_is_set_on_the_fake_without_prompting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_input(prompt: str = '') -> str:
+        raise AssertionError('--fake must not prompt')
+
+    monkeypatch.setattr('builtins.input', no_input)
+    fake = _v_run(tmp_path, '--gen-hz', '200000', '--sample-freq', '20 MHZ')
+    assert fake.gen_hz == 200000.0
+
+
+def test_gen_display_50_doubles_the_voltage_at_a_high_impedance_input(tmp_path: Path) -> None:
+    _v_run(tmp_path, '--gen-display', '50', '--gen-vpp', '0,0.1,0.2', '--gain-vpp', '0.05')
+    a = _load_probe(tmp_path)['steps']['STEP 12a']['data']
+    assert a['entries'][1]['v_in_pp'] == pytest.approx(0.2)
+    assert a['entries'][2]['v_in_pp'] == pytest.approx(0.4)
+    assert a['fit']['counts_per_volt'] == pytest.approx(V_COUNTS_PER_VOLT, rel=0.02)
+    assert 'twice the display' in a['generator']['assumption']
+
+
+def test_saturation_stops_12a_at_the_first_saturated_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(fake_resource, 'COUNTS_PER_VOLT', 1e6)
+    _v_run(tmp_path, '--gains', '0')
+    a = _load_probe(tmp_path)['steps']['STEP 12a']['data']
+    entries = a['entries']
+    assert [bool(e.get('skipped')) for e in entries] == [False] * 4 + [True] * 3
+    assert entries[3]['vpp_display'] == 0.1
+    assert entries[3]['analysis']['saturated']
+    assert entries[3]['analysis']['clip_value'] in (32767, -32768)
+    assert a['saturated_at'] == 0.1
+    assert a['fit']['points'] == 2  # 0.02 and 0.05 only
+    assert a['fit']['counts_per_volt'] == pytest.approx(1e6, rel=0.02)
+    assert a['fit']['full_scale_v_estimate'] == pytest.approx(32768 / 1e6, rel=0.02)
+    out = capsys.readouterr().out
+    assert 'saturated at 0.1; higher entries skipped' in out
+    assert 'WARNING: fewer than 3 unsaturated points' in out
+
+
+def test_the_fit_is_not_possible_with_fewer_than_two_points(tmp_path: Path) -> None:
+    _v_run(tmp_path, '--gen-vpp', '0,0.05', '--gains', '0')
+    fit = _load_probe(tmp_path)['steps']['STEP 12a']['data']['fit']
+    assert fit['possible'] is False
+    assert 'fewer than 2' in fit['reason']
+
+
+# ── analyse_sine ─────────────────────────────────────────────────────────────
+
+
+def test_analyse_sine_recovers_amplitude_and_offset() -> None:
+    result = hw_probe.analyse_sine(_sine(), 10e6, 100e3)
+    m = result['median']
+    assert m['amplitude'] == pytest.approx(1000.0, abs=1.0)
+    assert m['offset'] == pytest.approx(20.0, abs=1.0)
+    assert m['residual_std'] < 1.0
+    assert m['peak_hz'] == pytest.approx(100e3, rel=0.02)
+    assert result['warnings'] == []
+    assert result['saturated'] is False
+    assert result['clip_value'] is None
+    assert result['n_packets'] == 3
+
+
+def test_analyse_sine_warns_once_when_the_frequency_is_5_percent_off() -> None:
+    result = hw_probe.analyse_sine(_sine(hz=105e3), 10e6, 100e3)
+    (warning,) = result['warnings']
+    assert warning.startswith('generator or sample rate off')
+    assert (
+        hw_probe.analyse_sine(_sine(hz=105e3), 10e6, 100e3, expect_signal=False)['warnings'] == []
+    )
+    assert hw_probe.analyse_sine(_sine(hz=101e3), 10e6, 100e3)['warnings'] == []  # 1 %
+
+
+def test_analyse_sine_finds_a_flat_top_and_the_int16_limit() -> None:
+    clipped = np.clip(_sine(amplitude=1000.0), -600, 600).astype(np.int16)
+    result = hw_probe.analyse_sine(clipped, 10e6, 100e3)
+    assert result['saturated'] is True
+    assert result['saturated_samples'] > 0
+    assert result['clip_value'] == 600
+    assert result['clip_counts'] == 600
+    limit = _sine(amplitude=100.0)
+    limit[:, 5] = 32767
+    result = hw_probe.analyse_sine(limit, 10e6, 100e3)
+    assert result['saturated'] is True
+    assert result['clip_value'] == 32767
+    assert result['saturated_samples'] == 3
+
+
+def test_analyse_sine_coarse_quantisation_is_not_a_flat_top() -> None:
+    rng = np.random.default_rng(3)
+    t = np.arange(8192) / 10e6
+    wave = 80.0 * np.sin(2 * np.pi * 100e3 * t + 0.4) + rng.normal(0, 3.6, (3, 8192))
+    coarse = (np.rint(wave / 16) * 16).astype(np.int16)
+    result = hw_probe.analyse_sine(coarse, 10e6, 100e3)
+    assert result['lowest_used_bit'] == 4
+    assert result['saturated'] is False
+    assert result['n_q'] > 15
+    assert result['longest_run'] < 3 * result['n_q']
+
+
+def test_analyse_sine_clipped_sine_of_2000_counts_is_saturated() -> None:
+    result = hw_probe.analyse_sine(np.clip(_sine(amplitude=2000.0), -600, 600), 10e6, 100e3)
+    assert result['saturated'] is True
+    assert result['longest_run'] >= 4
+    assert result['clip_counts'] == 600
+
+
+def test_analyse_sine_lowest_used_bit_and_distinct_values() -> None:
+    assert hw_probe.analyse_sine(_sine() // 4 * 4, 10e6, 100e3)['lowest_used_bit'] == 2
+    assert hw_probe.analyse_sine(_sine() // 8 * 8 + 3, 10e6, 100e3)['lowest_used_bit'] == 3
+    result = hw_probe.analyse_sine(_sine(), 10e6, 100e3)
+    assert result['lowest_used_bit'] == 0
+    assert result['distinct_values'] == len(np.unique(_sine()))
+
+
+# ── prompts ──────────────────────────────────────────────────────────────────
+
+
+def _stub(*, fake: bool = False, no_prompt: bool = False) -> Any:
+    lines: list[str] = []
+    args = types.SimpleNamespace(
+        gen_display='HIGHZ', gen_hz=100e3, no_prompt=no_prompt, max_gen_vpp=1.0
+    )
+    return types.SimpleNamespace(say=lines.append, lines=lines, args=args, fake=fake)
+
+
+def _answers(monkeypatch: pytest.MonkeyPatch, *answers: str) -> list[str]:
+    prompts: list[str] = []
+    queue = list(answers)
+
+    def fake_input(prompt: str = '') -> str:
+        prompts.append(prompt)
+        return queue.pop(0)
+
+    monkeypatch.setattr('builtins.input', fake_input)
+    return prompts
+
+
+def test_set_generator_empty_line_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answers(monkeypatch, '')
+    stub = _stub()
+    assert hw_probe.set_generator(stub, 0.05) is True
+    assert stub.lines[0] == (
+        'GENERATOR: set 0.05 Vpp (display HIGHZ) sine at 100000 Hz on IN, output ON, '
+        'then press Enter'
+    )
+
+
+def test_set_generator_zero_says_output_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answers(monkeypatch, '')
+    stub = _stub()
+    assert hw_probe.set_generator(stub, 0) is True
+    assert 'output OFF, then press Enter' in stub.lines[0]
+
+
+def test_set_generator_s_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answers(monkeypatch, 'S')
+    assert hw_probe.set_generator(_stub(), 0.05) is False
+
+
+def test_set_generator_a_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answers(monkeypatch, 'a')
+    with pytest.raises(hw_probe.AbortRun) as info:
+        hw_probe.set_generator(_stub(), 0.05)
+    assert info.value.code == hw_probe.EXIT_FAILED_STEP
+
+
+def test_set_generator_other_input_asks_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts = _answers(monkeypatch, 'x', 'yes', '')
+    assert hw_probe.set_generator(_stub(), 0.05) is True
+    assert len(prompts) == 3
+
+
+def test_set_generator_end_of_input_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def eof(prompt: str = '') -> str:
+        raise EOFError
+
+    monkeypatch.setattr('builtins.input', eof)
+    with pytest.raises(hw_probe.AbortRun):
+        hw_probe.set_generator(_stub(), 0.05)
+
+
+def test_keyboard_interrupt_at_a_prompt_becomes_an_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    def interrupt(prompt: str = '') -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr('builtins.input', interrupt)
+    with pytest.raises(hw_probe.AbortRun) as info:
+        hw_probe.set_generator(_stub(), 0.05)
+    assert info.value.code == hw_probe.EXIT_FAILED_STEP
+    assert 'interrupted' in str(info.value)
+    with pytest.raises(hw_probe.AbortRun):
+        hw_probe.confirm_connection(_stub())
+
+
+def test_no_prompt_never_calls_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(prompt: str = '') -> str:
+        raise AssertionError('input() called')
+
+    monkeypatch.setattr('builtins.input', refuse)
+    stub = _stub(no_prompt=True)
+    assert hw_probe.set_generator(stub, 0.05) is True
+    hw_probe.confirm_connection(stub)
+    assert 'GENERATOR: connect the generator to IN (nothing on OUT)' in stub.lines[-1]
+
+
+def test_confirm_connection_prompts_and_can_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answers(monkeypatch, '')
+    stub = _stub()
+    hw_probe.confirm_connection(stub)
+    assert stub.lines[0] == (
+        'GENERATOR: connect the generator to IN (nothing on OUT), confirm the input ceiling '
+        '1 Vpp, then press Enter'
+    )
+    _answers(monkeypatch, 'a')
+    with pytest.raises(hw_probe.AbortRun):
+        hw_probe.confirm_connection(_stub())
+
+
+def test_set_generator_on_a_fake_sets_the_fake(tmp_path: Path) -> None:
+    sim = _v_fake()
+    stub = _stub(fake=True)
+    stub.resource = hw_probe.GuardedResource(sim, policy=_policy('V'))
+    assert hw_probe.set_generator(stub, 0.2) is True
+    assert sim.gen_vpp == 0.2
+    assert sim.gen_hz == 100e3
+    stub.args.gen_display = '50'
+    hw_probe.set_generator(stub, 0.2)
+    assert sim.gen_vpp == 0.4  # open-circuit voltage
+
+
+def test_an_abort_at_the_generator_prompt_restores_and_fails_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = hw_probe.set_generator
+    calls: list[float] = []
+
+    def abort_on_second(p: Any, vpp: float) -> bool:
+        calls.append(vpp)
+        if len(calls) == 2:
+            raise hw_probe.AbortRun(hw_probe.EXIT_FAILED_STEP, 'aborted at the generator prompt')
+        return real(p, vpp)
+
+    monkeypatch.setattr(hw_probe, 'set_generator', abort_on_second)
+    fake = _v_fake()
+    assert hw_probe.main(_v_args(tmp_path), fake=fake) == hw_probe.EXIT_FAILED_STEP
+    report = _load_probe(tmp_path)
+    assert report['final_diff']['changed'] == {}
+    assert report['steps']['STEP 12a']['status'] == 'aborted'
+    assert 'STEP 12b' not in report['steps']
+    assert set(_enab_writes(fake.log)) == {'TRAN:ENAB OFF'}
+
+
+def test_the_residual_warning_appears_once(tmp_path: Path) -> None:
+    fake = _v_fake()
+    original = fake._sine_amplitude
+    fake._sine_amplitude = lambda: original() * (1.0 + 3.0 * fake.gen_vpp)  # type: ignore[method-assign]
+    _v_run(tmp_path, fake=fake)
+    warnings = _load_probe(tmp_path)['warnings']
+    assert len([w for w in warnings if w.startswith('largest residual over 5 %')]) == 1
+
+
+def test_the_12e_note_only_near_100_khz(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _v_run(tmp_path / 'a', '--with-hpf')
+    assert 'index-1 corner' in capsys.readouterr().out
+    _v_run(tmp_path / 'b', '--with-hpf', '--gen-hz', '300000')
+    assert 'index-1 corner' not in capsys.readouterr().out
+
+
+# ── steps 12c to 12e ─────────────────────────────────────────────────────────
+
+V_HEADERS = ('GAIN:PRE:COMB', 'GAIN:PRE:SPLIT', 'TRAN:IMP', 'FILT:HPAS:IND')
+
+
+def _writes_of(log: list[str], header: str) -> list[str]:
+    return [c for c in log if c.startswith(header + ' ')]
+
+
+def test_without_the_flags_none_of_the_optional_headers_is_written(tmp_path: Path) -> None:
+    fake = _v_run(tmp_path)
+    for header in V_HEADERS:  # the preparation writes each of them once
+        assert len(_writes_of(fake.log, header)) == 1 + 1, header  # preparation and restore
+    steps = _load_probe(tmp_path)['steps']
+    assert not {'STEP 12c', 'STEP 12d', 'STEP 12e'} & set(steps)
+
+
+def test_with_preamps(tmp_path: Path) -> None:
+    fake = _v_run(tmp_path, '--with-preamps')
+    comb = _writes_of(fake.log, 'GAIN:PRE:COMB')
+    split = _writes_of(fake.log, 'GAIN:PRE:SPLIT')
+    assert comb[1:4] == ['GAIN:PRE:COMB 1', 'GAIN:PRE:COMB 0', 'GAIN:PRE:COMB 1']
+    assert split[1:4] == ['GAIN:PRE:SPLIT 0', 'GAIN:PRE:SPLIT 1', 'GAIN:PRE:SPLIT 1']
+    assert comb[4] == 'GAIN:PRE:COMB 0'  # put back
+    assert split[4] == 'GAIN:PRE:SPLIT 0'
+    data = _load_probe(tmp_path)['steps']['STEP 12c']['data']
+    assert [e['db'] for e in data['entries']] == [
+        pytest.approx(20.0, abs=0.1),
+        pytest.approx(20.0, abs=0.1),
+        pytest.approx(40.0, abs=0.1),
+    ]
+    assert data['entries'][0]['readbacks']['GAIN:PRE:COMB'] == '1'
+    assert fake._values['GAIN:PRE:COMB'] == fake._values['GAIN:PRE:SPLIT'] == '0'
+
+
+def test_a_refused_preamp_combination_is_a_result(tmp_path: Path) -> None:
+    fake = _v_fake()
+    original = fake.write
+
+    def refuse_split_on(cmd: str) -> None:
+        if cmd == 'GAIN:PRE:SPLIT 1':
+            fake._queue_error('-224,"Illegal parameter value"')
+        else:
+            original(cmd)
+
+    fake.write = refuse_split_on  # type: ignore[method-assign]
+    assert hw_probe.main(_v_args(tmp_path, '--with-preamps'), fake=fake) == 0
+    data = _load_probe(tmp_path)['steps']['STEP 12c']['data']
+    assert len(data['entries']) == 3
+    assert 'error' not in data['entries'][0]
+    for index in (1, 2):  # SPLIT 1 is refused in both combinations that use it
+        assert '-224,"Illegal parameter value"' in data['entries'][index]['error']
+        assert 'analysis' not in data['entries'][index]
+    assert _load_probe(tmp_path)['steps']['STEP 12c']['status'] == 'ok'
+
+
+def test_with_impedance(tmp_path: Path) -> None:
+    fake = _v_run(
+        tmp_path,
+        '--with-impedance',
+        '--gen-display',
+        '50',
+        '--gen-vpp',
+        '0,0.1',
+        '--gain-vpp',
+        '0.1',
+    )
+    imp = _writes_of(fake.log, 'TRAN:IMP')
+    assert imp[1:5] == ['TRAN:IMP 200', 'TRAN:IMP 1000', 'TRAN:IMP HIGH', 'TRAN:IMP HIGH']
+    entries = _load_probe(tmp_path)['steps']['STEP 12d']['data']['entries']
+    assert [e['imp'] for e in entries] == ['200', '1000', 'HIGH']
+    assert [e['readback'] for e in entries] == ['200', '1000', 'HIGH']
+    # display 50: v_open = 0.2 Vpp; into 200 ohm with 50 ohm out: 0.2 * 200 / 250 = 0.16 Vpp
+    assert entries[0]['v_in_pp'] == pytest.approx(0.16)
+    assert entries[1]['v_in_pp'] == pytest.approx(0.2 * 1000 / 1050)
+    assert entries[2]['v_in_pp'] == pytest.approx(0.2)
+    for entry in entries:
+        assert entry['counts_per_volt_at_R'] == pytest.approx(V_COUNTS_PER_VOLT, rel=0.02)
+    assert fake._values['TRAN:IMP'] == 'HIGH'
+
+
+def test_with_hpf(tmp_path: Path) -> None:
+    fake = _v_run(tmp_path, '--with-hpf')
+    index = _writes_of(fake.log, 'FILT:HPAS:IND')
+    assert index[1:5] == [f'FILT:HPAS:IND {i}' for i in (1, 2, 3, 0)]
+    entries = _load_probe(tmp_path)['steps']['STEP 12e']['data']['entries']
+    expected = [20 * np.log10(x) for x in fake_resource.HPF[1:]]
+    assert [e['attenuation_db'] for e in entries] == [pytest.approx(x, abs=0.1) for x in expected]
+    assert fake._values['FILT:HPAS:IND'] == DEFAULTS['FILT:HPAS:IND']
+    assert '100 kHz' in ' '.join(_load_probe(tmp_path)['steps']['STEP 12e']['lines'])
+
+
+# ── dry-run, npz, power-on ───────────────────────────────────────────────────
+
+V_FLAGS = ['--with-preamps', '--with-impedance', '--with-hpf']
+
+
+@pytest.mark.parametrize('flags', [[], V_FLAGS, ['--gen-vpp', '0,0.1', '--gains', '0,20,40']])
+def test_dry_run_phase_v_matches_what_the_fake_run_sends(tmp_path: Path, flags: list[str]) -> None:
+    args = hw_probe.build_parser().parse_args(['--phase', 'V', *flags])
+    planned = [
+        c
+        for c in _plan_commands(hw_probe.plan('V', args), 'PREPARATION', 'TEARDOWN')
+        if not c.startswith('PROMPT:')
+    ]
+    fake = _v_run(tmp_path, *flags)
+    start = fake.log.index('DATA:LENG 8192') - 1  # the error-queue drain before the setup
+    last_stop = max(i for i, c in enumerate(fake.log) if c == 'STOP')
+    assert planned == fake.log[start : last_stop - 1]
+
+
+def test_dry_run_phase_v_has_prompts_and_the_never_sent_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert hw_probe.main(['--dry-run', '--phase', 'V']) == 0
+    out = capsys.readouterr().out
+    lines = [line.strip() for line in out.splitlines()]
+    assert out.splitlines()[0].startswith('DRY RUN, phase V')
+    assert len([x for x in lines if x.startswith('PROMPT: GENERATOR: set')]) == 7 + 1
+    assert sum(x.startswith('PROMPT: GENERATOR: connect') for x in lines) == 1
+    assert 'GAIN 40' in lines
+    never = next(x for x in lines if x.startswith('NEVER SENT'))
+    for word in ('TRAN:PULS', 'TRAN:ENAB ON', '*RST', '/config'):
+        assert word in never
+    assert out.index('PULSER-OFF CHECK') < out.index('PREPARATION') < out.index('STEP 12a:')
+    assert 'STEP 12c' not in out
+    hw_probe.main(['--dry-run', '--phase', 'V', *V_FLAGS])
+    again = capsys.readouterr().out
+    assert 'STEP 12c' in again and 'STEP 12d' in again and 'STEP 12e' in again
+
+
+@pytest.mark.parametrize('flags', [[], V_FLAGS])
+def test_commands_sent_by_phase_v_are_all_in_the_plan(tmp_path: Path, flags: list[str]) -> None:
+    args = hw_probe.build_parser().parse_args(['--phase', 'V', *flags])
+    fake = _v_run(tmp_path, *flags)
+    planned = {
+        _header_key(c)
+        for _h, cs in hw_probe.plan('V', args)
+        for c in cs
+        if not c.startswith('PROMPT')
+    }
+    assert {_header_key(c) for c in fake.log} <= planned
+
+
+def test_the_npz_files_hold_int16_arrays_and_the_settings(tmp_path: Path) -> None:
+    _v_run(tmp_path, *V_FLAGS)
+    files = {p.name.rsplit('-', 1)[1]: p for p in tmp_path.glob('phaseV-*.npz')}
+    assert set(files) == {f'step12{x}.npz' for x in 'abcde'}
+    with np.load(files['step12a.npz']) as a:
+        assert [k for k in a.files if k != 'settings'] == [f'vpp_{i}' for i in range(7)]
+        for key in a.files:
+            if key != 'settings':
+                assert a[key].dtype == np.int16
+                assert a[key].shape == (10, 8192)
+        settings = json.loads(str(a['settings']))
+    assert settings['generator']['gen_hz'] == 100000.0
+    assert len(settings['entries']) == 7
+    assert settings['FREQ'] == '10 MHZ'
+    with np.load(files['step12b.npz']) as b:
+        assert 'gain_0' in b.files
+        assert b['gain_40'].dtype == np.int16
+    with np.load(files['step12c.npz']) as c:
+        assert {'comb1_split0', 'comb0_split1', 'comb1_split1'} <= set(c.files)
+
+
+def test_phase_v_from_power_on_marks_the_data_leng_restore_failure_expected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _v_fake(length=114688)
+    fake._values['TRAN:ENAB'] = '1'
+    assert hw_probe.main(_v_args(tmp_path), fake=fake) == 0
+    out = capsys.readouterr().out
+    assert 'RESTORE FAILED (known firmware defect' in out
+    teardown = _load_probe(tmp_path)['steps']['TEARDOWN']['data']
+    assert all(d['expected'] for d in teardown['restore_failure_details'])
+    assert teardown['restore_failure_details']

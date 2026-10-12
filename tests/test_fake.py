@@ -8,7 +8,7 @@ import struct
 import numpy as np
 import pytest
 
-from a1580_openhtf.fake_resource import DEFAULTS, POWER_ON, FakeA1580Resource
+from a1580_openhtf.fake_resource import COUNTS_PER_VOLT, DEFAULTS, POWER_ON, FakeA1580Resource
 from a1580_openhtf.plug import STATE_HEADERS, normalize_header
 from a1580_openhtf.stream import (
     HEADER_SIZE,
@@ -256,7 +256,7 @@ def test_close_and_attributes() -> None:
 
 def test_constructor_validates() -> None:
     with pytest.raises(ValueError):
-        FakeA1580Resource(signal='sine')
+        FakeA1580Resource(signal='bogus')
     with pytest.raises(ValueError):
         FakeA1580Resource(chunk=0)
 
@@ -833,3 +833,89 @@ def test_default_signal_ignores_the_pulser() -> None:
     off, on = FakeA1580Resource(), FakeA1580Resource()
     on.write('TRAN:ENAB ON')
     assert _transmission_record(off).tolist() == _transmission_record(on).tolist()
+
+
+# ── signal='sine' (invented constants, for hw_probe phase V) ─────────────────
+
+
+def _sine_fake(**settings: str) -> FakeA1580Resource:
+    fake = FakeA1580Resource(signal='sine')
+    for header, value in {
+        'DATA:LENG': '8192',
+        'FREQ': '10 MHZ',
+        'FILT:HPAS:IND': '0',
+        **settings,
+    }.items():
+        fake.write(f'{header} {value}')
+    return fake
+
+
+def _sine_amplitude(fake: FakeA1580Resource) -> float:
+    """Peak counts of the record at `fake.gen_hz` by least squares."""
+    record = _transmission_record(fake).astype(float)
+    t = np.arange(record.size) / float(fake.query('FREQ?'))
+    arg = 2.0 * np.pi * fake.gen_hz * t
+    design = np.column_stack([np.sin(arg), np.cos(arg), np.ones_like(t)])
+    a, b, _c = np.linalg.lstsq(design, record, rcond=None)[0]
+    return float(np.hypot(a, b))
+
+
+def test_sine_amplitude_follows_gen_vpp() -> None:
+    fake = _sine_fake()
+    fake.gen_vpp = 0.1
+    one = _sine_amplitude(fake)
+    assert one == pytest.approx(0.05 * COUNTS_PER_VOLT, rel=0.01)
+    fake.gen_vpp = 0.2
+    assert _sine_amplitude(fake) == pytest.approx(2 * one, rel=0.01)
+
+
+def test_sine_amplitude_follows_gain() -> None:
+    fake = _sine_fake(GAIN='20')
+    fake.gen_vpp = 0.01
+    assert _sine_amplitude(fake) == pytest.approx(0.005 * COUNTS_PER_VOLT * 10, rel=0.01)
+
+
+@pytest.mark.parametrize(
+    ('comb', 'split', 'factor'), [(1, 0, 10.0), (0, 1, 10.0), (1, 1, 100.0), (0, 0, 1.0)]
+)
+def test_sine_amplitude_follows_the_preamps(comb: int, split: int, factor: float) -> None:
+    fake = _sine_fake(**{'GAIN:PRE:COMB': str(comb), 'GAIN:PRE:SPLIT': str(split)})
+    fake.gen_vpp = 0.01
+    assert _sine_amplitude(fake) == pytest.approx(0.005 * COUNTS_PER_VOLT * factor, rel=0.01)
+
+
+@pytest.mark.parametrize(('imp', 'factor'), [('HIGH', 1.0), ('1000', 0.95), ('200', 0.8)])
+def test_sine_amplitude_follows_tran_imp(imp: str, factor: float) -> None:
+    fake = _sine_fake(**{'TRAN:IMP': imp})
+    fake.gen_vpp = 0.1
+    assert _sine_amplitude(fake) == pytest.approx(0.05 * COUNTS_PER_VOLT * factor, rel=0.01)
+
+
+@pytest.mark.parametrize(('index', 'factor'), [(0, 1.0), (1, 0.707), (2, 0.2), (3, 0.1)])
+def test_sine_amplitude_follows_the_high_pass_index(index: int, factor: float) -> None:
+    fake = _sine_fake(**{'FILT:HPAS:IND': str(index)})
+    fake.gen_vpp = 0.1
+    assert _sine_amplitude(fake) == pytest.approx(0.05 * COUNTS_PER_VOLT * factor, rel=0.01)
+
+
+def test_sine_with_the_output_off_is_noise_only_and_ignores_the_pulser() -> None:
+    fake = _sine_fake()
+    fake.write('TRAN:ENAB ON')
+    record = _transmission_record(fake).astype(float)
+    assert record.mean() == pytest.approx(11.0, abs=0.3)
+    assert record.std() == pytest.approx(3.6, rel=0.05)
+
+
+def test_sine_clips_at_int16_for_an_absurd_amplitude() -> None:
+    fake = _sine_fake(GAIN='80')
+    fake.gen_vpp = 1.0
+    record = _transmission_record(fake)
+    assert record.dtype == np.int16
+    assert record.max() == 32767
+    assert record.min() == -32768
+
+
+def test_sine_has_a_random_phase_per_packet() -> None:
+    fake = _sine_fake()
+    fake.gen_vpp = 0.1
+    assert _transmission_record(fake)[:8].tolist() != _transmission_record(fake)[:8].tolist()

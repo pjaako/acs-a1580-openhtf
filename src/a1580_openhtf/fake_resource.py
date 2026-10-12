@@ -98,7 +98,7 @@ _ENUM_VALUES: dict[str, tuple[str, ...]] = {
 _ENUM = frozenset(_ENUM_VALUES)
 _LIST = frozenset({'GAIN:TGC:LIN', 'GAIN:TGC:ARB'})
 _READ_ONLY = frozenset({'DATA:PORT'})
-_SIGNALS = ('burst', 'zeros', 'noise', 'none', 'transmission')
+_SIGNALS = ('burst', 'zeros', 'noise', 'none', 'transmission', 'sine')
 # `signal='transmission'`: measured 2026-10-05, fw 1.16, one pair of 50 kHz transducers face to
 # face, 20 V (one bench setup). With `TRAN:ENAB` on the record holds noise plus a damped sine at
 # `TRAN:FREQ` that starts 3 us after sample 0 (3 samples at 1 MHz) and does NOT move with
@@ -115,6 +115,22 @@ _TRANSMISSION_SIGNAL_DB_PER_DB = 37.4 / 40.0
 _TRANSMISSION_NOISE_STD = 3.6
 _TRANSMISSION_NOISE_PER_40_DB = 7.1
 _TRANSMISSION_OFFSET = 4.5
+# `signal='sine'`: a continuous sine at `gen_hz` with a random phase per packet, as a signal
+# generator on `IN` would give (hw_probe phase V). The noise is the measured open-input noise
+# (offset 11 counts, std 3.6 counts, see `signal='noise'`). Every constant below is invented:
+# not measured, invented so that hw_probe phase V can run; replace after the hardware run.
+# not measured, invented so that hw_probe phase V can run; replace after the hardware run
+# peak counts per peak volt at GAIN 0, TRAN:IMP HIGH
+COUNTS_PER_VOLT = 8000.0
+# not measured, invented so that hw_probe phase V can run; replace after the hardware run
+# factor per preamp that is 1 (100 for both; the fake accepts both on)
+PRE = 10.0
+# not measured, invented so that hw_probe phase V can run; replace after the hardware run
+# factor per TRAN:IMP
+IMP: dict[str, float] = {'HIGH': 1.0, '1000': 0.95, '200': 0.8}
+# not measured, invented so that hw_probe phase V can run; replace after the hardware run
+# factor at 100 kHz per FILT:HPAS:IND 0 to 3
+HPF: tuple[float, ...] = (1.0, 0.707, 0.2, 0.1)
 _ERROR_QUEUE_DEPTH = 16  # measured 2026-10-05, fw 1.16: 16 entries, then `-350` as the 17th
 _QUEUE_OVERFLOW = '-350,"Queue overflow"'
 # measured for DATA:LENG out of range (2026-10-05, fw 1.16), assumed for out-of-range values
@@ -213,6 +229,10 @@ class FakeA1580Resource:
         self.chunk = chunk
         self.garbage_prefix = garbage_prefix
         self.signal = signal
+        # signal='sine': open-circuit Vpp of the generator (0 = output off); the tool applies the
+        # display assumption, the fake applies the TRAN:IMP divider through `IMP`
+        self.gen_vpp = 0.0
+        self.gen_hz = 100e3  # signal='sine': generator frequency
         self.visa_errors = visa_errors
         self.connections: list[tuple[str, int]] = []
         self.sockets: list[FakeDataSocket] = []
@@ -448,6 +468,17 @@ class FakeA1580Resource:
         self.sockets.append(sock)
         return sock
 
+    def _sine_amplitude(self) -> float:
+        """Peak counts of the generator sine for the current settings (`signal='sine'`)."""
+        gain_db = float(self._values['GAIN'])
+        pre = 1.0
+        for header in ('GAIN:PRE:COMB', 'GAIN:PRE:SPLIT'):
+            if self._values[header].strip().upper() in ('1', 'ON'):
+                pre *= PRE
+        imp = IMP[self._values['TRAN:IMP'].strip().upper()]
+        hpf = HPF[int(float(self._values['FILT:HPAS:IND']))]
+        return self.gen_vpp / 2.0 * COUNTS_PER_VOLT * 10.0 ** (gain_db / 20.0) * pre * imp * hpf
+
     def _packet(self) -> bytes:
         """One synthetic A-scan packet from the current settings; numbers never restart."""
         number = self._next_packet
@@ -463,6 +494,16 @@ class FakeA1580Resource:
             rng = np.random.default_rng(number)
             noise = rng.normal(11.0, 3.6 / 2.0 ** (averaging / 2.0), length)
             samples = np.rint(noise).astype(np.int16)
+        elif self.signal == 'sine':
+            rng = np.random.default_rng(number)
+            noise = rng.normal(11.0, 3.6, length)
+            amplitude = self._sine_amplitude()
+            fs = float(self._values['FREQ'])
+            phase = rng.uniform(0.0, 2.0 * np.pi)
+            wave = noise + amplitude * np.sin(
+                2.0 * np.pi * self.gen_hz * np.arange(length) / fs + phase
+            )
+            samples = np.rint(np.clip(wave, -32768, 32767)).astype(np.int16)
         elif self.signal == 'transmission':
             # measured 2026-10-05, fw 1.16 (see `_TRANSMISSION_ARRIVAL_S`); averaging keeps the
             # signal and divides the noise std by 2^(N/2) (measured with the pulser on: peak

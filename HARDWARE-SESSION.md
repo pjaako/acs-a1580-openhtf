@@ -14,6 +14,9 @@ When: after v1 passes its hardware-free gates, and whenever a new unknown must b
    know yet, so one client at a time.
 4. The agent has `A1580_HOST` set and has run `tools/hw_probe.py --dry-run` (prints the
    command list without connecting).
+5. For experiment 12 only: the signal generator model, its output impedance and whether its
+   display assumes High-Z or 50 ohm, and the input ceiling (`--max-gen-vpp`, default 1.0 Vpp)
+   that the human confirms, since the rating of the receiver input is unknown.
 
 ## Rules during the session
 
@@ -60,9 +63,11 @@ Phase C, pulser on at the agreed voltage, transducer as confirmed:
     Run as `tools/hw_probe.py --phase C --pulse-v 20` (steps 10 and 10b of the tool).
 11. `TRIG:DEL 0 NS` vs `TRIG:DEL 5 US`: does the echo move by 5 us?
     Step 11 of the same invocation (`--phase C`) measures it for `TRIG:DEL` 0 NS, 1000 US and 2000 US.
-12. Count-to-volt scaling (unknown 2): with a known signal source if available, otherwise
+12. Count-to-volt scaling (PROTOCOL.md unknown 9): with a known signal source if available, otherwise
     skip and record "not measured".
     Deferred on 2026-10-05 (signal generator available later).
+    Run as `tools/hw_probe.py --phase V` with the signal generator on `IN`; the human sets the
+    generator at each prompt; optional `--with-preamps --with-impedance --with-hpf`.
 13. `*RST`: query all `STATE_HEADERS` again and diff against the documented defaults
     (unknown 14). Then restore the saved setup and verify by read-back.
     Run as `tools/hw_probe.py --phase RST --allow-rst`.
