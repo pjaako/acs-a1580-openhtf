@@ -38,6 +38,20 @@ Stop at the dry run. Anything beyond it opens a SCPI session and follows `HARDWA
 the human confirms the preconditions first (what is connected, voltage ceiling, exclusive use;
 a second SCPI client closes the first).
 
+## Alternatives that need no kit
+
+- A static route on the office gateway to `192.168.200.0/24`, if the A1580 hangs off a switch or
+  router that the gateway can reach. Then every LAN machine, this container included, reaches the
+  device and nothing changes on the Proxmox host.
+- Moving the device onto the office LAN: a human gives it a free static address on the office
+  subnet through its web UI from a laptop on the vendor subnet (never over the network from a
+  tool, see `AGENTS.md`), then plugs it into the office switch. `PROTOCOL.md` leaves DHCP, netmask
+  and gateway behaviour unknown, so a static address is the safe choice. Then only `A1580_HOST`
+  changes.
+
+The kit is only needed when the device is cabled straight into a NIC of the Proxmox host or sits
+on a VLAN that the office gateway does not route.
+
 ## Notes
 - The device address is the vendor default; if the unit was given another address, pass
   `--device-ip` to the installer and change `/etc/profile.d/a1580.sh`.
