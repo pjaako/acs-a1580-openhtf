@@ -13,6 +13,13 @@ different instrument. Read this file, then `STATUS.md`, then the SPEC you were g
   `Report:` line asks.
 - If a SPEC is wrong, ambiguous or impossible, do the closest sensible thing, keep going,
   and list every deviation in the report. Do not silently narrow the scope.
+- The project-owner agent does not write code, tools, kits or tests itself. It writes the
+  SPEC (numbered sections, the files a coder may change, the tests, a `Report:` line),
+  hands it to a coder subagent, then checks the result: reads the diff against the SPEC,
+  runs the gates, and only then commits. Cheap, fast models do the grunt work (searches,
+  inventories, mechanical edits, running gates, log digging); a stronger model takes coder
+  tasks against a clear SPEC; the strongest is kept for judgment, protocol or stream code,
+  and reviews of a coder's diff.
 
 ## Documents and which one wins
 

@@ -40,3 +40,5 @@ files in `captures/` and the generated `capture.schema.json`. Config keys are
 - Nothing is done until it ran on hardware; every hardware finding goes into the fake and
   into README with a date and firmware version.
 - Commits end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- The owner agent specifies and reviews; subagents write the code. Grunt work goes to the
+  cheapest model that can do it.
